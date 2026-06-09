@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.3](https://github.com/jdx/aube/compare/aube-linker-v1.18.2...aube-linker-v1.18.3) - 2026-06-09
+
+### Other
+
+- refresh benchmarks for v1.18.2 ([#851](https://github.com/jdx/aube/pull/851))
+
 ## [1.18.2](https://github.com/jdx/aube/compare/aube-linker-v1.18.1...aube-linker-v1.18.2) - 2026-06-08
 
 ### Other
