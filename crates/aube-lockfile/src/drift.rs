@@ -253,6 +253,82 @@ impl LockfileGraph {
             .or_else(|| runtime_drift_reason(&self.runtimes, manifest))
     }
 
+    /// Compare this lockfile's recorded patch config against the
+    /// manifest/workspace-declared one. `effective_paths` is the
+    /// merged `patchedDependencies` map (bun top-level +
+    /// `pnpm.patchedDependencies` + workspace yaml, selector → rel
+    /// path); `effective_hashes` is the sha256 hex of each patch
+    /// file's *current* contents. Mirrors pnpm's config-mismatch rule
+    /// (`ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`): a declared patch the
+    /// lockfile doesn't record, a moved patch path, or an edited
+    /// patch file (hash mismatch) all mean the lockfile is stale.
+    ///
+    /// Skipped entirely for lockfile formats that have no
+    /// patched-dependency construct (npm, yarn) — same rule as
+    /// [`kind_records_resolution_metadata`]: a `package-lock.json`
+    /// can never record the block, so comparing against it would
+    /// re-resolve (or frozen-fail) on every install. Hash comparison
+    /// is also skipped for lockfile entries that never recorded a
+    /// hash (bun.lock, pnpm v8's bare-path form) — those formats
+    /// carry no hash to compare against.
+    pub fn check_patched_dependencies_drift(
+        &self,
+        kind: LockfileKind,
+        effective_paths: &BTreeMap<String, String>,
+        effective_hashes: &BTreeMap<String, String>,
+    ) -> DriftStatus {
+        if !matches!(
+            kind,
+            LockfileKind::Aube | LockfileKind::Pnpm | LockfileKind::Bun
+        ) {
+            return DriftStatus::Fresh;
+        }
+        // Both directions matter, exactly like pnpm: a lockfile entry
+        // whose selector the project no longer declares is as stale as
+        // a declared patch the lockfile doesn't record (`patch-remove`
+        // relies on this firing to drop the entry on the next write).
+        for selector in self.patched_dependencies.keys() {
+            if !effective_paths.contains_key(selector) {
+                return DriftStatus::Stale {
+                    reason: format!(
+                        "patchedDependencies.{selector}: recorded in the lockfile but no longer declared in the project"
+                    ),
+                };
+            }
+        }
+        for (selector, path) in effective_paths {
+            match self.patched_dependencies.get(selector) {
+                None => {
+                    return DriftStatus::Stale {
+                        reason: format!(
+                            "patchedDependencies.{selector}: declared in the project but missing from the lockfile"
+                        ),
+                    };
+                }
+                Some(locked_path) if locked_path != path => {
+                    return DriftStatus::Stale {
+                        reason: format!(
+                            "patchedDependencies.{selector}: project says {path}, lockfile says {locked_path}"
+                        ),
+                    };
+                }
+                Some(_) => {}
+            }
+            if let (Some(effective_hash), Some(locked_hash)) = (
+                effective_hashes.get(selector),
+                self.patched_dependency_hashes.get(selector),
+            ) && effective_hash != locked_hash
+            {
+                return DriftStatus::Stale {
+                    reason: format!(
+                        "patchedDependencies.{selector}: patch file contents changed (hash mismatch)"
+                    ),
+                };
+            }
+        }
+        DriftStatus::Fresh
+    }
+
     /// Compare this lockfile's catalog snapshot against the current
     /// `pnpm-workspace.yaml` catalogs.
     ///

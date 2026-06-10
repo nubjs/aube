@@ -90,6 +90,16 @@ pub(crate) fn write_and_log_lockfile(
     graph: &aube_lockfile::LockfileGraph,
     manifest: &aube_manifest::PackageJson,
 ) -> miette::Result<PathBuf> {
+    // Same patch-config recording as install's write path: these
+    // commands (update / remove / dedupe / audit --fix) rewrite the
+    // lockfile from a fresh graph, and dropping the patch block here
+    // would desync the lockfile from the manifest's
+    // `patchedDependencies` until the next `install`.
+    let graph = &{
+        let mut g = graph.clone();
+        crate::patches::record_patches_on_graph(cwd, &mut g)?;
+        g
+    };
     // Preserve the project's resolved lockfile format — the existing
     // lockfile's, or the `package.json`-declared package manager's on
     // a fresh project; fall back to the configured

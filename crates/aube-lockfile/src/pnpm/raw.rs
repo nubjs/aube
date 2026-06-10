@@ -127,8 +127,8 @@ pub(super) struct RawPnpmLockfile {
 
 /// pnpm writes `patchedDependencies` as either a bare path string
 /// (v8 style) or a nested `{ path, hash }` object (v9+). We accept
-/// both via an untagged enum and collapse to the path string on the
-/// shared graph.
+/// both via an untagged enum; the path and the hash land in the
+/// graph's `patched_dependencies` / `patched_dependency_hashes` maps.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(super) enum RawPatchedDependency {
@@ -136,16 +136,15 @@ pub(super) enum RawPatchedDependency {
     Object {
         path: String,
         #[serde(default)]
-        #[allow(dead_code)]
         hash: Option<String>,
     },
 }
 
 impl RawPatchedDependency {
-    pub(super) fn into_path(self) -> String {
+    pub(super) fn into_path_and_hash(self) -> (String, Option<String>) {
         match self {
-            RawPatchedDependency::Path(p) => p,
-            RawPatchedDependency::Object { path, .. } => path,
+            RawPatchedDependency::Path(p) => (p, None),
+            RawPatchedDependency::Object { path, hash } => (path, hash),
         }
     }
 }

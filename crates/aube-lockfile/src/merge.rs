@@ -250,8 +250,16 @@ fn merge_into(dst: &mut LockfileGraph, src: LockfileGraph, report: &mut MergeRep
     }
     for (key, incoming) in src.patched_dependencies {
         use std::collections::btree_map::Entry;
+        // The hash sidecar travels with its path entry: whichever
+        // side's path wins keeps that side's hash, so a `{hash, path}`
+        // pair never ends up mixed across branches.
+        let incoming_hash = src.patched_dependency_hashes.get(&key).cloned();
         match dst.patched_dependencies.entry(key) {
             Entry::Vacant(slot) => {
+                if let Some(hash) = incoming_hash {
+                    dst.patched_dependency_hashes
+                        .insert(slot.key().clone(), hash);
+                }
                 slot.insert(incoming);
             }
             Entry::Occupied(slot) => {
@@ -262,6 +270,10 @@ fn merge_into(dst: &mut LockfileGraph, src: LockfileGraph, report: &mut MergeRep
                         slot.get(),
                         incoming
                     ));
+                } else if let Some(hash) = incoming_hash {
+                    dst.patched_dependency_hashes
+                        .entry(slot.key().clone())
+                        .or_insert(hash);
                 }
             }
         }

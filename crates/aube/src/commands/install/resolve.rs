@@ -148,6 +148,11 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
             }
         }
     }
+    // Patch-config drift (declared patchedDependencies the lockfile
+    // doesn't record, or an edited patch file) re-resolves like any
+    // other drift — same rule as pnpm's lockfile-config mismatch.
+    let (effective_patch_paths, effective_patch_hashes) =
+        crate::patches::effective_patch_config(cwd)?;
     let fresh = !force_resolve
         && matches!(
             parsed,
@@ -164,6 +169,14 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
                     DriftStatus::Fresh,
                 )
                     && matches!(g.check_catalogs_drift(workspace_catalogs), DriftStatus::Fresh)
+                    && matches!(
+                        g.check_patched_dependencies_drift(
+                            k,
+                            &effective_patch_paths,
+                            &effective_patch_hashes
+                        ),
+                        DriftStatus::Fresh
+                    )
         );
     if fresh {
         tracing::debug!("--lockfile-only: lockfile already up to date");
@@ -239,6 +252,9 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
     // ndjson stream.
     crate::pnpmfile::ReadPackageHostChain::drain_forwarders(read_package_forwarders).await;
     crate::pnpmfile::run_after_all_resolved_chain(&pnpmfile_paths, cwd, &mut graph).await?;
+    // Same patch-config recording as the main install branch — keeps
+    // `--lockfile-only` output byte-identical to a full install's.
+    crate::patches::record_patches_on_graph(cwd, &mut graph)?;
     // Same tarball-URL population pass as the main fetch branch —
     // keeps `--lockfile-only` and regular installs byte-identical.
     // Reuses the resolver's `client` (already built above) to avoid
@@ -379,6 +395,21 @@ pub(super) fn select_lockfile_result(
                          or run `aube install --no-frozen-lockfile` to regenerate it"
                     ));
                 }
+                // Same hard-fail for patch-config drift — pnpm rejects
+                // this as ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
+                let (effective_patch_paths, effective_patch_hashes) =
+                    crate::patches::effective_patch_config(cwd)?;
+                if let DriftStatus::Stale { reason } = graph.check_patched_dependencies_drift(
+                    kind,
+                    &effective_patch_paths,
+                    &effective_patch_hashes,
+                ) {
+                    return Err(miette!(
+                        code = aube_codes::errors::ERR_AUBE_OUTDATED_LOCKFILE,
+                        "lockfile is out of date with the project's patch configuration: {reason}\n\
+                         help: run without --frozen-lockfile to update the lockfile"
+                    ));
+                }
             }
             Ok(parsed)
         }
@@ -399,7 +430,9 @@ pub(super) fn select_lockfile_result(
                         );
                         Ok(Err(aube_lockfile::Error::NotFound(cwd.to_path_buf())))
                     } else {
-                        match graph.check_drift_workspace_for_kind(
+                        let (effective_patch_paths, effective_patch_hashes) =
+                            crate::patches::effective_patch_config(cwd)?;
+                        let drift = match graph.check_drift_workspace_for_kind(
                             manifests,
                             &ws_config.overrides,
                             &ws_config.ignored_optional_dependencies,
@@ -407,6 +440,14 @@ pub(super) fn select_lockfile_result(
                             is_workspace_project,
                             *kind,
                         ) {
+                            DriftStatus::Fresh => graph.check_patched_dependencies_drift(
+                                *kind,
+                                &effective_patch_paths,
+                                &effective_patch_hashes,
+                            ),
+                            stale => stale,
+                        };
+                        match drift {
                             DriftStatus::Fresh => Ok(Ok((graph.clone(), *kind))),
                             DriftStatus::Stale { reason } => {
                                 tracing::debug!("Lockfile out of date ({reason}), re-resolving...");

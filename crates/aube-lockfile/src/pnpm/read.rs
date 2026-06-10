@@ -753,12 +753,15 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         })
         .collect();
 
-    let patched_dependencies: BTreeMap<String, String> = raw
-        .patched_dependencies
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(k, v)| (k, v.into_path()))
-        .collect();
+    let mut patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
+    let mut patched_dependency_hashes: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in raw.patched_dependencies.unwrap_or_default() {
+        let (path, hash) = v.into_path_and_hash();
+        if let Some(hash) = hash {
+            patched_dependency_hashes.insert(k.clone(), hash);
+        }
+        patched_dependencies.insert(k, path);
+    }
 
     // Lift the synthetic runtime importer deps recorded above into
     // typed pins, pulling the per-platform artifact list out of the
@@ -806,6 +809,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         catalogs,
         bun_config_version: None,
         patched_dependencies,
+        patched_dependency_hashes,
         trusted_dependencies: Vec::new(),
         runtimes,
         extra_fields: BTreeMap::new(),

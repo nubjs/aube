@@ -109,6 +109,16 @@ pub struct LockfileGraph {
     /// verbatim so a parse/write cycle doesn't silently drop user
     /// patches from the lockfile.
     pub patched_dependencies: BTreeMap<String, String>,
+    /// Sidecar of [`Self::patched_dependencies`]: the sha256 hex of
+    /// each patch file's contents, keyed by the same selector. pnpm 10
+    /// records it as `patchedDependencies.<selector>.hash` and stamps
+    /// it into `(patch_hash=<hash>)` dep-path suffixes; a lockfile
+    /// that names a patch without the hash plumbing is rejected with
+    /// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`. Entries may be missing for
+    /// selectors parsed from hash-less sources (bun.lock, pnpm v8's
+    /// bare-path form) — the pnpm writer falls back to the bare-path
+    /// form for those instead of inventing a hash.
+    pub patched_dependency_hashes: BTreeMap<String, String>,
     /// Top-level `trustedDependencies:` block (bun) — a package-name
     /// allowlist for lifecycle script execution. Preserved so
     /// re-emitting a bun.lock doesn't strip the allowlist and cause
@@ -680,6 +690,7 @@ impl LockfileGraph {
             catalogs: self.catalogs.clone(),
             bun_config_version: self.bun_config_version,
             patched_dependencies: self.patched_dependencies.clone(),
+            patched_dependency_hashes: self.patched_dependency_hashes.clone(),
             trusted_dependencies: self.trusted_dependencies.clone(),
             // Runtime pins are graph-wide resolution intent, same as
             // overrides/catalogs — structural filters carry them.
@@ -743,6 +754,7 @@ impl LockfileGraph {
             catalogs: self.catalogs.clone(),
             bun_config_version: self.bun_config_version,
             patched_dependencies: self.patched_dependencies.clone(),
+            patched_dependency_hashes: self.patched_dependency_hashes.clone(),
             trusted_dependencies: self.trusted_dependencies.clone(),
             runtimes: self.runtimes.clone(),
             extra_fields: self.extra_fields.clone(),
@@ -791,9 +803,12 @@ impl LockfileGraph {
         if self.bun_config_version.is_none() {
             self.bun_config_version = prior.bun_config_version;
         }
-        if self.patched_dependencies.is_empty() {
-            self.patched_dependencies = prior.patched_dependencies.clone();
-        }
+        // `patched_dependencies` (+ its hash sidecar) is deliberately
+        // NOT carried forward: the patch config in the manifest /
+        // workspace yaml is authoritative, and the CLI's
+        // record-patches pass re-stamps it on every write path. A
+        // carry-forward would resurrect entries the user just
+        // `patch-remove`d.
         if self.trusted_dependencies.is_empty() {
             self.trusted_dependencies = prior.trusted_dependencies.clone();
         }
