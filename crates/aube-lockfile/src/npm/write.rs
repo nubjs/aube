@@ -153,20 +153,23 @@ pub fn write(
             .or_insert(pkg);
     }
 
-    // Compute reachability for dev/optional flags. A package is
-    // `dev: true` iff it's only reachable from dev roots; `optional:
-    // true` iff it's only reachable from optional roots. Production
-    // wins the tie: if a package is reachable from any prod root, it
-    // gets neither flag.
+    // Compute reachability for dev/optional flags, matching npm's
+    // path-based semantics: a package is `dev: true` iff *every* path
+    // from the root crosses a dev edge, `optional: true` iff every
+    // path crosses an optional edge (a root `optionalDependencies`
+    // entry or any package's `optionalDependencies` edge). Both are
+    // answered by complement: a package escapes the flag iff it stays
+    // reachable when the BFS refuses to cross edges of that type.
     let roots = graph.importers.get(".").cloned().unwrap_or_default();
     let all_roots: Vec<DirectDep> = graph
         .importers
         .values()
         .flat_map(|deps| deps.iter().cloned())
         .collect();
-    let prod_reach = reachable_from(&canonical, &all_roots, DepType::Production);
-    let dev_reach = reachable_from(&canonical, &all_roots, DepType::Dev);
-    let opt_reach = reachable_from(&canonical, &all_roots, DepType::Optional);
+    let any_reach = reachable_without(&canonical, &all_roots, &[]);
+    let non_dev_reach = reachable_without(&canonical, &all_roots, &[DepType::Dev]);
+    let non_opt_reach = reachable_without(&canonical, &all_roots, &[DepType::Optional]);
+    let prod_reach = reachable_without(&canonical, &all_roots, &[DepType::Dev, DepType::Optional]);
 
     // Build a hoist/nest tree keyed by a sequence of "node_modules"
     // path segments — e.g. `["foo"]` for `node_modules/foo`,
@@ -323,12 +326,21 @@ pub fn write(
         // `optional: true`, so a package reachable through both
         // chains would get removed under either omit even though the
         // other chain still needs it.
-        let is_prod = prod_reach.contains(canonical_key);
-        let is_dev = !is_prod && dev_reach.contains(canonical_key);
-        let is_opt = !is_prod && opt_reach.contains(canonical_key);
-        let dev_optional = is_dev && is_opt;
-        let dev = is_dev && !dev_optional;
-        let optional = is_opt && !dev_optional;
+        // Unreachable entries (canonical-key mismatches, hand-built
+        // graphs) stay unflagged rather than collapsing into
+        // `devOptional` vacuously.
+        let is_reachable = any_reach.contains(canonical_key);
+        let is_dev = is_reachable && !non_dev_reach.contains(canonical_key);
+        let is_opt = is_reachable && !non_opt_reach.contains(canonical_key);
+        // Third bit, npm's `devOptional`: no pure-production path
+        // exists, but neither "every path is dev" nor "every path is
+        // optional" holds (e.g. reachable via a dev chain *and* via an
+        // optional chain). The all-paths-dev-and-optional case
+        // collapses into the same flag.
+        let is_dev_opt = is_reachable && !prod_reach.contains(canonical_key);
+        let dev_optional = (is_dev && is_opt) || (is_dev_opt && !is_dev && !is_opt);
+        let dev = is_dev && !is_opt;
+        let optional = is_opt && !is_dev;
 
         // Aliased deps (`"h3-v2": "npm:h3@..."` in package.json)
         // round-trip as `node_modules/h3-v2` with an explicit
@@ -483,15 +495,25 @@ fn dep_sections_from_direct_deps(deps: &[DirectDep]) -> DepSections<'_> {
 /// the root importer's direct deps of a given type. Traversal follows
 /// `LockedPackage.dependencies`, dropping peer suffixes so the visited
 /// keys match the canonical map built at the top of [`write`].
-fn reachable_from(
+/// BFS over the locked graph refusing to cross edges of the
+/// `excluded` types (empty = plain reachability). npm's `dev` /
+/// `optional` flags mean "every install path crosses a dev /
+/// optional edge", so a package earns a flag iff it drops out of
+/// the set when those edges are off-limits (and `devOptional` iff it
+/// drops out when both are). Root edges carry their importer dep
+/// type; below the root the only typed edges are
+/// `optionalDependencies` (a dependency's `devDependencies` are
+/// never installed), so the `Dev` exclusion filters seeds only,
+/// while the `Optional` exclusion also filters child edges.
+fn reachable_without(
     canonical: &BTreeMap<String, &LockedPackage>,
     roots: &[DirectDep],
-    dep_type: DepType,
+    excluded: &[DepType],
 ) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     let mut queue: VecDeque<String> = VecDeque::new();
     for dep in roots {
-        if dep.dep_type != dep_type {
+        if excluded.contains(&dep.dep_type) {
             continue;
         }
         let key = super::canonical_key_from_dep_path(&dep.dep_path);
@@ -504,6 +526,11 @@ fn reachable_from(
             continue;
         };
         for (child_name, child_value) in &pkg.dependencies {
+            if excluded.contains(&DepType::Optional)
+                && pkg.optional_dependencies.contains_key(child_name)
+            {
+                continue;
+            }
             let child_key = super::child_canonical_key(child_name, child_value);
             if canonical.contains_key(&child_key) && out.insert(child_key.clone()) {
                 queue.push_back(child_key);
