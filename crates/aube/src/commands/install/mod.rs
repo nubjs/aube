@@ -655,6 +655,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 node_version: lock_node_version,
                 build_policy: lock_build_policy,
                 use_global_virtual_store_override,
+                virtual_store_dir: aube_dir.clone(),
             };
             let lock_materialize_handle =
                 spawn_gvs_prewarm(lock_prewarm_inputs, lock_materialize_rx);
@@ -1392,6 +1393,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 node_version: node_version_for_prewarm.clone(),
                 build_policy: build_policy_for_prewarm.clone(),
                 use_global_virtual_store_override,
+                virtual_store_dir: aube_dir.clone(),
             };
             aube_util::diag::instant(
                 aube_util::diag::Category::Install,
