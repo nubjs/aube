@@ -15,6 +15,13 @@ pub(super) struct GvsPrewarmInputs {
     pub node_version: Option<String>,
     pub build_policy: std::sync::Arc<aube_scripts::BuildPolicy>,
     pub use_global_virtual_store_override: Option<bool>,
+    /// The RESOLVED per-project virtual store dir (the same value the
+    /// link phase applies via `with_aube_dir_override`). Threaded here
+    /// so the non-GVS streaming materializer lands in the directory the
+    /// user (or embedder) configured via `virtualStoreDir` — deriving it
+    /// from the probe linker's built-in `<modulesDir>/.aube` fallback
+    /// instead materialized a SECOND store next to the configured one.
+    pub virtual_store_dir: std::path::PathBuf,
 }
 
 /// Initial capacity for the (canonical_key, PackageIndex) channel
@@ -107,6 +114,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
         node_version,
         build_policy,
         use_global_virtual_store_override,
+        virtual_store_dir,
     } = inputs;
 
     let engine = node_version
@@ -119,7 +127,8 @@ pub(super) async fn run_gvs_prewarm_materializer(
     // off so per-project installs and cold CI (CI=true gates GVS)
     // don't pay for hashes nothing reads.
     let mut probe = aube_linker::Linker::new(store.as_ref(), link_strategy)
-        .with_virtual_store_dir_max_length(virtual_store_dir_max_length);
+        .with_virtual_store_dir_max_length(virtual_store_dir_max_length)
+        .with_aube_dir_override(virtual_store_dir);
     if let Some(enabled) = use_global_virtual_store_override {
         probe = probe.with_use_global_virtual_store(enabled);
     }
