@@ -93,12 +93,17 @@ fn build_http_client_inner(
     // CDN edge cache hit rate keys partly off the User-Agent header.
     // Hardcoded `0.1.0` lands in cold buckets on Cloudflare/Fastly. Use
     // the real workspace version + an OS/arch tail in the same shape
-    // pnpm and npm send so the registry recognises us.
+    // pnpm and npm send so the registry recognises us. An embedder
+    // that registered its own product token via
+    // `aube_util::ua::set_user_agent_product` replaces the leading
+    // `aube/<version>` (the platform tail stays).
     static UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let user_agent = UA.get_or_init(|| {
+        let product = aube_util::ua::user_agent_product()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("aube/{}", env!("CARGO_PKG_VERSION")));
         format!(
-            "aube/{} ({} {})",
-            env!("CARGO_PKG_VERSION"),
+            "{product} ({} {})",
             std::env::consts::OS,
             std::env::consts::ARCH
         )

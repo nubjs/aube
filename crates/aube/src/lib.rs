@@ -538,6 +538,13 @@ pub use aube_settings::set_embedder_defaults;
 /// all families; call once per process before invoking any command.
 pub use aube_util::env::{EnvFamilies, set_env_families};
 
+/// User-agent product override for embedders, re-exported from
+/// `aube-util`: replace the leading `aube/<version>` token of the
+/// registry `User-Agent` header and the `npm_config_user_agent`
+/// variable exported to lifecycle scripts. Call once per process
+/// before invoking any command.
+pub use aube_util::ua::set_user_agent_product;
+
 /// CLI entry point shared by the `aube`, `aubr`, and `aubx` binaries.
 ///
 /// Parses `std::env::args_os()`, dispatches the subcommand, and exits the

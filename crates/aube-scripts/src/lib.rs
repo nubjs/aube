@@ -434,13 +434,16 @@ pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
 /// (`darwin`/`linux`/`win32`, `x64`/`arm64`), not Rust's native
 /// `std::env::consts::{OS,ARCH}` values, so tools that parse the full
 /// UA string identify the platform the same way npm/yarn/pnpm do.
+///
+/// The product token defaults to `aube/<version>`; an embedder that
+/// registered its own identity via
+/// `aube_util::ua::set_user_agent_product` replaces it (the platform
+/// tail stays).
 pub fn aube_user_agent() -> String {
-    format!(
-        "aube/{} {} {}",
-        env!("CARGO_PKG_VERSION"),
-        node_platform(),
-        node_arch(),
-    )
+    let product = aube_util::ua::user_agent_product()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("aube/{}", env!("CARGO_PKG_VERSION")));
+    format!("{product} {} {}", node_platform(), node_arch())
 }
 
 fn node_platform() -> &'static str {
