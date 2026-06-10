@@ -177,6 +177,73 @@ fn test_parse_simple() {
     );
 }
 
+/// bun installs a root-workspace `peerDependencies` entry that is not
+/// listed in `optionalPeers` — a required root peer is linked into the
+/// root `node_modules` like a regular dep. The importer-build pass only
+/// walked `dependencies` / `devDependencies` / `optionalDependencies`,
+/// so a required root peer was dropped from `importers["."]` and never
+/// linked: the package sits in `packages:` but `node_modules/<peer>`
+/// goes missing, breaking downstream type-checks/builds that import it.
+///
+/// Shape taken from elysiajs/elysia's committed bun.lock, whose root
+/// peer `openapi-types` (required — absent from `optionalPeers`) went
+/// unlinked, found by differential corpus testing against elysia.
+#[test]
+fn test_parse_links_required_root_workspace_peer() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let sri_cookie = fake_sri('a');
+    let sri_openapi = fake_sri('b');
+    let sri_typebox = fake_sri('c');
+    let content = r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "elysia",
+      "dependencies": {
+        "cookie": "^1.1.1"
+      },
+      "peerDependencies": {
+        "@sinclair/typebox": ">= 0.34.0 < 1",
+        "openapi-types": ">= 12.0.0",
+        "typescript": ">= 5.0.0"
+      },
+      "optionalPeers": [
+        "typescript"
+      ]
+    }
+  },
+  "packages": {
+    "cookie": ["cookie@1.1.1", "", {}, "SRI_COOKIE"],
+    "openapi-types": ["openapi-types@12.1.3", "", {}, "SRI_OPENAPI"],
+    "@sinclair/typebox": ["@sinclair/typebox@0.34.0", "", {}, "SRI_TYPEBOX"]
+  }
+}"#
+    .replace("SRI_COOKIE", &sri_cookie)
+    .replace("SRI_OPENAPI", &sri_openapi)
+    .replace("SRI_TYPEBOX", &sri_typebox);
+    std::fs::write(tmp.path(), &content).unwrap();
+    let graph = parse(tmp.path()).unwrap();
+
+    let root = graph.importers.get(".").unwrap();
+
+    // Required root peers (not in optionalPeers) are linked as direct
+    // deps; `typescript` is in optionalPeers and has no package entry,
+    // so it stays unlinked — matching bun.
+    let openapi = root
+        .iter()
+        .find(|d| d.name == "openapi-types")
+        .expect("required root peer openapi-types must be linked as a direct dep");
+    assert_eq!(openapi.dep_path, "openapi-types@12.1.3");
+    assert!(
+        root.iter().any(|d| d.name == "@sinclair/typebox"),
+        "required root peer @sinclair/typebox must be linked"
+    );
+    assert!(
+        !root.iter().any(|d| d.name == "typescript"),
+        "optional root peer typescript must not be force-linked"
+    );
+}
+
 #[test]
 fn test_parse_bun_lifecycle_deps_as_dep_path_tails() {
     let tmp = tempfile::NamedTempFile::new().unwrap();

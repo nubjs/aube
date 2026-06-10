@@ -285,6 +285,38 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         for (n, spec) in &ws_raw.optional_dependencies {
             push_dep(n, spec, DepType::Optional, &mut direct);
         }
+        // Required workspace peers. bun links a workspace's
+        // `peerDependencies` entry into that workspace's `node_modules`
+        // unless it's listed in `optionalPeers` — so a required peer
+        // resolves like a regular direct dep. Walking only
+        // dependencies/devDependencies/optionalDependencies above drops
+        // it, leaving `packages:` populated but `node_modules/<peer>`
+        // missing and downstream imports broken. Skip names already
+        // pushed as a regular dep (a dep that's also peer-declared is
+        // linked once) and optional peers (bun only links them when
+        // some other resolution supplies them, which the regular-dep
+        // walk already covers).
+        let optional_peers: std::collections::HashSet<&str> = ws_raw
+            .extra
+            .get("optionalPeers")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if let Some(peers) = ws_raw
+            .extra
+            .get("peerDependencies")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (n, spec) in peers {
+                if optional_peers.contains(n.as_str()) || direct.iter().any(|d| &d.name == n) {
+                    continue;
+                }
+                let spec = spec.as_str().unwrap_or_default();
+                push_dep(n, spec, DepType::Production, &mut direct);
+            }
+        }
         importers.insert(importer_path.clone(), direct);
         if !ws_raw.extra.is_empty() {
             workspace_extra_fields.insert(importer_path, ws_raw.extra.clone());
