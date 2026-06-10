@@ -10,11 +10,47 @@ use crate::UpdateConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-pub(super) const WORKSPACE_YAML_NAMES: &[&str] = &["aube-workspace.yaml", "pnpm-workspace.yaml"];
+const DEFAULT_WORKSPACE_YAML_NAMES: &[&str] = &["aube-workspace.yaml", "pnpm-workspace.yaml"];
+
+static WORKSPACE_YAML_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Override the workspace-yaml filenames aube probes for, in
+/// precedence order. The first entry doubles as the filename for
+/// freshly created workspace yamls (see [`workspace_yaml_target`]).
+/// Defaults to `["aube-workspace.yaml", "pnpm-workspace.yaml"]`.
+///
+/// For embedders that present a different brand surface: a tool
+/// driving aube's command layer as a library can restrict discovery
+/// to `pnpm-workspace.yaml` only, so an `aube-workspace.yaml` left on
+/// disk by some other tool doesn't change what the embedding product
+/// reads or writes.
+///
+/// Idempotent — second calls and calls after the first read are
+/// silently ignored, matching the other process-global `set_*`
+/// helpers (consumers may cache derived paths). Empty lists are
+/// ignored: at least one filename must remain probe-able.
+pub fn set_workspace_yaml_names(names: &[&str]) {
+    if names.is_empty() {
+        return;
+    }
+    let _ = WORKSPACE_YAML_NAMES.set(names.iter().map(|s| s.to_string()).collect());
+}
+
+/// The workspace-yaml filenames currently in effect, highest
+/// precedence first.
+pub fn workspace_yaml_names() -> &'static [String] {
+    WORKSPACE_YAML_NAMES.get_or_init(|| {
+        DEFAULT_WORKSPACE_YAML_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    })
+}
 
 fn find_and_read(project_dir: &Path) -> Result<Option<(PathBuf, String)>, crate::Error> {
-    for name in WORKSPACE_YAML_NAMES {
+    for name in workspace_yaml_names() {
         let path = project_dir.join(name);
         if path.exists() {
             let content =
@@ -714,7 +750,7 @@ pub fn load_both(
 /// callers (catalog cleanup, ancestor walks) treat that as "nothing
 /// to read or rewrite".
 pub fn workspace_yaml_existing(project_dir: &Path) -> Option<PathBuf> {
-    for name in WORKSPACE_YAML_NAMES {
+    for name in workspace_yaml_names() {
         let path = project_dir.join(name);
         if path.exists() {
             return Some(path);
@@ -725,8 +761,9 @@ pub fn workspace_yaml_existing(project_dir: &Path) -> Option<PathBuf> {
 
 /// Resolve which workspace-yaml path a writer should mutate in
 /// `project_dir`. Existing `aube-workspace.yaml` wins over
-/// `pnpm-workspace.yaml`; when neither exists, falls back to
-/// `aube-workspace.yaml` — aube's own filename, parallel to the
+/// `pnpm-workspace.yaml`; when neither exists, falls back to the
+/// highest-precedence configured filename — by default
+/// `aube-workspace.yaml`, aube's own filename, parallel to the
 /// `aube-lock.yaml` shape we use for the lockfile.
 ///
 /// Background: aube reads both `aube-workspace.yaml` (preferred)
@@ -743,7 +780,8 @@ pub fn workspace_yaml_existing(project_dir: &Path) -> Option<PathBuf> {
 /// needs a workspace yaml path even on a fresh project (e.g. the
 /// node-gyp bootstrap dummy file).
 pub fn workspace_yaml_target(project_dir: &Path) -> PathBuf {
-    workspace_yaml_existing(project_dir).unwrap_or_else(|| project_dir.join("aube-workspace.yaml"))
+    workspace_yaml_existing(project_dir)
+        .unwrap_or_else(|| project_dir.join(&workspace_yaml_names()[0]))
 }
 
 /// Where the next mutation of a workspace-level setting should land.

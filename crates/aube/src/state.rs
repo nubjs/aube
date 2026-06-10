@@ -977,8 +977,11 @@ fn hash_settings(project_dir: &Path, cli_flags: &[(String, String)]) -> String {
     // map shaped workspace settings live in yaml. raw byte hash catches
     // catalog edits, overrides bumps, packageExtensions, allowBuilds list.
     // any of those mean re-resolve is needed, yaml bytes are the source.
+    // hash exactly the filenames discovery consults (and in the same
+    // order) so a name an embedder excluded via
+    // `set_workspace_yaml_names` can't flip the fast path.
     hasher.update(b"workspace_yaml=");
-    for name in ["pnpm-workspace.yaml", "aube-workspace.yaml"] {
+    for name in aube_manifest::workspace::workspace_yaml_names() {
         let path = project_dir.join(name);
         hasher.update(name.as_bytes());
         hasher.update(b"\x1f");

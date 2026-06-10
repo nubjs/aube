@@ -704,7 +704,7 @@ fn edit_target(meta: &settings_meta::SettingMeta) -> Option<EditTarget> {
     let cwd = crate::dirs::project_root_or_cwd().ok()?;
     let workspace_key = meta.workspace_yaml_keys.first().map(|key| key.to_string());
     if let Some(key) = workspace_key.clone()
-        && let Some(path) = workspace_yaml_target(&cwd)
+        && let Some(path) = aube_manifest::workspace::workspace_yaml_existing(&cwd)
     {
         return Some(EditTarget::WorkspaceYaml { path, key });
     }
@@ -718,7 +718,7 @@ fn edit_target(meta: &settings_meta::SettingMeta) -> Option<EditTarget> {
     }
 
     workspace_key.map(|key| EditTarget::WorkspaceYaml {
-        path: cwd.join("aube-workspace.yaml"),
+        path: aube_manifest::workspace::workspace_yaml_target(&cwd),
         key,
     })
 }
@@ -757,13 +757,6 @@ fn edit_unavailable_message(meta: &settings_meta::SettingMeta) -> String {
             actions.join(", or ")
         )
     }
-}
-
-fn workspace_yaml_target(cwd: &std::path::Path) -> Option<PathBuf> {
-    ["aube-workspace.yaml", "pnpm-workspace.yaml"]
-        .into_iter()
-        .map(|name| cwd.join(name))
-        .find(|path| path.exists())
 }
 
 fn target_file_label(target: Option<&EditTarget>) -> String {

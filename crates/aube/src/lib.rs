@@ -545,6 +545,14 @@ pub use aube_util::env::{EnvFamilies, set_env_families};
 /// before invoking any command.
 pub use aube_util::ua::set_user_agent_product;
 
+/// Workspace-yaml filename override for embedders, re-exported from
+/// `aube-manifest`: restrict (or reorder) which workspace-yaml
+/// filenames are discovered, with the first entry doubling as the
+/// filename for freshly created workspace yamls. Defaults to
+/// `["aube-workspace.yaml", "pnpm-workspace.yaml"]`. Call once per
+/// process before invoking any command.
+pub use aube_manifest::workspace::set_workspace_yaml_names;
+
 /// CLI entry point shared by the `aube`, `aubr`, and `aubx` binaries.
 ///
 /// Parses `std::env::args_os()`, dispatches the subcommand, and exits the
