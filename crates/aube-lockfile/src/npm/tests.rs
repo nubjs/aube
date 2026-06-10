@@ -461,6 +461,115 @@ fn test_write_dev_and_optional_reachable_uses_dev_optional() {
     assert_eq!(json["packages"]["node_modules/opt-root"]["optional"], true);
 }
 
+/// npm's flags are path-based, and below the root the only typed edge
+/// is a package's `optionalDependencies`: a production dep's optional
+/// child is `optional: true` (verified against npm 11: chokidar ⇒
+/// fsevents carries the flag), and a package reachable only via a dev
+/// chain *and* a transitive-optional chain is `devOptional: true`
+/// (arborist's calc-dep-flags: no pure-production path, but neither
+/// "every path dev" nor "every path optional" holds).
+#[test]
+fn test_write_transitive_optional_edges_set_optional_and_dev_optional() {
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        "parent@1.0.0".to_string(),
+        LockedPackage {
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some("sha512-parent".to_string()),
+            dep_path: "parent@1.0.0".to_string(),
+            dependencies: [("shared".to_string(), "1.0.0".to_string())]
+                .into_iter()
+                .collect(),
+            optional_dependencies: [("shared".to_string(), "^1.0.0".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+    );
+    graph.packages.insert(
+        "shared@1.0.0".to_string(),
+        LockedPackage {
+            name: "shared".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some("sha512-shared".to_string()),
+            dep_path: "shared@1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "parent".to_string(),
+            dep_path: "parent@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let manifest = aube_manifest::PackageJson {
+        name: Some("test".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [("parent".to_string(), "^1.0.0".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+
+    // Production root → optional edge: every path to `shared` crosses an
+    // optional edge ⇒ `optional: true` (the parent itself stays unflagged).
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.path()).unwrap()).unwrap();
+    assert_eq!(
+        json["packages"]["node_modules/shared"]["optional"], true,
+        "a production dep's optionalDependencies child must be optional"
+    );
+    assert!(
+        json["packages"]["node_modules/parent"]
+            .get("optional")
+            .is_none()
+    );
+
+    // Add a dev root depending on `shared` directly: now no pure-production
+    // path exists, but neither flag holds alone ⇒ `devOptional: true`.
+    graph.packages.insert(
+        "dev-root@1.0.0".to_string(),
+        LockedPackage {
+            name: "dev-root".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some("sha512-dev".to_string()),
+            dep_path: "dev-root@1.0.0".to_string(),
+            dependencies: [("shared".to_string(), "1.0.0".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+    );
+    graph.importers.get_mut(".").unwrap().push(DirectDep {
+        name: "dev-root".to_string(),
+        dep_path: "dev-root@1.0.0".to_string(),
+        dep_type: DepType::Dev,
+        specifier: None,
+    });
+    let manifest = aube_manifest::PackageJson {
+        dev_dependencies: [("dev-root".to_string(), "^1.0.0".to_string())]
+            .into_iter()
+            .collect(),
+        ..manifest
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.path()).unwrap()).unwrap();
+    let shared = &json["packages"]["node_modules/shared"];
+    assert_eq!(
+        shared["devOptional"], true,
+        "dev chain + transitive-optional chain must collapse to devOptional"
+    );
+    assert!(shared.get("dev").is_none() && shared.get("optional").is_none());
+}
+
 /// Regression: the npm writer must drop `dependencies` entries
 /// whose target isn't in the canonical map. Platform-filtered
 /// optionals and `ignoredOptionalDependencies` leave the parent's
