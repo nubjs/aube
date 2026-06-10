@@ -24,6 +24,13 @@ static MANIFEST_CONFIG_NAMESPACES: OnceLock<Vec<String>> = OnceLock::new();
 /// `trustedDependencies`, `patchedDependencies`, `dependenciesMeta`)
 /// are independent of this list.
 ///
+/// The empty string `""` is accepted as a namespace meaning *the
+/// manifest root*: config keys (`allowBuilds`, `catalog`, …) are then
+/// read from (and pruned at) the top level of `package.json` itself.
+/// An embedder whose config surface is top-level-only — bun-style —
+/// sets `[""]`; one that layers top-level over the pnpm object sets
+/// `["pnpm", ""]`.
+///
 /// Idempotent — second calls and calls after the first read are
 /// silently ignored, matching the other process-global `set_*`
 /// helpers. Empty lists are ignored: at least one namespace must
@@ -44,6 +51,24 @@ pub fn manifest_config_namespaces() -> &'static [String] {
             .map(|s| s.to_string())
             .collect()
     })
+}
+
+/// One configured `package.json` config namespace, as yielded by
+/// `PackageJson::pnpm_aube_objects`. Either a nested object
+/// (`pnpm`/`aube`) or the manifest root itself (the `""` namespace) —
+/// readers only ever probe keys, so one `get` method covers both.
+enum ConfigNamespace<'a> {
+    Root(&'a BTreeMap<String, serde_json::Value>),
+    Object(&'a serde_json::Map<String, serde_json::Value>),
+}
+
+impl<'a> ConfigNamespace<'a> {
+    fn get(&self, key: &str) -> Option<&'a serde_json::Value> {
+        match self {
+            ConfigNamespace::Root(map) => map.get(key),
+            ConfigNamespace::Object(obj) => obj.get(key),
+        }
+    }
 }
 
 /// Deserialize `engines` tolerant to legacy non-map forms, e.g.
@@ -311,7 +336,7 @@ impl BundledDependencies {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Workspaces {
     /// Bare single-pattern form. npm accepts
@@ -322,24 +347,83 @@ pub enum Workspaces {
     String(String),
     Array(Vec<String>),
     Object {
-        // `packages` stays required (no `#[serde(default)]`) so that a
-        // typo like `"pacakges"` fails deserialization instead of
-        // silently producing an empty vec. Bun's object form always
-        // includes `packages`, so this doesn't lock out the catalog use
-        // case.
+        // `packages` may be absent: bun accepts a packages-less
+        // object form for single-package projects that only declare
+        // catalogs (`"workspaces": {"catalog": {...}}`). The manual
+        // `Deserialize` impl below still rejects an object with *no*
+        // recognized key, so a typo like `"pacakges"` fails loudly
+        // instead of silently producing an empty workspace.
         packages: Vec<String>,
-        #[serde(default)]
         nohoist: Vec<String>,
         /// Bun-style default catalog nested under `workspaces.catalog`.
         /// Aube reads it in addition to `pnpm-workspace.yaml`'s `catalog:`
         /// so bun projects that migrated config into package.json keep
         /// working.
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         catalog: BTreeMap<String, String>,
         /// Bun-style named catalogs nested under `workspaces.catalogs`.
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         catalogs: BTreeMap<String, BTreeMap<String, String>>,
     },
+}
+
+impl<'de> Deserialize<'de> for Workspaces {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // The object branch lands in a raw map (instead of a derived
+        // struct) so unknown-key validation can run: at least one
+        // recognized key is required in a non-empty object. That keeps
+        // the original typo guard — `{"pacakges": [...]}` fails with a
+        // named error rather than deserializing to an empty workspace —
+        // while accepting bun's packages-less catalog-only form.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            String(String),
+            Array(Vec<String>),
+            Object(serde_json::Map<String, serde_json::Value>),
+        }
+
+        const RECOGNIZED: [&str; 4] = ["packages", "nohoist", "catalog", "catalogs"];
+
+        fn field<'de, T, D>(
+            map: &mut serde_json::Map<String, serde_json::Value>,
+            key: &str,
+        ) -> Result<T, D::Error>
+        where
+            T: serde::de::DeserializeOwned + Default,
+            D: Deserializer<'de>,
+        {
+            match map.remove(key) {
+                Some(value) => serde_json::from_value(value).map_err(|e| {
+                    serde::de::Error::custom(format!("invalid `workspaces.{key}`: {e}"))
+                }),
+                None => Ok(T::default()),
+            }
+        }
+
+        match Raw::deserialize(de)? {
+            Raw::String(s) => Ok(Workspaces::String(s)),
+            Raw::Array(v) => Ok(Workspaces::Array(v)),
+            Raw::Object(mut map) => {
+                if !map.is_empty() && !RECOGNIZED.iter().any(|k| map.contains_key(*k)) {
+                    return Err(serde::de::Error::custom(format!(
+                        "`workspaces` object has none of the recognized keys ({}); found: {}",
+                        RECOGNIZED.join(", "),
+                        map.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                Ok(Workspaces::Object {
+                    packages: field::<_, D>(&mut map, "packages")?,
+                    nohoist: field::<_, D>(&mut map, "nohoist")?,
+                    catalog: field::<_, D>(&mut map, "catalog")?,
+                    catalogs: field::<_, D>(&mut map, "catalogs")?,
+                })
+            }
+        }
+    }
 }
 
 impl Workspaces {
@@ -424,13 +508,21 @@ impl PackageJson {
     /// included. Aube mirrors every `pnpm.*` config key under an
     /// `aube.*` alias so projects can declare aube-native config
     /// without piggy-backing on the pnpm namespace. The namespace set
-    /// follows [`set_manifest_config_namespaces`] overrides.
-    fn pnpm_aube_objects(
-        &self,
-    ) -> impl Iterator<Item = &serde_json::Map<String, serde_json::Value>> {
-        manifest_config_namespaces()
-            .iter()
-            .filter_map(|k| self.extra.get(k.as_str()).and_then(|v| v.as_object()))
+    /// follows [`set_manifest_config_namespaces`] overrides; the `""`
+    /// entry yields the manifest root, so embedders can route every
+    /// namespace-driven reader (`allowBuilds`, `catalog`, …) at
+    /// top-level keys.
+    fn pnpm_aube_objects(&self) -> impl Iterator<Item = ConfigNamespace<'_>> {
+        manifest_config_namespaces().iter().filter_map(|k| {
+            if k.is_empty() {
+                Some(ConfigNamespace::Root(&self.extra))
+            } else {
+                self.extra
+                    .get(k.as_str())
+                    .and_then(|v| v.as_object())
+                    .map(ConfigNamespace::Object)
+            }
+        })
     }
 
     /// Extract the `pnpm.allowBuilds` / `aube.allowBuilds` object from
@@ -1198,6 +1290,54 @@ mod tests {
 
     fn parse(json: &str) -> PackageJson {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// Bun accepts a packages-less `workspaces` object so a
+    /// single-package project can declare catalogs
+    /// (`"workspaces": {"catalog": {...}}`). The object must parse,
+    /// yield no workspace patterns, and surface the catalogs.
+    #[test]
+    fn workspaces_object_without_packages_carries_catalogs() {
+        let p = parse(
+            r#"{"name":"x","workspaces":{"catalog":{"react":"^18.0.0"},"catalogs":{"evens":{"react":"^18.2.0"}}}}"#,
+        );
+        let ws = p.workspaces.as_ref().unwrap();
+        assert!(ws.patterns().is_empty(), "no packages key → no patterns");
+        assert_eq!(ws.catalog().get("react").unwrap(), "^18.0.0");
+        assert_eq!(
+            ws.catalogs()
+                .get("evens")
+                .and_then(|c| c.get("react"))
+                .unwrap(),
+            "^18.2.0"
+        );
+    }
+
+    /// The typo guard the required-`packages` field used to provide:
+    /// an object with only unrecognized keys still fails, now with an
+    /// error that names the offending keys instead of a generic
+    /// untagged-enum mismatch.
+    #[test]
+    fn workspaces_object_with_only_unrecognized_keys_is_rejected() {
+        let err = serde_json::from_str::<PackageJson>(
+            r#"{"name":"x","workspaces":{"pacakges":["a/*"]}}"#,
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("pacakges"),
+            "error must name the unrecognized key, got: {err}"
+        );
+    }
+
+    /// A recognized key plus an unknown sibling stays accepted — bun
+    /// may grow new object-form keys and old aube builds must not
+    /// reject manifests that use them.
+    #[test]
+    fn workspaces_object_tolerates_unknown_siblings_of_recognized_keys() {
+        let p = parse(r#"{"name":"x","workspaces":{"packages":["pkgs/*"],"futureKey":true}}"#);
+        assert_eq!(p.workspaces.as_ref().unwrap().patterns(), ["pkgs/*"]);
     }
 
     /// Pre-npm-2.x publishes (e.g. `extsprintf@1.4.1`, `coffee-script@1.3.3`)

@@ -262,43 +262,60 @@ fn run_global(packages: &[String]) -> miette::Result<()> {
     Ok(())
 }
 
+/// Config keys `aube remove` prunes inside each configured namespace
+/// — and at the manifest root when the `""` (root) namespace is
+/// configured. Map-shaped keys are keyed by package name; array keys
+/// hold `name` / `name@range` entries.
+const PRUNE_MAP_KEYS: [&str; 3] = ["allowBuilds", "overrides", "peerDependencyRules"];
+const PRUNE_ARRAY_KEYS: [&str; 3] = [
+    "onlyBuiltDependencies",
+    "neverBuiltDependencies",
+    "trustedDependencies",
+];
+
+/// Drop `name` from every prune-key inside one namespace object.
+/// `shift_remove` (not `remove` → swap_remove) keeps the surrounding
+/// keys in their original on-disk position — `aube remove` must not
+/// reshuffle the user's manifest as a side effect.
+fn prune_config_keys_json(ns: &mut serde_json::Map<String, serde_json::Value>, name: &str) {
+    for map_key in PRUNE_MAP_KEYS {
+        if let Some(inner) = ns.get_mut(map_key).and_then(|v| v.as_object_mut()) {
+            inner.shift_remove(name);
+            if inner.is_empty() {
+                ns.shift_remove(map_key);
+            }
+        }
+    }
+    for arr_key in PRUNE_ARRAY_KEYS {
+        if let Some(arr) = ns.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
+            arr.retain(|entry| match entry.as_str() {
+                Some(s) => s.rsplit_once('@').map(|(base, _)| base).unwrap_or(s) != name,
+                None => true,
+            });
+            if arr.is_empty() {
+                ns.shift_remove(arr_key);
+            }
+        }
+    }
+}
+
 fn prune_sidecar_entries_json(obj: &mut serde_json::Map<String, serde_json::Value>, name: &str) {
-    // shift_remove (not remove → swap_remove) keeps the surrounding
-    // keys in their original on-disk position. Same rationale as the
-    // dep-section pruning above: `aube remove` must not reshuffle the
-    // user's manifest as a side effect. Only configured namespaces
-    // are mutated (see `set_manifest_config_namespaces`).
+    // Only configured namespaces are mutated (see
+    // `set_manifest_config_namespaces`).
     for ns_key in aube_manifest::manifest_config_namespaces() {
-        let remove_ns = if let Some(ns) =
-            obj.get_mut(ns_key.as_str()).and_then(|v| v.as_object_mut())
-        {
-            for map_key in ["allowBuilds", "overrides", "peerDependencyRules"] {
-                if let Some(inner) = ns.get_mut(map_key).and_then(|v| v.as_object_mut()) {
-                    inner.shift_remove(name);
-                    if inner.is_empty() {
-                        ns.shift_remove(map_key);
-                    }
-                }
-            }
-            for arr_key in [
-                "onlyBuiltDependencies",
-                "neverBuiltDependencies",
-                "trustedDependencies",
-            ] {
-                if let Some(arr) = ns.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
-                    arr.retain(|entry| match entry.as_str() {
-                        Some(s) => s.rsplit_once('@').map(|(base, _)| base).unwrap_or(s) != name,
-                        None => true,
-                    });
-                    if arr.is_empty() {
-                        ns.shift_remove(arr_key);
-                    }
-                }
-            }
-            ns.is_empty()
-        } else {
-            false
-        };
+        if ns_key.is_empty() {
+            // `""` = the manifest root: prune the same config keys at
+            // top level. The root itself is never removed.
+            prune_config_keys_json(obj, name);
+            continue;
+        }
+        let remove_ns =
+            if let Some(ns) = obj.get_mut(ns_key.as_str()).and_then(|v| v.as_object_mut()) {
+                prune_config_keys_json(ns, name);
+                ns.is_empty()
+            } else {
+                false
+            };
         if remove_ns {
             obj.shift_remove(ns_key);
         }
@@ -329,6 +346,38 @@ fn prune_sidecar_entries(manifest: &mut aube_manifest::PackageJson, name: &str) 
     // `set_manifest_config_namespaces` is foreign data we must not
     // rewrite.
     for ns_key in aube_manifest::manifest_config_namespaces() {
+        if ns_key.is_empty() {
+            // `""` = the manifest root: prune the same config keys at
+            // top level of `extra`. The root itself is never removed.
+            for map_key in PRUNE_MAP_KEYS {
+                if let Some(inner) = manifest
+                    .extra
+                    .get_mut(map_key)
+                    .and_then(|v| v.as_object_mut())
+                {
+                    inner.remove(name);
+                    if inner.is_empty() {
+                        manifest.extra.remove(map_key);
+                    }
+                }
+            }
+            for arr_key in PRUNE_ARRAY_KEYS {
+                if let Some(arr) = manifest
+                    .extra
+                    .get_mut(arr_key)
+                    .and_then(|v| v.as_array_mut())
+                {
+                    arr.retain(|entry| match entry.as_str() {
+                        Some(s) => s.rsplit_once('@').map(|(a, _)| a).unwrap_or(s) != name,
+                        None => true,
+                    });
+                    if arr.is_empty() {
+                        manifest.extra.remove(arr_key);
+                    }
+                }
+            }
+            continue;
+        }
         let Some(ns) = manifest.extra.get_mut(ns_key.as_str()) else {
             continue;
         };
@@ -336,7 +385,7 @@ fn prune_sidecar_entries(manifest: &mut aube_manifest::PackageJson, name: &str) 
             continue;
         };
         // Map-shape fields: key is package name.
-        for map_key in ["allowBuilds", "overrides", "peerDependencyRules"] {
+        for map_key in PRUNE_MAP_KEYS {
             if let Some(inner) = obj.get_mut(map_key).and_then(|v| v.as_object_mut()) {
                 inner.remove(name);
                 // peerDependencyRules has nested allowedVersions,
@@ -348,11 +397,7 @@ fn prune_sidecar_entries(manifest: &mut aube_manifest::PackageJson, name: &str) 
             }
         }
         // Array-shape fields: whole entries match name or name@ver.
-        for arr_key in [
-            "onlyBuiltDependencies",
-            "neverBuiltDependencies",
-            "trustedDependencies",
-        ] {
+        for arr_key in PRUNE_ARRAY_KEYS {
             if let Some(arr) = obj.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
                 arr.retain(|entry| match entry.as_str() {
                     Some(s) => {
