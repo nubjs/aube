@@ -21,7 +21,7 @@ pub mod commands;
 mod dep_chain;
 mod deprecations;
 mod dirs;
-mod engines;
+pub mod engines;
 mod patches;
 mod pnpmfile;
 mod progress;
@@ -560,6 +560,12 @@ pub use aube_manifest::workspace::set_workspace_yaml_names;
 /// (`overrides`, `resolutions`, `trustedDependencies`, …) are
 /// unaffected. Call once per process before invoking any command.
 pub use aube_manifest::set_manifest_config_namespaces;
+
+/// `engines.aube` validation toggle for embedders — see
+/// [`engines::set_aube_engine_check`]. Defaults to enabled;
+/// `engines.node` validation is unaffected. Call once per process
+/// before invoking any command.
+pub use engines::set_aube_engine_check;
 
 /// CLI entry point shared by the `aube`, `aubr`, and `aubx` binaries.
 ///

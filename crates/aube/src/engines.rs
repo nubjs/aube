@@ -35,6 +35,30 @@ pub fn aube_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+static AUBE_ENGINE_CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Disable (or explicitly keep) `engines.aube` validation. Defaults to
+/// enabled.
+///
+/// For embedders: a tool driving aube's command layer as a library has
+/// its own version that does not live in aube's version namespace, so
+/// honoring a project's `engines.aube` pin against `aube_version()`
+/// would gate the embedding product on a constraint its users never
+/// see — the same spurious-mismatch rationale that keeps
+/// `engines.pnpm` unchecked (module docs). `engines.node` validation
+/// is unaffected.
+///
+/// Idempotent — second calls are silently ignored, matching the other
+/// process-global `set_*` helpers. Call once per process before
+/// invoking any command.
+pub fn set_aube_engine_check(enabled: bool) {
+    let _ = AUBE_ENGINE_CHECK.set(enabled);
+}
+
+fn aube_engine_check_enabled() -> bool {
+    *AUBE_ENGINE_CHECK.get().unwrap_or(&true)
+}
+
 /// Which `engines.<key>` field a mismatch was found on. Carried on
 /// `Mismatch` so the warning printer can label the failure correctly
 /// without reparsing the manifest.
@@ -155,7 +179,9 @@ fn check_manifest_engines(
             current: node_v.to_string(),
         });
     }
-    if let Some(declared) = check_engine_field(&manifest.engines, "aube", aube_v) {
+    if aube_engine_check_enabled()
+        && let Some(declared) = check_engine_field(&manifest.engines, "aube", aube_v)
+    {
         out.push(Mismatch {
             engine: Engine::Aube,
             package: label.to_string(),
