@@ -501,14 +501,17 @@ pub(crate) fn project_modules_dir(cwd: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Resolve the absolute path of the per-project virtual store
-/// (pnpm's `virtualStoreDir`). When the user explicitly sets the value
-/// in `.npmrc`, `pnpm-workspace.yaml`, or the environment, expand it
-/// (relative paths resolve against `project_dir`, `~` expands to
-/// `$HOME`) and return it. Otherwise derive from `modulesDir`:
+/// (pnpm's `virtualStoreDir`). When the value is explicitly set —
+/// in `.npmrc`, `pnpm-workspace.yaml`, the environment, or either
+/// programmatic embedder source — expand it (relative paths resolve
+/// against `project_dir`, `~` expands to `$HOME`) and return it.
+/// Otherwise derive from `modulesDir`:
 /// `<project_dir>/<modulesDir>/.aube`. This matches pnpm, where the
 /// documented default is `<modulesDir>/.pnpm` — a user who overrides
 /// `modulesDir` alone keeps a coherent layout without having to set
-/// both.
+/// both. (An embedder-default `virtualStoreDir` consequently replaces
+/// the `<modulesDir>/.aube` derivation too; an embedder that wants the
+/// modulesDir-coupled behavior simply doesn't set the key.)
 ///
 /// Every site that touches `.aube/<dep_path>/` — linker, install state
 /// sidecar, `patch`, `rebuild`, `list --long`, `why`, `prune`, `clean`,
@@ -548,7 +551,14 @@ pub(crate) fn resolve_virtual_store_dir(
             || k == "AUBE_VIRTUAL_STORE_DIR")
             && aube_util::env::env_family_enabled(k)
     });
-    if !(has_explicit_npmrc || has_explicit_yaml || has_explicit_env) {
+    // The programmatic embedder sources (overlay above env, defaults
+    // below files) count as explicit too — without this check a value
+    // registered through either seam would be silently discarded in
+    // favor of the `<modulesDir>/.aube` derivation.
+    let has_explicit_programmatic = aube_settings::values::string_from_overlay("virtualStoreDir")
+        .is_some()
+        || aube_settings::values::string_from_embedder_defaults("virtualStoreDir").is_some();
+    if !(has_explicit_npmrc || has_explicit_yaml || has_explicit_env || has_explicit_programmatic) {
         return default_from_modules_dir();
     }
     let raw = aube_settings::resolved::virtual_store_dir(ctx);
