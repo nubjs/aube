@@ -33,9 +33,63 @@
 //!   and never makes a multi-lockfile project ambiguous: aube's
 //!   documented contract is "preserve whatever lockfile the project
 //!   already uses".
+//!
+//! Both carve-outs are embedder-parameterized (defaults preserve the
+//! behavior above): [`set_detection_self_names`] swaps which declared
+//! names count as the running tool, and
+//! [`set_canonical_lockfile_always_wins`] lets a strict-identity
+//! embedder demote the first carve-out so a canonical lockfile beside a
+//! foreign one resolves through the ordinary ambiguity/contradiction
+//! rules instead of silently winning.
 
 use crate::io::{Error, LockfileKind, lockfile_candidates, refine_yarn_kind};
 use std::path::Path;
+use std::sync::OnceLock;
+
+static SELF_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+static CANONICAL_ALWAYS_WINS: OnceLock<bool> = OnceLock::new();
+
+/// Override the package-manager names detection treats as "the running tool
+/// itself" — the names whose declaration accepts every preservable lockfile
+/// format and pins the canonical format for fresh projects (what `aube` is by
+/// default). An embedder shipping aube's command layer under its own name
+/// registers that name here so `"packageManager": "<embedder>@1.0.0"`
+/// resolves exactly like a declared `aube` does upstream, instead of falling
+/// through as an unknown foreign tool.
+///
+/// Idempotent — second calls and calls after the first read are silently
+/// ignored; empty lists are ignored (at least one self-name must remain).
+pub fn set_detection_self_names(names: &[&str]) {
+    if names.is_empty() {
+        return;
+    }
+    let _ = SELF_NAMES.set(names.iter().map(|s| s.to_string()).collect());
+}
+
+fn is_self_name(name: &str) -> bool {
+    SELF_NAMES
+        .get()
+        .map(|names| names.iter().any(|n| n == name))
+        .unwrap_or(name == "aube")
+}
+
+/// Whether the canonical lockfile's presence short-circuits detection even
+/// when other tools' lockfiles sit beside it (the upstream default, `true` —
+/// the normal post-`aube import` state is `aube-lock.yaml` next to the
+/// original foreign lockfile, and it must keep resolving). An embedder with
+/// a strict identity model can set `false`: the canonical kind then
+/// participates in the ordinary declaration/ambiguity rules, so a canonical
+/// lockfile beside a foreign one becomes the loud [`Error::AmbiguousLockfiles`]
+/// / [`Error::DeclarationMismatch`] instead of a silent win.
+///
+/// Idempotent; same contract as the other process-global `set_*` helpers.
+pub fn set_canonical_lockfile_always_wins(always_wins: bool) {
+    let _ = CANONICAL_ALWAYS_WINS.set(always_wins);
+}
+
+fn canonical_lockfile_always_wins() -> bool {
+    *CANONICAL_ALWAYS_WINS.get().unwrap_or(&true)
+}
 
 /// Which `package.json` field declared the package manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,12 +236,15 @@ pub fn resolve_project_lockfile_kind(project_dir: &Path) -> Result<ResolvedLockf
             .into_iter()
             .filter(|(path, _)| path.exists())
             .collect();
-    // aube's own lockfile always wins — see module docs.
-    if existing.iter().any(|(_, k)| *k == LockfileKind::Aube) {
+    // aube's own lockfile always wins — see module docs. An embedder with a
+    // strict identity model opts out (set_canonical_lockfile_always_wins),
+    // letting the canonical kind fall through to the ordinary
+    // declaration/ambiguity rules below.
+    if canonical_lockfile_always_wins() && existing.iter().any(|(_, k)| *k == LockfileKind::Aube) {
         return Ok(ResolvedLockfileKind::Existing(LockfileKind::Aube));
     }
     let declared = declared_package_manager(project_dir);
-    match declared.as_ref().filter(|d| d.name != "aube") {
+    match declared.as_ref().filter(|d| !is_self_name(&d.name)) {
         Some(decl) => match declared_lockfile_kind(&decl.name) {
             Some(declared_kind) => {
                 // Match on family, not exact kind: declared `npm` is
