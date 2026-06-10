@@ -68,7 +68,10 @@ pub(crate) fn take_project_lock(cwd: &std::path::Path) -> miette::Result<Project
     let nm_path = super::project_modules_dir(cwd);
     let lock = xx::fslock::FSLock::new(&nm_path)
         .with_callback(|_| {
-            eprintln!("Waiting for another aube process to finish in this project...");
+            eprintln!(
+                "Waiting for another {} process to finish in this project...",
+                aube_util::ua::product_name()
+            );
         })
         .lock()
         .map_err(|e| miette!("failed to acquire project lock: {e}"))?;

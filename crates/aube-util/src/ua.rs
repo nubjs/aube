@@ -33,3 +33,37 @@ pub fn set_user_agent_product(product: impl Into<String>) {
 pub fn user_agent_product() -> Option<&'static str> {
     PRODUCT.get().map(String::as_str)
 }
+
+/// The product *name* stream-time messages should print when they name
+/// the running tool — the name half of the first registered
+/// `name/version` token, or `"aube"` when no embedder registered one.
+///
+/// Command hints (``Run `aube deprecations` ``), lock-wait notices, and
+/// similar prose name the tool the user actually invoked; an embedder
+/// that registered its identity for the UA and the install header is
+/// that tool, so these messages follow the same registration (the
+/// audience contract from [`set_user_agent_product`]).
+pub fn product_name() -> &'static str {
+    user_agent_product()
+        .and_then(|p| p.split_whitespace().next())
+        .map(|token| token.split('/').next().unwrap_or(token))
+        .unwrap_or("aube")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One test fn so the unset→set ordering on the process-global
+    /// `PRODUCT` is deterministic (parallel tests would race it).
+    #[test]
+    fn product_name_defaults_to_aube_and_follows_the_registered_token() {
+        assert_eq!(product_name(), "aube", "unset must fall back to aube");
+        set_user_agent_product("mytool/2.1.0 aube/1.18.2");
+        assert_eq!(
+            product_name(),
+            "mytool",
+            "name half of the first registered token"
+        );
+    }
+}

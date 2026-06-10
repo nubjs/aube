@@ -143,14 +143,15 @@ pub(super) fn merge_branch_lockfiles_if_needed(
 }
 
 pub(super) fn warn_accepted_noop_install_settings(settings_ctx: &aube_settings::ResolveCtx<'_>) {
+    let product = aube_util::ua::product_name();
     if super::settings::resolve_use_running_store_server(settings_ctx) {
         eprintln!(
-            "warning: aube has no store server; useRunningStoreServer=true is accepted but has no effect"
+            "warning: {product} has no store server; useRunningStoreServer=true is accepted but has no effect"
         );
     }
     if !super::settings::resolve_symlink(settings_ctx) {
         eprintln!(
-            "warning: aube's isolated layout requires symlinks; symlink=false is accepted but has no effect"
+            "warning: {product}'s isolated layout requires symlinks; symlink=false is accepted but has no effect"
         );
     }
 }

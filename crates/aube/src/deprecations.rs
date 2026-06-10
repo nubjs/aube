@@ -130,7 +130,8 @@ fn write_transitive_count_line(count: usize) {
     let pkgs = pluralizer::pluralize("transitive package", count as isize, true);
     let verb = if count == 1 { "has" } else { "have" };
     let msg = format!(
-        "{pkgs} {verb} deprecation warnings. Run `aube deprecations --transitive` to see them."
+        "{pkgs} {verb} deprecation warnings. Run `{} deprecations --transitive` to see them.",
+        aube_util::ua::product_name()
     );
     let _ = writeln!(std::io::stderr(), "{}", style::edim(msg));
 }
@@ -138,11 +139,10 @@ fn write_transitive_count_line(count: usize) {
 fn write_count_line(count: usize, has_transitive: bool) {
     let pkgs = pluralizer::pluralize("package", count as isize, true);
     let verb = if count == 1 { "has" } else { "have" };
-    let cmd = if has_transitive {
-        "aube deprecations --transitive"
-    } else {
-        "aube deprecations"
-    };
-    let msg = format!("{pkgs} {verb} deprecation warnings. Run `{cmd}` to see them.");
+    let flag = if has_transitive { " --transitive" } else { "" };
+    let msg = format!(
+        "{pkgs} {verb} deprecation warnings. Run `{} deprecations{flag}` to see them.",
+        aube_util::ua::product_name()
+    );
     let _ = writeln!(std::io::stderr(), "{}", style::edim(msg));
 }
