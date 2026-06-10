@@ -1288,6 +1288,14 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             crate::pnpmfile::ReadPackageHostChain::drain_forwarders(read_package_forwarders).await;
             crate::pnpmfile::run_after_all_resolved_chain(&pnpmfile_paths, &cwd, &mut graph)
                 .await?;
+            // Record the project's patch configuration (manifest /
+            // workspace-yaml `patchedDependencies` + sha256 of each
+            // patch file) on the graph before anything downstream
+            // clones it — the lockfile writers need it to emit pnpm
+            // 10's `{hash, path}` block and `(patch_hash=…)` suffixes
+            // / bun's `patchedDependencies` block, without which the
+            // real PMs reject or silently unpatch a frozen install.
+            crate::patches::record_patches_on_graph(&cwd, &mut graph)?;
             // Overlay per-package metadata the resolver can't recover
             // from abbreviated (corgi) packuments — `license`,
             // `funding_url`, bun's `configVersion` — from the

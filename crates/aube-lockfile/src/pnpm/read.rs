@@ -707,12 +707,15 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         })
         .collect();
 
-    let patched_dependencies: BTreeMap<String, String> = raw
-        .patched_dependencies
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(k, v)| (k, v.into_path()))
-        .collect();
+    let mut patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
+    let mut patched_dependency_hashes: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in raw.patched_dependencies.unwrap_or_default() {
+        let (path, hash) = v.into_path_and_hash();
+        if let Some(hash) = hash {
+            patched_dependency_hashes.insert(k.clone(), hash);
+        }
+        patched_dependencies.insert(k, path);
+    }
 
     Ok(LockfileGraph {
         importers,
@@ -729,6 +732,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         catalogs,
         bun_config_version: None,
         patched_dependencies,
+        patched_dependency_hashes,
         trusted_dependencies: Vec::new(),
         extra_fields: BTreeMap::new(),
         workspace_extra_fields: BTreeMap::new(),

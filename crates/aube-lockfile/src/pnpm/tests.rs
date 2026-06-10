@@ -1139,6 +1139,97 @@ fn patched_dependencies_emitted_after_overrides_before_catalogs() {
     );
 }
 
+/// A patched dependency must serialize the way real pnpm 10 writes it
+/// (ground-truthed against pnpm 10.15.1 `patch` + `patch-commit` on
+/// `ms@2.1.3`): the top-level `patchedDependencies:` entry is a
+/// `{ hash, path }` mapping where `hash` is the sha256 hex of the
+/// patch file, the importer's resolved version and the `snapshots:`
+/// key carry a `(patch_hash=<hash>)` suffix, and the `packages:` key
+/// stays the clean `name@version`. pnpm rejects a lockfile that names
+/// the patch without the hash plumbing with
+/// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`.
+#[test]
+fn patched_dependency_writes_pnpm10_hash_and_suffix_shape() {
+    const HASH: &str = "82ff0b4d1c20272cdb11684045f28947472d5b8a10a04c0d972102d14815e536";
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "ms@2.1.3".to_string(),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            integrity: Some("sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==".to_string()),
+            dep_path: "ms@2.1.3".to_string(),
+            ..Default::default()
+        },
+    );
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "ms".to_string(),
+            dep_path: "ms@2.1.3".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("2.1.3".to_string()),
+        }],
+    );
+    let mut patched_dependencies = BTreeMap::new();
+    patched_dependencies.insert("ms@2.1.3".to_string(), "patches/ms@2.1.3.patch".to_string());
+    let mut patched_dependency_hashes = BTreeMap::new();
+    patched_dependency_hashes.insert("ms@2.1.3".to_string(), HASH.to_string());
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        patched_dependencies,
+        patched_dependency_hashes,
+        ..Default::default()
+    };
+    let mut deps = BTreeMap::new();
+    deps.insert("ms".to_string(), "2.1.3".to_string());
+    let manifest = PackageJson {
+        name: Some("test".to_string()),
+        dependencies: deps,
+        ..Default::default()
+    };
+
+    write(&lockfile_path, &graph, &manifest).unwrap();
+    let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
+
+    assert!(
+        yaml.contains(&format!(
+            "patchedDependencies:\n  ms@2.1.3:\n    hash: {HASH}\n    path: patches/ms@2.1.3.patch"
+        )),
+        "expected pnpm 10 {{hash, path}} patchedDependencies entry in:\n{yaml}"
+    );
+    assert!(
+        yaml.contains(&format!("version: 2.1.3(patch_hash={HASH})")),
+        "expected importer version to carry the patch_hash suffix in:\n{yaml}"
+    );
+    assert!(
+        yaml.contains(&format!("  ms@2.1.3(patch_hash={HASH}): {{}}")),
+        "expected the snapshots key to carry the patch_hash suffix in:\n{yaml}"
+    );
+    assert!(
+        yaml.contains("\n  ms@2.1.3:\n    resolution:"),
+        "expected the packages key to stay the clean name@version in:\n{yaml}"
+    );
+
+    // Round-trip: both the path and the hash must survive a re-parse,
+    // otherwise the next write degrades to the rejected shape.
+    let reparsed = parse(&lockfile_path).unwrap();
+    assert_eq!(
+        reparsed.patched_dependencies.get("ms@2.1.3").unwrap(),
+        "patches/ms@2.1.3.patch"
+    );
+    assert_eq!(
+        reparsed.patched_dependency_hashes.get("ms@2.1.3").unwrap(),
+        HASH
+    );
+}
+
 #[test]
 fn empty_overrides_block_omitted_from_yaml() {
     // Default-empty overrides should not introduce an `overrides:` key

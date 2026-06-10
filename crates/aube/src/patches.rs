@@ -25,6 +25,10 @@ pub struct ResolvedPatch {
     pub version: String,
     #[allow(dead_code)]
     pub path: PathBuf,
+    /// The project-relative patch path exactly as declared
+    /// (`patches/ms@2.1.3.patch`, forward slashes) — the string the
+    /// lockfile's `patchedDependencies:` block records.
+    pub rel: String,
     pub content: String,
 }
 
@@ -204,6 +208,7 @@ fn load_patches_with_lockfile_entries(
                 name,
                 version,
                 path,
+                rel,
                 content,
             },
         );
@@ -211,13 +216,43 @@ fn load_patches_with_lockfile_entries(
     Ok(out)
 }
 
-/// Add or replace an entry in `patchedDependencies`. Routes through
-/// the shared [`aube_manifest::workspace::config_write_target`] rule:
-/// workspace yaml when one is present, otherwise `package.json`.
-/// Returns the path that was rewritten so the caller can report it to
-/// the user.
+/// Add or replace an entry in `patchedDependencies`. The entry goes
+/// where the package manager that owns the project's lockfile reads
+/// it from: a bun-format project gets `package.json`'s top-level
+/// `patchedDependencies` (the only location real bun consults — an
+/// entry under `pnpm.patchedDependencies` would leave a frozen
+/// `bun install` linking unpatched content). Everything else routes
+/// through the shared
+/// [`aube_manifest::workspace::config_write_target`] rule: workspace
+/// yaml when one is present, otherwise `package.json`'s
+/// `pnpm`/`aube` namespace. Returns the path that was rewritten so
+/// the caller can report it to the user.
 pub fn upsert_patched_dependency(cwd: &Path, key: &str, rel_patch_path: &str) -> Result<PathBuf> {
     use aube_manifest::workspace::ConfigWriteTarget;
+    // Interop routing by the project's lockfile format. bun reads only
+    // the top-level `patchedDependencies`; pnpm reads only
+    // `pnpm.patchedDependencies` (or the workspace yaml, which
+    // `config_write_target` already prefers when present) — an entry
+    // under the `aube` namespace would make the real PM reject the
+    // very lockfile we write for it (pnpm:
+    // ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) or silently link unpatched
+    // content (bun). aube-native projects keep the configured
+    // namespace rule below.
+    match aube_lockfile::detect_existing_lockfile_kind(cwd) {
+        Some(aube_lockfile::LockfileKind::Bun) => {
+            upsert_manifest_patched_dependency(cwd, key, rel_patch_path, None)
+                .wrap_err("failed to write package.json")?;
+            return Ok(cwd.join("package.json"));
+        }
+        Some(aube_lockfile::LockfileKind::Pnpm)
+            if aube_manifest::workspace::workspace_yaml_existing(cwd).is_none() =>
+        {
+            upsert_manifest_patched_dependency(cwd, key, rel_patch_path, Some("pnpm"))
+                .wrap_err("failed to write package.json")?;
+            return Ok(cwd.join("package.json"));
+        }
+        _ => {}
+    }
     match aube_manifest::workspace::config_write_target(cwd) {
         ConfigWriteTarget::PackageJson => {
             aube_manifest::workspace::edit_setting_map(cwd, "patchedDependencies", |map| {
@@ -241,6 +276,45 @@ pub fn upsert_patched_dependency(cwd: &Path, key: &str, rel_patch_path: &str) ->
             Ok(path)
         }
     }
+}
+
+/// The manifest/workspace-declared patch config — `(selector → rel
+/// path, selector → sha256 hex of the patch file's current contents)`
+/// — for install's lockfile drift check
+/// ([`aube_lockfile::LockfileGraph::check_patched_dependencies_drift`]).
+/// Deliberately excludes lockfile-carried entries: drift compares the
+/// project's declared intent against what the lockfile recorded.
+/// Errors on a declared-but-missing patch file, same as the linker.
+pub fn effective_patch_config(
+    cwd: &Path,
+) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+    let resolved = load_patches_with_lockfile_entries(cwd, &BTreeMap::new())?;
+    let mut paths = BTreeMap::new();
+    let mut hashes = BTreeMap::new();
+    for patch in resolved.values() {
+        paths.insert(patch.key.clone(), patch.rel.clone());
+        hashes.insert(patch.key.clone(), patch.content_hash());
+    }
+    Ok((paths, hashes))
+}
+
+/// Record the project's patch configuration on a freshly resolved
+/// graph so the lockfile writers emit it the way the owning package
+/// manager does: pnpm 10's `patchedDependencies: { hash, path }` block
+/// plus `(patch_hash=…)` dep-path suffixes, bun's path-form
+/// `patchedDependencies` block. The config — Bun's top-level
+/// `patchedDependencies`, `pnpm.patchedDependencies` /
+/// `aube.patchedDependencies`, then workspace yaml — *replaces*
+/// whatever the graph carried: it is the user's intent, and keeping
+/// stale lockfile-carried entries would resurrect patches the user
+/// just `patch-remove`d. The hash is the sha256 hex of the patch file
+/// contents — exactly what pnpm computes and verifies on a frozen
+/// install.
+pub fn record_patches_on_graph(cwd: &Path, graph: &mut aube_lockfile::LockfileGraph) -> Result<()> {
+    let (paths, hashes) = effective_patch_config(cwd)?;
+    graph.patched_dependencies = paths;
+    graph.patched_dependency_hashes = hashes;
+    Ok(())
 }
 
 /// Drop an entry from `patchedDependencies` in whichever file declares
@@ -270,6 +344,53 @@ pub fn remove_patched_dependency(cwd: &Path, key: &str) -> Result<Vec<PathBuf>> 
         rewritten.push(cwd.join("package.json"));
     }
     Ok(rewritten)
+}
+
+/// Add or replace `key` in a `patchedDependencies` map in
+/// `package.json` — top-level when `namespace` is `None` (bun's
+/// location), nested under the named object otherwise (`pnpm` for
+/// pnpm-format projects). Creates the map (and namespace object)
+/// when absent.
+fn upsert_manifest_patched_dependency(
+    cwd: &Path,
+    key: &str,
+    rel_patch_path: &str,
+    namespace: Option<&str>,
+) -> Result<()> {
+    let path = cwd.join("package.json");
+    let raw = std::fs::read_to_string(&path)
+        .into_diagnostic()
+        .map_err(|e| miette!("failed to read {}: {e}", path.display()))?;
+    let mut value =
+        aube_manifest::parse_json::<serde_json::Value>(&path, raw).map_err(miette::Report::new)?;
+    let mut obj = value
+        .as_object_mut()
+        .ok_or_else(|| miette!("package.json is not an object"))?;
+    if let Some(ns) = namespace {
+        obj = obj
+            .entry(ns)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| miette!("package.json `{ns}` is not an object"))?;
+    }
+    let patched = obj
+        .entry("patchedDependencies")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let patched = patched
+        .as_object_mut()
+        .ok_or_else(|| miette!("package.json `patchedDependencies` is not an object"))?;
+    patched.insert(
+        key.to_string(),
+        serde_json::Value::String(rel_patch_path.to_string()),
+    );
+    let mut out = serde_json::to_string_pretty(&value)
+        .into_diagnostic()
+        .map_err(|e| miette!("failed to serialize {}: {e}", path.display()))?;
+    out.push('\n');
+    std::fs::write(&path, out)
+        .into_diagnostic()
+        .map_err(|e| miette!("failed to write {}: {e}", path.display()))?;
+    Ok(())
 }
 
 fn remove_bun_patched_dependency(cwd: &Path, key: &str) -> Result<bool> {

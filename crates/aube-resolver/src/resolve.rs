@@ -124,6 +124,7 @@ impl Resolver {
             // install-side merge (`overlay_metadata_from`) copies
             // them back from the prior lockfile when round-tripping.
             patched_dependencies: BTreeMap::new(),
+            patched_dependency_hashes: BTreeMap::new(),
             trusted_dependencies: Vec::new(),
             extra_fields: BTreeMap::new(),
             workspace_extra_fields: BTreeMap::new(),
