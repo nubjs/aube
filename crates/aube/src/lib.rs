@@ -523,6 +523,14 @@ enum Commands {
 /// command.
 pub use aube_settings::set_embedder_overlay;
 
+/// Programmatic setting *defaults* for embedders, re-exported from
+/// `aube-settings`: the counterpart to [`set_embedder_overlay`] that
+/// ranks below every user-controlled source (CLI, overlay, env, all
+/// files), just above each setting's built-in default. Use it to
+/// reshape defaults without masking user configuration. Call once per
+/// process before invoking any command.
+pub use aube_settings::set_embedder_defaults;
+
 /// Env-family restriction for embedders, re-exported from `aube-util`:
 /// limit which environment-variable families (npm-compatible
 /// `npm_config_*`, aube-owned `AUBE_*`, ecosystem-neutral externals)

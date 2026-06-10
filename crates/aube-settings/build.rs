@@ -241,13 +241,14 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
             Some(_) => value_ty.clone(),
             None => format!("Option<{value_ty}>"),
         };
-        let (npmrc_call, ws_call, env_call, cli_call, overlay_call) = match kind {
+        let (npmrc_call, ws_call, env_call, cli_call, overlay_call, defaults_call) = match kind {
             Kind::Bool => (
                 "bool_from_npmrc",
                 "bool_from_workspace_yaml",
                 "bool_from_env",
                 "bool_from_cli",
                 "bool_from_overlay",
+                "bool_from_embedder_defaults",
             ),
             Kind::String | Kind::Enum => (
                 "string_from_npmrc",
@@ -255,6 +256,7 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
                 "string_from_env",
                 "string_from_cli",
                 "string_from_overlay",
+                "string_from_embedder_defaults",
             ),
             Kind::U64 => (
                 "u64_from_npmrc",
@@ -262,6 +264,7 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
                 "u64_from_env",
                 "u64_from_cli",
                 "u64_from_overlay",
+                "u64_from_embedder_defaults",
             ),
             Kind::VecString => (
                 "string_list_from_npmrc",
@@ -269,6 +272,7 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
                 "string_list_from_env",
                 "string_list_from_cli",
                 "string_list_from_overlay",
+                "string_list_from_embedder_defaults",
             ),
         };
 
@@ -297,11 +301,14 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
         // surfaces the parse failure as `None` so the caller's default
         // applies instead of a silently-overridden value.
         for (i, src) in order.iter().enumerate() {
-            // The overlay is process-global state rather than a
-            // `ResolveCtx` field, so its helper takes only the setting
-            // name. Every other source reads a ctx slice.
+            // The overlay and the embedder defaults are process-global
+            // state rather than `ResolveCtx` fields, so their helpers
+            // take only the setting name. Every other source reads a
+            // ctx slice.
             let expr = if src == "overlay" {
                 format!("super::{overlay_call}({name:?})")
+            } else if src == "embedderDefaults" {
+                format!("super::{defaults_call}({name:?})")
             } else {
                 let (call, arg) = match src.as_str() {
                     "cli" => (cli_call, "ctx.cli"),
@@ -559,10 +566,12 @@ fn pascal_case(name: &str) -> String {
 /// consulted.
 fn resolve_precedence(declared: &[String]) -> Vec<String> {
     // CLI, the embedder overlay, and env are always
-    // highest-precedence, in that order. The per-setting `precedence`
-    // override only reorders the file-based sources. Anyone who
-    // declares `cli`, `overlay`, or `env` in their precedence list
-    // gets it silently dropped because it's already pinned on top.
+    // highest-precedence, in that order; the embedder defaults are
+    // always lowest (just above the built-in default). The per-setting
+    // `precedence` override only reorders the file-based sources.
+    // Anyone who declares `cli`, `overlay`, `env`, or
+    // `embedderDefaults` in their precedence list gets it silently
+    // dropped because its position is already pinned.
     //
     // The default file order encodes two principles: scope locality
     // (project > user) and aube authority within a scope (aubeConfig >
@@ -586,7 +595,7 @@ fn resolve_precedence(declared: &[String]) -> Vec<String> {
         // `settings.toml` overrides that predate the scope split can
         // keep using the short names.
         let expansion: &[&str] = match src.as_str() {
-            "cli" | "overlay" | "env" => continue,
+            "cli" | "overlay" | "env" | "embedderDefaults" => continue,
             "npmrc" => &["projectNpmrc", "userNpmrc"],
             "aubeConfig" => &["projectAubeConfig", "userAubeConfig"],
             other => &[other],
@@ -605,6 +614,7 @@ fn resolve_precedence(declared: &[String]) -> Vec<String> {
     }
     let mut out = vec!["cli".to_string(), "overlay".to_string(), "env".to_string()];
     out.extend(files);
+    out.push("embedderDefaults".to_string());
     out
 }
 

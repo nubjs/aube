@@ -91,6 +91,49 @@ fn embedder_overlay() -> &'static [(String, String)] {
     EMBEDDER_OVERLAY.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// Process-wide programmatic *default* substitutions registered by an
+/// embedding caller. Consulted by the generated accessors as the
+/// lowest-priority source — below every user-controlled source, just
+/// above each setting's built-in default.
+static EMBEDDER_DEFAULTS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Register replacement setting *defaults* once per process, before
+/// any settings resolution happens.
+///
+/// The counterpart to [`set_embedder_overlay`] for the opposite need:
+/// the overlay *pins* settings above env and files, while this tier
+/// only adjusts what a setting resolves to when the user configured
+/// nothing — CLI flags, the overlay, environment variables, and every
+/// file source all keep winning. An embedder that wants pnpm-flavored
+/// defaults (say `nodeLinker=hoisted` for a flat-layout host tool)
+/// can ship them here without masking a single user decision.
+///
+/// Keys and values follow the same contract as the overlay: canonical
+/// setting names exactly as spelled in `settings.toml` (no alias
+/// matching; unknown keys are rejected by a debug assertion), raw
+/// `.npmrc` string value forms, unparseable values skipped.
+///
+/// Idempotent — second calls are silently ignored, matching the other
+/// `set_global_*` helpers. The constraint is load-bearing: resolution
+/// may already have read the first value, so late mutation would
+/// produce split-brain results.
+pub fn set_embedder_defaults(defaults: Vec<(String, String)>) {
+    debug_assert!(
+        defaults.iter().all(|(k, _)| meta::find(k).is_some()),
+        "embedder defaults contain a key that is not a canonical setting name: {:?}",
+        defaults
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| meta::find(k).is_none())
+            .collect::<Vec<_>>()
+    );
+    let _ = EMBEDDER_DEFAULTS.set(defaults);
+}
+
+fn embedder_defaults() -> &'static [(String, String)] {
+    EMBEDDER_DEFAULTS.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
 /// Bundle of source inputs consumed by the per-setting typed
 /// accessors in [`resolved`]. Each field is a borrowed view so
 /// callers can reuse the same owned values across many lookups
@@ -205,6 +248,7 @@ pub fn process_env() -> &'static [(String, String)] {
 ///     > workspace_yaml      (pnpm-workspace.yaml / aube-workspace.yaml)
 ///     > user_aube_config    (~/.config/aube/config.toml)
 ///     > user_npmrc          (~/.npmrc + pnpm auth.ini)
+///     > embedder defaults   (process-wide, set_embedder_defaults)
 /// ```
 ///
 /// Two principles drive the file-source ordering:
@@ -219,8 +263,10 @@ pub fn process_env() -> &'static [(String, String)] {
 ///
 /// The per-setting `precedence` override in `settings.toml` reorders
 /// the file-based sources but cannot demote `cli`, `overlay`, or `env`
-/// off the top — CLI flags, the embedder overlay, and environment
-/// variables always win, in that order. Bare names
+/// off the top, nor promote the embedder defaults off the bottom —
+/// CLI flags, the embedder overlay, and environment
+/// variables always win, in that order, and embedder defaults only
+/// apply when every other source is silent. Bare names
 /// `npmrc` and `aubeConfig` in a `precedence` list expand to their
 /// project+user pair (project first); use the scope-qualified names
 /// `projectNpmrc`/`userNpmrc`/`projectAubeConfig`/`userAubeConfig` for
@@ -531,6 +577,57 @@ pub(crate) fn string_list_from_overlay(setting: &str) -> Option<Vec<String>> {
         return None;
     }
     raw_from_overlay(meta).map(parse_string_list)
+}
+
+/// Raw embedder-default value for `meta`, if one was registered.
+/// Canonical setting name only; iterates from the end so a later
+/// duplicate key wins, mirroring the other list-shaped sources.
+fn raw_from_embedder_defaults(meta: &meta::SettingMeta) -> Option<&'static str> {
+    for (key, raw) in embedder_defaults().iter().rev() {
+        if key == meta.name {
+            return Some(raw);
+        }
+    }
+    None
+}
+
+/// Resolve a `bool` setting from the process-wide embedder defaults.
+/// Returns `None` on unknown setting, wrong type, unparseable value,
+/// or when no defaults were registered.
+pub(crate) fn bool_from_embedder_defaults(setting: &str) -> Option<bool> {
+    let meta = meta::find(setting)?;
+    if meta.type_ != "bool" {
+        return None;
+    }
+    raw_from_embedder_defaults(meta).and_then(parse_bool)
+}
+
+/// Resolve a `string` setting from the process-wide embedder defaults.
+pub fn string_from_embedder_defaults(setting: &str) -> Option<String> {
+    let meta = meta::find(setting)?;
+    if !is_stringish(meta.type_) {
+        return None;
+    }
+    raw_from_embedder_defaults(meta).map(ToOwned::to_owned)
+}
+
+/// Resolve an `int` setting from the process-wide embedder defaults.
+pub(crate) fn u64_from_embedder_defaults(setting: &str) -> Option<u64> {
+    let meta = meta::find(setting)?;
+    if meta.type_ != "int" {
+        return None;
+    }
+    raw_from_embedder_defaults(meta).and_then(|raw| raw.trim().parse::<u64>().ok())
+}
+
+/// Resolve a `list<string>` setting from the process-wide embedder
+/// defaults. Accepts the same stringified forms as `.npmrc`.
+pub(crate) fn string_list_from_embedder_defaults(setting: &str) -> Option<Vec<String>> {
+    let meta = meta::find(setting)?;
+    if meta.type_ != "list<string>" {
+        return None;
+    }
+    raw_from_embedder_defaults(meta).map(parse_string_list)
 }
 
 /// Resolve a `bool` setting from a captured environment snapshot,
