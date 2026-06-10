@@ -124,7 +124,8 @@ pub async fn run(
         // workaround for the genuine refresh-transitives case.
         eprintln!(
             "warn: --depth {depth} is ignored; aube only refreshes direct deps. \
-             For a full refresh, run `rm aube-lock.yaml && aube install`."
+             For a full refresh, run `rm {} && aube install`.",
+            aube_lockfile::aube_lock_base_filename()
         );
     }
     if args.global {

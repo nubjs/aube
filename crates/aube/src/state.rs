@@ -608,16 +608,17 @@ fn active_lockfile(project_dir: &Path) -> (String, Option<PathBuf>) {
     }
     // Freshly-enabled `gitBranchLockfile`: base file exists, branch
     // file does not. Pick up the base so we don't loop on every run.
-    if preferred != "aube-lock.yaml" {
-        let base = project_dir.join("aube-lock.yaml");
+    let base_name = aube_lockfile::aube_lock_base_filename();
+    if preferred != base_name {
+        let base = project_dir.join(base_name);
         if base.exists() {
-            return ("aube-lock.yaml".to_string(), Some(base));
+            return (base_name.to_string(), Some(base));
         }
     }
     // Preserve pnpm-lock.yaml (and its branch variant) as an active
     // lockfile when the project already uses it.
-    let pnpm_preferred = preferred.replacen("aube-lock.", "pnpm-lock.", 1);
-    if pnpm_preferred != preferred {
+    let pnpm_preferred = aube_lockfile::pnpm_lock_filename(project_dir);
+    if pnpm_preferred != "pnpm-lock.yaml" {
         let pnpm_branch = project_dir.join(&pnpm_preferred);
         if pnpm_branch.exists() {
             return (pnpm_preferred, Some(pnpm_branch));
@@ -711,21 +712,26 @@ fn restore_lockfile_snapshot(
 }
 
 fn is_restorable_lockfile_name(name: &str) -> bool {
-    matches!(
-        name,
-        "aube-lock.yaml"
-            | "pnpm-lock.yaml"
-            | "bun.lock"
-            | "yarn.lock"
-            | "npm-shrinkwrap.json"
-            | "package-lock.json"
-    ) || is_branch_lockfile_name(name)
+    name == aube_lockfile::aube_lock_base_filename()
+        || matches!(
+            name,
+            "pnpm-lock.yaml"
+                | "bun.lock"
+                | "yarn.lock"
+                | "npm-shrinkwrap.json"
+                | "package-lock.json"
+        )
+        || is_branch_lockfile_name(name)
 }
 
 fn is_branch_lockfile_name(name: &str) -> bool {
-    (name.starts_with("aube-lock.") || name.starts_with("pnpm-lock."))
+    let aube_base = aube_lockfile::aube_lock_base_filename();
+    // Branch lockfiles are "<stem>.<branch>.yaml" — the base filename
+    // with the branch spliced before the extension.
+    let aube_stem = aube_base.strip_suffix(".yaml").unwrap_or(aube_base);
+    (name.starts_with(&format!("{aube_stem}.")) || name.starts_with("pnpm-lock."))
         && name.ends_with(".yaml")
-        && name != "aube-lock.yaml"
+        && name != aube_base
         && name != "pnpm-lock.yaml"
 }
 

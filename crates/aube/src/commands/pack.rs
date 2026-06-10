@@ -506,7 +506,6 @@ fn is_npm_ignored(name: &str) -> bool {
             | "yarn.lock"
             | "pnpm-lock.yaml"
             | "bun.lock"
-            | "aube-lock.yaml"
             | ".env"
             | ".envrc"
             | ".ssh"
@@ -517,6 +516,11 @@ fn is_npm_ignored(name: &str) -> bool {
             | "id_ecdsa"
             | "id_ed25519"
     ) {
+        return true;
+    }
+    // Aube's own lockfile is excluded like every other tool's; checked
+    // at runtime because the filename is embedder-configurable.
+    if name == aube_lockfile::aube_lock_base_filename() {
         return true;
     }
     if name.ends_with(".tgz") || name.ends_with(".swp") {

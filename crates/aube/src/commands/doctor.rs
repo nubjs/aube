@@ -220,7 +220,12 @@ fn project_section(anchor: &Path, report: &mut Report) -> Section {
         "lockfile",
         lockfile
             .map(|k| k.filename().to_string())
-            .unwrap_or_else(|| "(none — first install will create aube-lock.yaml)".to_string()),
+            .unwrap_or_else(|| {
+                format!(
+                    "(none — first install will create {})",
+                    aube_lockfile::aube_lock_base_filename()
+                )
+            }),
     );
 
     s

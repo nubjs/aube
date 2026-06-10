@@ -32,10 +32,12 @@ pub struct MergeReport {
     pub conflicts: Vec<String>,
 }
 
-/// Glob all `aube-lock.*.yaml` files in `project_dir` (excluding plain
-/// `aube-lock.yaml`), parse each, merge them into the base
-/// `aube-lock.yaml` (or an empty graph if no base exists), write the
-/// merged result, and delete each successfully-merged branch file.
+/// Glob all branch lockfiles (`aube-lock.*.yaml`, or the configured
+/// base name's stem — see [`crate::set_aube_lock_base_filename`]) in
+/// `project_dir`, excluding the plain base file, parse each, merge
+/// them into the base lockfile (or an empty graph if no base exists),
+/// write the merged result, and delete each successfully-merged
+/// branch file.
 ///
 /// Returns a [`MergeReport`] describing what happened. If no branch
 /// files are found, the report is empty and no files are written.
@@ -50,7 +52,8 @@ pub fn merge_branch_lockfiles(
         return Ok(report);
     }
 
-    let base_path = project_dir.join("aube-lock.yaml");
+    let base_name = crate::aube_lock_base_filename();
+    let base_path = project_dir.join(base_name);
     let mut merged = if base_path.exists() {
         pnpm::parse(&base_path)?
     } else {
@@ -71,8 +74,8 @@ pub fn merge_branch_lockfiles(
         report.merged_files.push(path);
     }
 
-    // Write out the combined graph as `aube-lock.yaml` (plain filename,
-    // not branch-scoped).
+    // Write out the combined graph under the plain base filename
+    // (not branch-scoped).
     pnpm::write(&base_path, &merged, manifest)?;
 
     for path in &report.merged_files {
@@ -140,16 +143,19 @@ fn discover_branch_lockfiles(project_dir: &Path) -> Vec<PathBuf> {
     let Some(dir_str) = project_dir.to_str() else {
         return Vec::new();
     };
-    let pattern = format!("{dir_str}/aube-lock.*.yaml");
+    let base_name = crate::aube_lock_base_filename();
+    // The setter guarantees the `.yaml` suffix; fallback is defensive.
+    let stem = base_name.strip_suffix(".yaml").unwrap_or(base_name);
+    let pattern = format!("{dir_str}/{stem}.*.yaml");
     let mut out: Vec<PathBuf> = glob::glob(&pattern)
         .ok()
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.ok())
         .filter(|p| {
-            // `aube-lock.*.yaml` also matches `aube-lock.yaml` itself
+            // `<stem>.*.yaml` also matches the base file itself
             // on some implementations; filter it out explicitly.
-            p.file_name().and_then(|n| n.to_str()) != Some("aube-lock.yaml")
+            p.file_name().and_then(|n| n.to_str()) != Some(base_name)
         })
         .collect();
     out.sort();

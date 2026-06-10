@@ -30,8 +30,10 @@ pub struct CleanArgs {
 
 /// Lockfile basenames removed by `--lockfile`. Kept in one place so
 /// `clean` and any future `purge`-adjacent command see the same set.
+/// Aube's own lockfile name is appended at the use site (it's
+/// embedder-configurable, see
+/// [`aube_lockfile::set_aube_lock_base_filename`]).
 const LOCKFILE_NAMES: &[&str] = &[
-    "aube-lock.yaml",
     "pnpm-lock.yaml",
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -121,7 +123,8 @@ async fn run_as(invoked_as: &str, args: CleanArgs) -> miette::Result<()> {
     }
 
     if args.lockfile {
-        for name in LOCKFILE_NAMES {
+        let aube_lock_name = aube_lockfile::aube_lock_base_filename();
+        for name in std::iter::once(&aube_lock_name).chain(LOCKFILE_NAMES) {
             let p = cwd.join(name);
             if p.symlink_metadata().is_ok() {
                 eprintln!("Removing {}", p.display());

@@ -1,13 +1,79 @@
 use crate::{LockedPackage, LockfileGraph, bun, npm, pnpm, yarn};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+const DEFAULT_AUBE_LOCK_BASE_FILENAME: &str = "aube-lock.yaml";
+
+/// Filenames owned by other tools' [`LockfileKind`]s. The configured
+/// aube-lock filename must not collide with any of these — detection
+/// keys kind off the filename, and a collision would make one file
+/// resolve to two kinds.
+const FOREIGN_LOCKFILE_NAMES: &[&str] = &[
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "yarn.lock",
+    "npm-shrinkwrap.json",
+    "package-lock.json",
+];
+
+static AUBE_LOCK_BASE_FILENAME: OnceLock<String> = OnceLock::new();
+
+/// Override the filename used for [`LockfileKind::Aube`] — the
+/// lockfile aube itself owns. Defaults to `aube-lock.yaml`.
+///
+/// For embedders that present a different brand surface: a tool
+/// driving aube's command layer as a library can name the canonical
+/// lockfile after its own product (or a neutral name like
+/// `lock.yaml`) without forking the detection order — the configured
+/// name keeps the Aube kind's top rank in the file-precedence list,
+/// and branch lockfiles derive as `<stem>.<branch>.yaml` from it.
+///
+/// Constraints: the name must end in `.yaml` (the bytes are pnpm-v9
+/// YAML and branch variants splice the branch before the extension),
+/// must be a bare filename (no path separators), and must not collide
+/// with another tool's lockfile name (`pnpm-lock.yaml`, `bun.lock`,
+/// …). Values violating any of these are ignored and the default
+/// stays in effect.
+///
+/// Idempotent — second calls and calls after the first read are
+/// silently ignored, matching the other process-global `set_*`
+/// helpers (callers memoize derived filenames).
+pub fn set_aube_lock_base_filename(name: &str) {
+    let valid = name.len() > ".yaml".len()
+        && name.ends_with(".yaml")
+        && !name.contains(['/', '\\'])
+        && !FOREIGN_LOCKFILE_NAMES.contains(&name);
+    if !valid {
+        return;
+    }
+    let _ = AUBE_LOCK_BASE_FILENAME.set(name.to_string());
+}
+
+/// The base (non-branch) filename currently in effect for
+/// [`LockfileKind::Aube`]. `aube-lock.yaml` unless an embedder
+/// overrode it via [`set_aube_lock_base_filename`].
+pub fn aube_lock_base_filename() -> &'static str {
+    AUBE_LOCK_BASE_FILENAME.get_or_init(|| DEFAULT_AUBE_LOCK_BASE_FILENAME.to_string())
+}
+
+/// Splice `branch` into a `.yaml` lockfile name before the extension:
+/// `aube-lock.yaml` + `feature/x` → `aube-lock.feature!x.yaml`.
+/// Forward slashes encode as `!`, matching pnpm.
+fn branch_lockfile_name(base: &str, branch: &str) -> String {
+    // The setter guarantees the `.yaml` suffix; the fallback is
+    // purely defensive.
+    let stem = base.strip_suffix(".yaml").unwrap_or(base);
+    format!("{stem}.{}.yaml", branch.replace('/', "!"))
+}
 
 /// Which source lockfile format was parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockfileKind {
-    /// `aube-lock.yaml` — aube's default lockfile when no existing
-    /// lockfile is present. Same on-disk format as pnpm v9 for now
-    /// (we piggyback on pnpm::read/write).
+    /// `aube-lock.yaml` (or the embedder-configured name, see
+    /// [`set_aube_lock_base_filename`]) — aube's default lockfile when
+    /// no existing lockfile is present. Same on-disk format as pnpm v9
+    /// for now (we piggyback on pnpm::read/write).
     Aube,
     /// `pnpm-lock.yaml` — pnpm v9 format. If this is the existing
     /// project lockfile, aube reads and writes it in place.
@@ -29,7 +95,7 @@ pub enum LockfileKind {
 impl LockfileKind {
     pub fn filename(self) -> &'static str {
         match self {
-            LockfileKind::Aube => "aube-lock.yaml",
+            LockfileKind::Aube => aube_lock_base_filename(),
             LockfileKind::Pnpm => "pnpm-lock.yaml",
             LockfileKind::Npm => "package-lock.json",
             LockfileKind::Yarn | LockfileKind::YarnBerry => "yarn.lock",
@@ -182,11 +248,13 @@ fn has_conflict_markers(content: &str) -> bool {
 
 /// Resolve the canonical lockfile filename for `project_dir` (aube's own).
 ///
-/// Returns `aube-lock.<branch>.yaml` when `gitBranchLockfile: true` is
-/// set in `pnpm-workspace.yaml` (or `aube-workspace.yaml`) and the
-/// project is inside a git checkout with a current branch. Forward
-/// slashes in the branch name are encoded as `!`, matching pnpm. Falls
-/// back to plain `aube-lock.yaml` in every other case.
+/// Returns the branch variant (`aube-lock.<branch>.yaml`, or the
+/// configured base name with the branch spliced in) when
+/// `gitBranchLockfile: true` is set in `pnpm-workspace.yaml` (or
+/// `aube-workspace.yaml`) and the project is inside a git checkout
+/// with a current branch. Forward slashes in the branch name are
+/// encoded as `!`, matching pnpm. Falls back to the plain base
+/// filename ([`aube_lock_base_filename`]) in every other case.
 ///
 /// Memoized per `project_dir` for the lifetime of the process: a
 /// single install resolves this 3–5 times (lockfile_candidates,
@@ -204,12 +272,13 @@ pub fn aube_lock_filename(project_dir: &Path) -> String {
     {
         return hit.clone();
     }
+    let base = aube_lock_base_filename();
     let resolved = if !git_branch_lockfile_enabled(project_dir) {
-        "aube-lock.yaml".to_string()
+        base.to_string()
     } else {
         match current_git_branch(project_dir) {
-            Some(branch) => format!("aube-lock.{}.yaml", branch.replace('/', "!")),
-            None => "aube-lock.yaml".to_string(),
+            Some(branch) => branch_lockfile_name(base, &branch),
+            None => base.to_string(),
         }
     };
     if let Ok(mut map) = cache.lock() {
@@ -224,11 +293,23 @@ pub fn aube_lock_filename(project_dir: &Path) -> String {
 /// pnpm filename prefix so projects with an existing `pnpm-lock.yaml`
 /// keep writing to pnpm's file.
 pub fn pnpm_lock_filename(project_dir: &Path) -> String {
-    let aube_name = aube_lock_filename(project_dir);
-    // `aube_lock_filename` always returns "aube-lock.<rest>", so strip_prefix
-    // always succeeds. The fallback is purely defensive.
+    pnpm_name_for(&aube_lock_filename(project_dir))
+}
+
+/// Map an aube lockfile name (base or branch form) onto the matching
+/// pnpm filename: the configured base maps to `pnpm-lock.yaml`, a
+/// branch variant `<stem>.<branch>.yaml` maps to
+/// `pnpm-lock.<branch>.yaml`.
+fn pnpm_name_for(aube_name: &str) -> String {
+    let base = aube_lock_base_filename();
+    if aube_name == base {
+        return "pnpm-lock.yaml".to_string();
+    }
+    // Branch names are always "<stem>.<rest>" per `branch_lockfile_name`,
+    // so strip_prefix succeeds. The fallback is purely defensive.
+    let stem = base.strip_suffix(".yaml").unwrap_or(base);
     aube_name
-        .strip_prefix("aube-lock.")
+        .strip_prefix(&format!("{stem}."))
         .map(|rest| format!("pnpm-lock.{rest}"))
         .unwrap_or_else(|| "pnpm-lock.yaml".to_string())
 }
@@ -341,27 +422,22 @@ pub(crate) fn lockfile_candidates(
     include_aube: bool,
 ) -> Vec<(PathBuf, LockfileKind)> {
     let mut out = Vec::new();
+    let aube_base = aube_lock_base_filename();
     if include_aube {
         // Prefer the branch-specific lockfile (if `gitBranchLockfile` is on
-        // and we resolve a branch); fall through to plain `aube-lock.yaml`
+        // and we resolve a branch); fall through to the plain base file
         // so a freshly-enabled branch still picks up the base lockfile.
         let branch_name = aube_lock_filename(project_dir);
-        if branch_name != "aube-lock.yaml" {
+        if branch_name != aube_base {
             out.push((project_dir.join(&branch_name), LockfileKind::Aube));
         }
-        out.push((project_dir.join("aube-lock.yaml"), LockfileKind::Aube));
+        out.push((project_dir.join(aube_base), LockfileKind::Aube));
     }
     // Preserve pnpm lockfiles in place. Branch-specific
     // `pnpm-lock.<branch>.yaml` mirrors the aube branch lockfile naming
     // logic, so a project that already uses pnpm branch lockfiles keeps
     // writing through that file.
-    let pnpm_branch = {
-        let mut s = aube_lock_filename(project_dir);
-        if let Some(rest) = s.strip_prefix("aube-lock.") {
-            s = format!("pnpm-lock.{rest}");
-        }
-        s
-    };
+    let pnpm_branch = pnpm_name_for(&aube_lock_filename(project_dir));
     if pnpm_branch != "pnpm-lock.yaml" {
         out.push((project_dir.join(&pnpm_branch), LockfileKind::Pnpm));
     }
@@ -632,5 +708,29 @@ mod filename_tests {
             assert_eq!(aube_lock_filename(dir.path()), "aube-lock.feature!x.yaml");
             assert_eq!(pnpm_lock_filename(dir.path()), "pnpm-lock.feature!x.yaml");
         }
+    }
+
+    // The configured-filename path (`set_aube_lock_base_filename`) is
+    // exercised in `tests/custom_lock_filename.rs` — its own process,
+    // because the override is a process-global `OnceLock` and these
+    // unit tests rely on the default. Only the pure helpers are
+    // covered here.
+
+    #[test]
+    fn branch_filename_splices_before_the_yaml_extension() {
+        assert_eq!(
+            branch_lockfile_name("aube-lock.yaml", "feature/x"),
+            "aube-lock.feature!x.yaml"
+        );
+        assert_eq!(branch_lockfile_name("lock.yaml", "main"), "lock.main.yaml");
+    }
+
+    #[test]
+    fn pnpm_name_mapping_handles_base_and_branch_forms() {
+        assert_eq!(pnpm_name_for("aube-lock.yaml"), "pnpm-lock.yaml");
+        assert_eq!(
+            pnpm_name_for("aube-lock.feature!x.yaml"),
+            "pnpm-lock.feature!x.yaml"
+        );
     }
 }
