@@ -27,7 +27,23 @@ set -euo pipefail
 #   BENCH_TOOLS  — comma-separated tools to include
 #                  (default: aube,bun,pnpm,npm,yarn,deno; vlt is
 #                  temporarily disabled — its --frozen-lockfile still
-#                  makes network requests, skewing results)
+#                  makes network requests, skewing results; nub is
+#                  opt-in — add it explicitly, e.g.
+#                  BENCH_TOOLS=nub,aube,pnpm)
+#   BENCH_NUB_BIN — path to the nub binary (the Rust CLI that embeds
+#                  the aube install engine; `nub install` routes
+#                  through `aube::commands::install` in-process).
+#                  The benchmark runner is expected to pass this
+#                  explicitly. Default: ../nub/target/release/nub
+#                  relative to this repo's parent (the side-by-side
+#                  scratch-clone layout), falling back to `nub` on
+#                  $PATH. nub's native lockfile is pnpm-lock.yaml
+#                  (its embedder default is defaultLockfileFormat=pnpm).
+#   BENCH_NUB_ENGINE_VERSION — optional embedded-aube version string
+#                  recorded into results.json `versions` as
+#                  "nub-aube-engine" (the binary's --version prints
+#                  only the nub version; the runner knows the vendored
+#                  submodule rev and passes it through).
 #   BENCH_SCENARIOS — comma-separated scenario keys to run
 #                     (default: all)
 #   BENCH_PHASES — set to 0 to skip aube phase timing samples
@@ -49,6 +65,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUBE_BIN="$REPO_DIR/target/release/aube"
+# nub lives in its own repo; the runner passes BENCH_NUB_BIN. The default
+# assumes the side-by-side scratch layout (<workdir>/aube + <workdir>/nub).
+NUB_BIN="${BENCH_NUB_BIN:-$REPO_DIR/../nub/target/release/nub}"
+if [ ! -x "$NUB_BIN" ]; then
+	NUB_BIN="$(command -v nub || true)"
+fi
 PNPM_BIN="$(command -v pnpm || true)"
 YARN_BIN="$(command -v yarn || true)"
 NPM_BIN="$(command -v npm || true)"
@@ -62,6 +84,7 @@ RUNS="${RUNS:-10}"
 # Slower tools take a real chunk of wall time per iteration; default
 # pnpm to half the run count and npm/yarn to a third. Each is overridable.
 RUNS_AUBE="${RUNS_AUBE:-$RUNS}"
+RUNS_NUB="${RUNS_NUB:-$RUNS}"
 RUNS_BUN="${RUNS_BUN:-$RUNS}"
 RUNS_DENO="${RUNS_DENO:-$RUNS}"
 RUNS_PNPM="${RUNS_PNPM:-$(((RUNS + 1) / 2))}"
@@ -79,11 +102,18 @@ if ! command -v hyperfine &>/dev/null; then
 	exit 1
 fi
 
-if [ ! -f "$AUBE_BIN" ]; then
-	echo "error: aube release binary not found at $AUBE_BIN" >&2
-	echo "Run: cargo build --release" >&2
-	exit 1
-fi
+# The aube binary is only a hard requirement when aube is actually in
+# the tool set — a nub-only run (BENCH_TOOLS=nub,pnpm,...) must not
+# demand a local aube build.
+case ",$BENCH_TOOLS," in
+*,aube,*)
+	if [ ! -f "$AUBE_BIN" ]; then
+		echo "error: aube release binary not found at $AUBE_BIN" >&2
+		echo "Run: cargo build --release" >&2
+		exit 1
+	fi
+	;;
+esac
 
 # ── Optional hermetic registry ─────────────────────────────────────────────
 # BENCH_HERMETIC=1 routes all registry traffic through a local
@@ -145,7 +175,10 @@ run_scenario() {
 
 # Order matters for the console output; keep aube first so the
 # headline comparison is prominent and the rest follow alphabetically.
+# nub (when opted in via BENCH_TOOLS) slots in right after aube — the
+# nub-vs-aube delta is the fork-overhead regression sentinel.
 register_tool "aube" "$AUBE_BIN"
+register_tool "nub" "$NUB_BIN"
 register_tool "bun" "$BUN_BIN"
 register_tool "deno" "$DENO_BIN"
 register_tool "pnpm" "$PNPM_BIN"
@@ -181,6 +214,7 @@ echo ""
 runs_for_tool() {
 	case "$1" in
 	aube) echo "$RUNS_AUBE" ;;
+	nub) echo "$RUNS_NUB" ;;
 	bun) echo "$RUNS_BUN" ;;
 	deno) echo "$RUNS_DENO" ;;
 	pnpm) echo "$RUNS_PNPM" ;;
@@ -198,6 +232,9 @@ runs_for_tool() {
 lockfile_name_for() {
 	case "$1" in
 	aube) echo "aube-lock.yaml" ;;
+	# nub's embedder defaults write pnpm-lock.yaml for fresh projects
+	# (defaultLockfileFormat=pnpm) — pnpm's format IS nub's native format.
+	nub) echo "pnpm-lock.yaml" ;;
 	bun) echo "bun.lock" ;;
 	deno) echo "deno.lock" ;;
 	npm) echo "package-lock.json" ;;
@@ -307,6 +344,13 @@ for i in "${!TOOLS[@]}"; do
 
 	case "$tool" in
 	aube)
+		cd "$dir" && HOME="$home" XDG_CACHE_HOME="$cache" XDG_DATA_HOME="$home/.local/share" "$bin" install
+		;;
+	nub)
+		# Same isolation shape as aube: nub's engine cache lands at
+		# $XDG_CACHE_HOME/nub/pm and its CAS store at
+		# $XDG_DATA_HOME/nub/store. Scripts are off by default (the
+		# embedded engine's default), matching aube.
 		cd "$dir" && HOME="$home" XDG_CACHE_HOME="$cache" XDG_DATA_HOME="$home/.local/share" "$bin" install
 		;;
 	npm)
@@ -457,6 +501,13 @@ AUBE_ENV="HOME={home} XDG_CACHE_HOME={cache} XDG_DATA_HOME={home}/.local/share n
 # cannot silently flip the mode.
 AUBE_ENV_GVS_ON="$AUBE_ENV npm_config_enable_global_virtual_store=true"
 
+# nub embeds the aube engine, including its settings layer, so the same
+# npm_config_* aliases (minimum-release-age, enableGlobalVirtualStore)
+# steer it. Isolation mirrors AUBE_ENV: engine cache at
+# $XDG_CACHE_HOME/nub/pm, CAS store at $XDG_DATA_HOME/nub/store.
+NUB_ENV="HOME={home} XDG_CACHE_HOME={cache} XDG_DATA_HOME={home}/.local/share npm_config_minimum_release_age=${MIN_RELEASE_AGE_MINUTES}"
+NUB_ENV_GVS_ON="$NUB_ENV npm_config_enable_global_virtual_store=true"
+
 # Scenario keys describe what's on disk before the run. Every install
 # scenario assumes a committed lockfile is present; the axes are
 # cache/store warmth. The "install-test" scenario measures install +
@@ -466,6 +517,9 @@ cmd_template() {
 	case "$1:$2" in
 	gvs-warm:aube | gvs-cold:aube)
 		echo "cd {project} && $AUBE_ENV_GVS_ON {bin} install --frozen-lockfile >/dev/null 2>&1"
+		;;
+	gvs-warm:nub | gvs-cold:nub)
+		echo "cd {project} && $NUB_ENV_GVS_ON {bin} install --frozen-lockfile >/dev/null 2>&1"
 		;;
 	gvs-warm:bun | gvs-cold:bun)
 		echo "cd {project} && $BUN_BASE --frozen-lockfile >/dev/null 2>&1"
@@ -502,6 +556,14 @@ cmd_template() {
 		;;
 	install-test:aube)
 		echo "cd {project} && $AUBE_ENV_GVS_ON {bin} test >/dev/null 2>&1"
+		;;
+	install-test:nub)
+		# nub has no `test` verb that auto-installs; the equivalent
+		# developer loop is `nub install` (state-hash short-circuit via
+		# the embedded engine) followed by `nub run test`. nub discovers
+		# Node from $PATH, so the isolated HOME doesn't trigger Node
+		# provisioning here.
+		echo "cd {project} && $NUB_ENV_GVS_ON {bin} install >/dev/null 2>&1 && $NUB_ENV_GVS_ON {bin} run test >/dev/null 2>&1"
 		;;
 	install-test:bun)
 		echo "cd {project} && $BUN_BASE --frozen-lockfile >/dev/null 2>&1 && HOME={home} BUN_INSTALL={home}/.bun {bin} run test >/dev/null 2>&1"
@@ -679,7 +741,7 @@ run_aube_phase_bench() {
 # Directories to wipe in cold scenarios. Each pm has its own cache /
 # store layout, so we reset everything we know about to guarantee
 # a fresh download on every iteration.
-COLD_WIPE='{store} {cache} {home}/.pnpm-store {home}/.local/share/aube {home}/.npm {home}/.yarn {home}/.bun {home}/.cache/aube {home}/.cache/yarn {home}/.cache/bun {home}/.cache/deno {home}/.cache/vlt {home}/.config/vlt {home}/Library/Caches/deno'
+COLD_WIPE='{store} {cache} {home}/.pnpm-store {home}/.local/share/aube {home}/.local/share/nub {home}/.npm {home}/.yarn {home}/.bun {home}/.cache/aube {home}/.cache/nub {home}/.cache/yarn {home}/.cache/bun {home}/.cache/deno {home}/.cache/vlt {home}/.config/vlt {home}/Library/Caches/deno'
 
 # Warm-cache lockfile restore: wipe the project-local state (lockfile
 # + node_modules) and drop the saved lockfile back. Uses the per-tool

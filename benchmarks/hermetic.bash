@@ -226,6 +226,12 @@ _hermetic_warm() {
 	# the warmed cache contains exactly the tarballs each tool will
 	# later ask for.
 	_warm_one aube "${AUBE_BIN:-}" "${AUBE_BIN:-aube}" install --ignore-scripts
+	# nub is opt-in via BENCH_TOOLS (non-default sets get their own warm
+	# sentinel below, so adding it invalidates nothing). Its resolver is
+	# the embedded aube engine, but warm anyway: version skew between the
+	# vendored engine and the aube binary can pick different transitive
+	# sets, and a 404-hole here would poison the no-uplink runs.
+	_warm_one nub "${NUB_BIN:-}" "${NUB_BIN:-nub}" install --ignore-scripts
 	_warm_one bun "$(command -v bun || echo)" bun install --ignore-scripts --no-summary
 	_warm_one pnpm "$(command -v pnpm || echo)" pnpm install --ignore-scripts --no-frozen-lockfile
 	_warm_one npm "$(command -v npm || echo)" npm install --ignore-scripts --no-audit --no-fund --legacy-peer-deps

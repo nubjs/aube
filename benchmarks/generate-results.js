@@ -77,13 +77,20 @@ function fmtSpeedup (baseMean, aubeMean) {
 // Emits one row per scenario with a column per tool plus trailing
 // "vs pnpm" and "vs bun" speedup columns when those tools are present
 // in the run. pnpm is aube's drop-in-replacement target; bun is the
-// other "fast" package manager users compare against.
+// other "fast" package manager users compare against. When nub (the
+// Rust CLI embedding the aube engine) runs without aube, it takes the
+// hero seat; when both run, an extra "nub vs aube" column surfaces the
+// fork overhead (the two should be ~equal — divergence is a regression).
+const HERO = TOOLS.includes('aube') ? 'aube' : (TOOLS.includes('nub') ? 'nub' : null)
 const headerCells = ['#', 'Scenario', ...TOOLS]
-if (TOOLS.includes('pnpm') && TOOLS.includes('aube')) {
+if (HERO && TOOLS.includes('pnpm')) {
   headerCells.push('vs pnpm')
 }
-if (TOOLS.includes('bun') && TOOLS.includes('aube')) {
+if (HERO && TOOLS.includes('bun')) {
   headerCells.push('vs bun')
+}
+if (TOOLS.includes('nub') && TOOLS.includes('aube')) {
+  headerCells.push('nub vs aube')
 }
 
 const lines = [
@@ -105,6 +112,11 @@ if (versionsFile && fs.existsSync(versionsFile)) {
     if (name && version) versions[name] = version.trim()
   }
 }
+// `nub --version` prints only the nub version; the embedded aube engine
+// rev comes from the vendored submodule, which only the runner knows.
+if (process.env.BENCH_NUB_ENGINE_VERSION) {
+  versions['nub-aube-engine'] = process.env.BENCH_NUB_ENGINE_VERSION
+}
 
 const json = {
   updated: new Date().toISOString(),
@@ -124,11 +136,14 @@ benchmarks.filter(([name]) => SELECTED_BENCHMARKS.has(name)).forEach(([name, lab
   for (const tool of TOOLS) {
     cells.push(results[tool].text)
   }
-  if (TOOLS.includes('pnpm') && TOOLS.includes('aube')) {
-    cells.push(fmtSpeedup(results.pnpm.mean, results.aube.mean).trim())
+  if (HERO && TOOLS.includes('pnpm')) {
+    cells.push(fmtSpeedup(results.pnpm.mean, results[HERO].mean).trim())
   }
-  if (TOOLS.includes('bun') && TOOLS.includes('aube')) {
-    cells.push(fmtSpeedup(results.bun.mean, results.aube.mean).trim())
+  if (HERO && TOOLS.includes('bun')) {
+    cells.push(fmtSpeedup(results.bun.mean, results[HERO].mean).trim())
+  }
+  if (TOOLS.includes('nub') && TOOLS.includes('aube')) {
+    cells.push(fmtSpeedup(results.aube.mean, results.nub.mean).trim())
   }
   lines.push(`| ${cells.join(' | ')} |`)
 
