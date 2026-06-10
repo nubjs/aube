@@ -22,13 +22,23 @@ pub(crate) fn current_patch_hashes(patches: &Patches) -> BTreeMap<String, String
         .collect()
 }
 
-/// Read the previously-applied patch sidecar at
-/// `node_modules/.aube-applied-patches.json`. Missing or malformed
+/// The applied-patch sidecar filename: `.{product}-applied-patches.json`,
+/// following the registered product identity
+/// ([`aube_util::ua::product_name`]) the same way stream-time tool names
+/// and the install header do — an embedder that registered itself as the
+/// running tool owns the sidecars it writes into user projects. Defaults
+/// to `.aube-applied-patches.json` when no product is registered.
+pub(crate) fn applied_patches_file_name() -> String {
+    format!(".{}-applied-patches.json", aube_util::ua::product_name())
+}
+
+/// Read the previously-applied patch sidecar
+/// ([`applied_patches_file_name`]) under `nm_dir`. Missing or malformed
 /// files return an empty map — the caller treats them as "no patches
 /// were ever applied here," which conservatively triggers a re-link
 /// on the first run after the linker started writing the sidecar.
 pub(crate) fn read_applied_patches(nm_dir: &Path) -> BTreeMap<String, String> {
-    let path = nm_dir.join(".aube-applied-patches.json");
+    let path = nm_dir.join(applied_patches_file_name());
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Default::default();
     };
@@ -49,7 +59,7 @@ pub(crate) fn write_applied_patches(
     nm_dir: &Path,
     map: &BTreeMap<String, String>,
 ) -> std::io::Result<()> {
-    let path = nm_dir.join(".aube-applied-patches.json");
+    let path = nm_dir.join(applied_patches_file_name());
     let out = serde_json::to_string(map)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     aube_util::fs_atomic::atomic_write(&path, out.as_bytes())
@@ -420,6 +430,15 @@ fn split_patch_sections(text: &str) -> Vec<PatchSection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Default-preserving contract for the product-derived sidecar name:
+    // with no registered product (this test binary never registers one),
+    // the filename must stay `.aube-applied-patches.json` so existing
+    // installs keep their patch-tracking state across upgrades.
+    #[test]
+    fn applied_patches_file_name_defaults_to_aube() {
+        assert_eq!(applied_patches_file_name(), ".aube-applied-patches.json");
+    }
 
     #[cfg(windows)]
     #[test]

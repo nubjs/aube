@@ -4,10 +4,19 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_STATE_DIR: &str = "node_modules";
-const STATE_DIR_NAME: &str = ".aube-state";
 const INSTALL_STATE_FILE_NAME: &str = "state.json";
 const FRESH_STATE_FILE_NAME: &str = "fresh.json";
 const LOCKFILE_SNAPSHOT_FILE_NAME: &str = "lockfile";
+
+/// The state-directory name: `.{product}-state`, following the
+/// registered product identity ([`aube_util::ua::product_name`]) the
+/// same way stream-time tool names and the install header do — an
+/// embedder that registered itself as the running tool owns the
+/// sidecars it writes into user projects. Defaults to `.aube-state`
+/// when no product is registered.
+fn state_dir_name() -> String {
+    format!(".{}-state", aube_util::ua::product_name())
+}
 
 /// Resolve the modules dir and state directory path for `project_dir` in a
 /// single settings-context load. `check_needs_install` and `write_state`
@@ -28,7 +37,7 @@ fn resolve_paths(project_dir: &Path) -> (PathBuf, PathBuf) {
             crate::commands::expand_setting_path(&raw_state, project_dir)
                 .unwrap_or_else(|| modules_dir.clone())
         };
-        let state_dir = state_parent.join(STATE_DIR_NAME);
+        let state_dir = state_parent.join(state_dir_name());
         (modules_dir, state_dir)
     })
 }
@@ -1101,6 +1110,15 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+
+    // Default-preserving contract for the product-derived sidecar stem:
+    // with no registered product (this test binary never registers one),
+    // the directory name must stay `.aube-state` so existing installs
+    // keep their freshness state across upgrades.
+    #[test]
+    fn state_dir_name_defaults_to_aube_state() {
+        assert_eq!(super::state_dir_name(), ".aube-state");
+    }
 
     #[test]
     fn relative_path_helper_keeps_original_path_when_diff_fails() {

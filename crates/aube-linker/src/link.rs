@@ -371,7 +371,8 @@ impl Linker {
             if let Err(e) = write_applied_patches(&nm, &curr_applied) {
                 tracing::error!(
                     code = aube_codes::errors::ERR_AUBE_PATCHES_TRACKING_WRITE,
-                    "failed to write .aube-applied-patches.json: {e}. next install may miss stale patched entries"
+                    "failed to write {}: {e}. next install may miss stale patched entries",
+                    crate::patches::applied_patches_file_name()
                 );
             }
             return Ok(stats);
@@ -491,7 +492,8 @@ impl Linker {
         if let Err(e) = write_applied_patches(&nm, &curr_applied) {
             tracing::error!(
                 code = aube_codes::errors::ERR_AUBE_PATCHES_TRACKING_WRITE,
-                "failed to write .aube-applied-patches.json: {e}. next install may miss stale patched entries"
+                "failed to write {}: {e}. next install may miss stale patched entries",
+                crate::patches::applied_patches_file_name()
             );
         }
         Ok(stats)
@@ -875,7 +877,8 @@ impl Linker {
             if let Err(e) = write_applied_patches(&root_nm, &curr_applied) {
                 tracing::error!(
                     code = aube_codes::errors::ERR_AUBE_PATCHES_TRACKING_WRITE,
-                    "failed to write .aube-applied-patches.json: {e}. next install may miss stale patched entries"
+                    "failed to write {}: {e}. next install may miss stale patched entries",
+                    crate::patches::applied_patches_file_name()
                 );
             }
             return Ok(stats);
@@ -1149,7 +1152,8 @@ impl Linker {
         if let Err(e) = write_applied_patches(&root_nm, &curr_applied) {
             tracing::error!(
                 code = aube_codes::errors::ERR_AUBE_PATCHES_TRACKING_WRITE,
-                "failed to write .aube-applied-patches.json: {e}. next install may miss stale patched entries"
+                "failed to write {}: {e}. next install may miss stale patched entries",
+                crate::patches::applied_patches_file_name()
             );
         }
         Ok(stats)
