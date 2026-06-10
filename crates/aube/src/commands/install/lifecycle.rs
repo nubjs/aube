@@ -526,9 +526,15 @@ pub(crate) async fn run_dep_lifecycle_scripts(
 
     // Name what the floor let through — the floor must never be a
     // silent allow path. One line, not per-package, so big graphs
-    // don't drown the install output.
+    // don't drown the install output. Emitted at `warn` with a stable
+    // code because `warn` is the CLI's default-visible level — an
+    // `info!` disclosure would only reach users who already opted into
+    // verbose logging, which defeats its purpose.
     if !floor_trusted.is_empty() {
-        tracing::info!(
+        tracing::warn!(
+            code = aube_codes::warnings::WARN_AUBE_DEFAULT_TRUST_BUILDS,
+            count = floor_trusted.len(),
+            packages = ?floor_trusted,
             "defaultTrust: running build scripts for {} default-trusted package(s): {}",
             floor_trusted.len(),
             floor_trusted.join(", ")
