@@ -2627,7 +2627,10 @@ snapshots:
     let real_key = source.dep_path("@vitejs/test-optimized-with-nested-external");
 
     for (name, key) in [
-        ("@vitejs/test-optimized-cjs-with-nested-external", &alias_key),
+        (
+            "@vitejs/test-optimized-cjs-with-nested-external",
+            &alias_key,
+        ),
         ("@vitejs/test-optimized-with-nested-external", &real_key),
     ] {
         let dep = importer

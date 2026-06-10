@@ -1,6 +1,7 @@
-use crate::{DepType, DirectDep, Error, LockedPackage, LockfileGraph};
+use super::berry::{file_protocol_source, strip_hash_fragment};
+use crate::{DepType, DirectDep, Error, LocalSource, LockedPackage, LockfileGraph};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Parse a yarn classic (v1) lockfile's pre-read contents.
 pub(super) fn parse_classic_str(
@@ -52,7 +53,22 @@ pub(super) fn parse_classic_str(
             .find_map(|s| parse_npm_alias_real_name(s))
             .filter(|real| real.as_str() != name);
 
-        let dep_path = format!("{name}@{version}");
+        // A `link:` / `file:` / `portal:` spec points at a local on-disk
+        // package, not a registry one — yarn records `version "0.0.0"`
+        // and no `resolved` URL. Without a `LocalSource` the linker
+        // treats it as a registry dep and builds a
+        // `<name>/-/<name>-0.0.0.tgz` URL that 404s, aborting the whole
+        // install. The dep_path is keyed by `LocalSource::dep_path` (the
+        // FS-safe hashed form) exactly like the berry parser keys its
+        // local packages.
+        let local_source = block
+            .specs
+            .iter()
+            .find_map(|s| classic_local_source(s, &name));
+        let dep_path = match &local_source {
+            Some(src) => src.dep_path(&name),
+            None => format!("{name}@{version}"),
+        };
 
         for spec in &block.specs {
             spec_to_dep_path.insert(spec.clone(), dep_path.clone());
@@ -85,6 +101,7 @@ pub(super) fn parse_classic_str(
                     dep_path,
                     declared_dependencies: declared,
                     alias_of: alias_of.clone(),
+                    local_source: local_source.clone(),
                     ..Default::default()
                 },
             );
@@ -290,6 +307,25 @@ pub(super) fn parse_spec_name(spec: &str) -> Option<String> {
     } else {
         let at = spec.find('@')?;
         Some(spec[..at].to_string())
+    }
+}
+
+/// Detect a yarn-classic local-package protocol on a spec key and map
+/// it to a [`LocalSource`]. Classic encodes the protocol in the spec
+/// *range* (`name@link:./path`, `name@file:./path`, `name@portal:./path`)
+/// rather than in a separate `resolution:` field the way berry does.
+/// Registry and remote (`http(s):`, git) specs return `None` — they
+/// resolve through the normal `name@version` path.
+fn classic_local_source(spec: &str, name: &str) -> Option<LocalSource> {
+    let range = spec.strip_prefix(name)?.strip_prefix('@')?;
+    let (protocol, body) = range.split_once(':')?;
+    match protocol {
+        "link" => Some(LocalSource::Link(PathBuf::from(strip_hash_fragment(body)))),
+        "file" => Some(file_protocol_source(body)),
+        "portal" => Some(LocalSource::Portal(PathBuf::from(strip_hash_fragment(
+            body,
+        )))),
+        _ => None,
     }
 }
 
