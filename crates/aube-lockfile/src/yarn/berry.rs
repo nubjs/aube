@@ -265,6 +265,19 @@ pub(super) fn parse_berry_str(
         }
     }
 
+    // A root `resolutions` entry rewrites the descriptor yarn writes
+    // to the lockfile, so the block is keyed by the *resolved* range,
+    // not the manifest range. With `resolutions: {"@types/node":
+    // "18.x"}` and a manifest range of `^18.14`, yarn.lock holds only
+    // `@types/node@npm:18.x`; matching the raw range misses and the dep
+    // is silently dropped from the importer. Apply the resolution to
+    // each direct dep before building its lockfile-spec candidates so
+    // the resolved descriptor is tried too. `overrides_map` collects
+    // yarn `resolutions` (alongside npm/pnpm overrides, harmless here);
+    // `override_match` handles both bare-name (`@types/node`) and
+    // descriptor-keyed (`lru-cache@^10.0.1`) resolution keys.
+    let resolution_rules = crate::override_match::compile(&manifest.overrides_map());
+
     // Build direct deps from the manifest, using the yarn berry
     // convention that a range `"^1.0.0"` corresponds to the spec
     // `"name@npm:^1.0.0"`. If the manifest range already carries a
@@ -272,7 +285,8 @@ pub(super) fn parse_berry_str(
     // already a valid spec suffix and we try it verbatim first.
     let mut direct: Vec<DirectDep> = Vec::new();
     let push_direct = |name: &str, range: &str, dep_type: DepType, direct: &mut Vec<DirectDep>| {
-        let candidates = berry_spec_candidates(name, range);
+        let resolved = crate::override_match::apply(&resolution_rules, name, range);
+        let candidates = berry_spec_candidates(name, range, resolved);
         for candidate in candidates {
             if let Some(dep_path) = spec_to_dep_path.get(&candidate) {
                 direct.push(DirectDep {
@@ -345,12 +359,24 @@ pub(super) fn parse_berry_spec(spec: &str) -> Option<(&str, &str, &str)> {
 /// already carries a protocol prefix like `workspace:*`); failing
 /// that, fall back to `name@npm:range` which is the default berry
 /// adds when the user writes an un-prefixed semver range.
-fn berry_spec_candidates(name: &str, range: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(2);
-    out.push(format!("{name}@{range}"));
-    if !range_has_protocol(range) {
-        out.push(format!("{name}@npm:{range}"));
+///
+/// When a root `resolution` rewrites this dep's descriptor, yarn keys
+/// the block by the *resolved* range — so we try the resolved
+/// descriptor first, before the manifest range. The resolution value
+/// may already carry a protocol (`patch:...`, `npm:...`); the same
+/// raw-then-`npm:` candidate pair covers both spellings.
+fn berry_spec_candidates(name: &str, range: &str, resolved: Option<&str>) -> Vec<String> {
+    let mut out = Vec::with_capacity(4);
+    let mut push_for = |r: &str| {
+        out.push(format!("{name}@{r}"));
+        if !range_has_protocol(r) {
+            out.push(format!("{name}@npm:{r}"));
+        }
+    };
+    if let Some(resolved) = resolved.filter(|r| *r != range) {
+        push_for(resolved);
     }
+    push_for(range);
     out
 }
 

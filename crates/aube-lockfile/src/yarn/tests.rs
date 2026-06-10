@@ -508,6 +508,49 @@ fn test_parse_berry_scoped_and_multi_spec() {
     assert_eq!(root[0].dep_path, "@scope/pkg@1.1.0");
 }
 
+/// A root `resolutions` entry rewrites the descriptor yarn writes to
+/// the lockfile: with `resolutions: {"@types/node": "18.x"}`, the
+/// manifest still declares `^18.14` but `yarn.lock` is keyed only by
+/// the resolved descriptor `@types/node@npm:18.x`. The direct-dep pass
+/// must apply the resolution before matching, or the importer dep is
+/// silently dropped and the satisfaction check refuses a tree that
+/// `yarn install --immutable` accepts.
+///
+/// Shape taken from jestjs/jest's committed package.json + yarn.lock
+/// (root `resolutions: {"@types/node": "18.x"}`), found by differential
+/// corpus testing against jest.
+#[test]
+fn test_parse_berry_applies_root_resolution_to_direct_dep() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"@types/node@npm:18.x":
+  version: 18.19.130
+  resolution: "@types/node@npm:18.19.130"
+  checksum: 10c0/abcdef
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let mut manifest = make_manifest(&[], &[("@types/node", "^18.14")]);
+    manifest.extra.insert(
+        "resolutions".to_string(),
+        serde_json::json!({ "@types/node": "18.x" }),
+    );
+
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    let root = graph.importers.get(".").unwrap();
+    let dep = root
+        .iter()
+        .find(|d| d.name == "@types/node")
+        .expect("@types/node direct dep must resolve through the root resolution");
+    assert_eq!(dep.dep_path, "@types/node@18.19.130");
+}
+
 /// Blocks for the project's own workspace entry shouldn't become
 /// `LockedPackage`s — they're the root importer, not a
 /// resolved dep. Skipping them keeps the graph shape identical to
