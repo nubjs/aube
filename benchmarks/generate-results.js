@@ -48,8 +48,13 @@ function readResult (benchDir, name, tool) {
       throw new Error('missing benchmark mean')
     }
     const stddev = Number.isFinite(r.stddev) ? r.stddev : 0
+    // Median is the headline statistic: min overstates best-case (the
+    // pnpm.io approach), mean is noise-sensitive on small N. Mean/min/max
+    // stay in `stats` so the raw shape is never lost.
+    const median = Number.isFinite(r.median) ? r.median : r.mean
     return {
-      text: `${r.mean.toFixed(3)}s ± ${stddev.toFixed(3)}s`,
+      text: `${median.toFixed(3)}s ± ${stddev.toFixed(3)}s`,
+      median,
       mean: r.mean,
       stddev,
       min: r.min,
@@ -59,16 +64,17 @@ function readResult (benchDir, name, tool) {
     if (err && err.code !== 'ENOENT') {
       console.error(`Warning: failed to read ${name}-${tool}: ${err.message}`)
     }
-    return { text: 'n/a', mean: null, stddev: null, min: null, max: null }
+    return { text: 'n/a', median: null, mean: null, stddev: null, min: null, max: null }
   }
 }
 
-function fmtSpeedup (baseMean, aubeMean) {
-  if (baseMean == null || aubeMean == null) return ''
-  if (aubeMean < baseMean) {
-    return ` (${(baseMean / aubeMean).toFixed(1)}x faster)`
-  } else if (aubeMean > baseMean) {
-    return ` (${(aubeMean / baseMean).toFixed(1)}x slower)`
+// Ratios are computed from medians (same statistic as the headline cells).
+function fmtSpeedup (baseMedian, heroMedian) {
+  if (baseMedian == null || heroMedian == null) return ''
+  if (heroMedian < baseMedian) {
+    return ` (${(baseMedian / heroMedian).toFixed(1)}x faster)`
+  } else if (heroMedian > baseMedian) {
+    return ` (${(heroMedian / baseMedian).toFixed(1)}x slower)`
   }
   return ''
 }
@@ -118,11 +124,30 @@ if (process.env.BENCH_NUB_ENGINE_VERSION) {
   versions['nub-aube-engine'] = process.env.BENCH_NUB_ENGINE_VERSION
 }
 
+// The environment block makes every results.json self-describing: which
+// config tier / GVS cell / advisory + release-age pins produced these
+// numbers. No number is publishable without its tier label, so the
+// label rides with the data. bench.sh exports the resolved knob values.
+const environment = {
+  tier: process.env.BENCH_TIER || null,
+  gvs: process.env.BENCH_GVS || 'pin-fast',
+  advisoryCheck: process.env.BENCH_ADVISORY_CHECK || 'default',
+  minimumReleaseAgeMinutes: process.env.BENCH_MIN_RELEASE_AGE_MINUTES || '1440',
+  ci: 'scrubbed (set only in the ci-loop-ci scenario)',
+  runs: process.env.RUNS || null,
+  warmup: process.env.WARMUP || null,
+  hermetic: process.env.BENCH_HERMETIC === '1',
+  bandwidth: process.env.BENCH_BANDWIDTH || null,
+  latency: process.env.BENCH_LATENCY || null,
+  fixture: process.env.BENCH_FIXTURE || 'default',
+}
+
 const json = {
   updated: new Date().toISOString(),
   unit: 'ms',
   managers: TOOLS,
   versions,
+  environment,
   rows: [],
 }
 
@@ -137,21 +162,23 @@ benchmarks.filter(([name]) => SELECTED_BENCHMARKS.has(name)).forEach(([name, lab
     cells.push(results[tool].text)
   }
   if (HERO && TOOLS.includes('pnpm')) {
-    cells.push(fmtSpeedup(results.pnpm.mean, results[HERO].mean).trim())
+    cells.push(fmtSpeedup(results.pnpm.median, results[HERO].median).trim())
   }
   if (HERO && TOOLS.includes('bun')) {
-    cells.push(fmtSpeedup(results.bun.mean, results[HERO].mean).trim())
+    cells.push(fmtSpeedup(results.bun.median, results[HERO].median).trim())
   }
   if (TOOLS.includes('nub') && TOOLS.includes('aube')) {
-    cells.push(fmtSpeedup(results.aube.mean, results.nub.mean).trim())
+    cells.push(fmtSpeedup(results.aube.median, results.nub.median).trim())
   }
   lines.push(`| ${cells.join(' | ')} |`)
 
+  // `values` carries the headline statistic (median, ms); the full
+  // mean/median/stddev/min/max shape lives in `stats`.
   const values = {}
   const stats = {}
   for (const tool of TOOLS) {
-    values[tool] = results[tool].mean == null ? null : Math.round(results[tool].mean * 1000)
-    stats[tool] = results[tool].mean == null ? null : results[tool]
+    values[tool] = results[tool].median == null ? null : Math.round(results[tool].median * 1000)
+    stats[tool] = results[tool].median == null ? null : results[tool]
   }
 
   json.rows.push({ key: name, label, values, stats })

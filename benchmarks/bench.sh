@@ -15,14 +15,16 @@ set -euo pipefail
 #
 # Environment variables:
 #   WARMUP       — warmup runs before timing (default: 1)
-#   RUNS         — timed runs per benchmark (default: 10). Applies to
-#                  the fast tools (aube, bun, deno). Slower tools
-#                  default to fewer runs so the matrix doesn't take
-#                  forever: pnpm = vlt = ceil(RUNS/2),
-#                  npm = yarn = ceil(RUNS/3).
-#   RUNS_PNPM, RUNS_NPM, RUNS_YARN, RUNS_BUN, RUNS_AUBE, RUNS_DENO,
-#   RUNS_VLT     — override the per-tool run count individually. Falls
-#                  back to the defaults above when unset.
+#   RUNS         — timed runs per benchmark (default: 10), applied to
+#                  EVERY tool equally. The old per-tool taper (pnpm at
+#                  half, npm/yarn at a third) saved wall time but made
+#                  the slow tools' statistics structurally noisier than
+#                  the fast tools' — a published ratio should never
+#                  compare a 10-run median to a 4-run one. If wall time
+#                  hurts, cut scenarios, not statistical symmetry.
+#   RUNS_PNPM, RUNS_NPM, RUNS_YARN, RUNS_BUN, RUNS_AUBE, RUNS_NUB,
+#   RUNS_DENO, RUNS_VLT — override the per-tool run count individually
+#                  (escape hatch; published runs keep them equal).
 #   RESULTS_JSON — override the structured JSON output path
 #   BENCH_TOOLS  — comma-separated tools to include
 #                  (default: aube,bun,pnpm,npm,yarn,deno; vlt is
@@ -61,6 +63,47 @@ set -euo pipefail
 #                      proxy in front of Verdaccio.
 #   BENCH_LATENCY    — optional fixed response latency for the throttle
 #                      proxy. Defaults to `50ms` in mise tasks.
+#
+# Config-tier plumbing (every published number carries its tier label;
+# the runner invokes bench.sh once per tier/cell with RESULTS_JSON set
+# to a distinct path — the knobs below are recorded into results.json's
+# `environment` block):
+#
+#   BENCH_TIER       — convenience defaults-setter. `t1` = out-of-box
+#                      (GVS auto, advisory check at tool defaults,
+#                      minimum-release-age unpinned: every tool ships
+#                      its own default). `t2` = normalized same-work
+#                      (GVS pinned on for every tool that has one,
+#                      advisory check off, minimum-release-age pinned
+#                      equal). Explicit BENCH_GVS / BENCH_ADVISORY_CHECK /
+#                      BENCH_MIN_RELEASE_AGE_MINUTES always win over the
+#                      tier default. Unset = legacy behavior (pin-fast).
+#   BENCH_GVS        — global-virtual-store axis, the four-cell knob:
+#                      `pin-fast` (default; aube/nub pinned on, pnpm at
+#                      its default off — upstream's published config),
+#                      `on` (aube/nub/pnpm all pinned on), `off` (all
+#                      pinned off), `auto` (nothing pinned; each tool's
+#                      own heuristic decides — note CI is scrubbed from
+#                      the env, see below). pnpm's equivalent setting is
+#                      enableGlobalVirtualStore (experimental ≥10.12).
+#                      The ci-loop scenario ignores this knob by design.
+#   BENCH_ADVISORY_CHECK — `default` (aube/nub keep their on-by-default
+#                      OSV MAL-* check; it fires only on fresh-resolution
+#                      flows) or `off` (pinned off for aube/nub — the T2
+#                      same-work setting; pnpm/npm/bun have no equivalent
+#                      to pin, npm's audit is already off via --no-audit).
+#   BENCH_MIN_RELEASE_AGE_MINUTES — numeric pin applied to every PM that
+#                      supports the gate (existing behavior, default
+#                      1440), `0` to disable everywhere, or `default` to
+#                      pin nothing anywhere: aube/nub keep their
+#                      compiled-in 1440, everyone else keeps their own
+#                      default (the T1 out-of-box posture — aube alone
+#                      pays its full-packument cost, priced honestly).
+#
+# CI env policy: `CI` is unset for the entire run — it is a benchmark
+# *variable*, not ambient state (GitHub Actions' inherited CI=true used
+# to silently flip tool heuristics). The only place it appears is the
+# ci-loop scenario's explicit CI=true row.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -81,19 +124,53 @@ VLT_BIN="$(command -v vlt || true)"
 BENCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aube-bench.XXXXXX")"
 WARMUP="${WARMUP:-1}"
 RUNS="${RUNS:-10}"
-# Slower tools take a real chunk of wall time per iteration; default
-# pnpm to half the run count and npm/yarn to a third. Each is overridable.
+# Every tool gets the same run count — equal-N or the comparison is
+# apples-to-oranges statistically (see the RUNS doc comment above).
+# Per-tool overrides remain as an escape hatch for local iteration.
 RUNS_AUBE="${RUNS_AUBE:-$RUNS}"
 RUNS_NUB="${RUNS_NUB:-$RUNS}"
 RUNS_BUN="${RUNS_BUN:-$RUNS}"
 RUNS_DENO="${RUNS_DENO:-$RUNS}"
-RUNS_PNPM="${RUNS_PNPM:-$(((RUNS + 1) / 2))}"
-RUNS_VLT="${RUNS_VLT:-$(((RUNS + 1) / 2))}"
-RUNS_NPM="${RUNS_NPM:-$(((RUNS + 2) / 3))}"
-RUNS_YARN="${RUNS_YARN:-$(((RUNS + 2) / 3))}"
+RUNS_PNPM="${RUNS_PNPM:-$RUNS}"
+RUNS_VLT="${RUNS_VLT:-$RUNS}"
+RUNS_NPM="${RUNS_NPM:-$RUNS}"
+RUNS_YARN="${RUNS_YARN:-$RUNS}"
 BENCH_TOOLS="${BENCH_TOOLS:-aube,bun,pnpm,npm,yarn,deno}"
 BENCH_SCENARIOS="${BENCH_SCENARIOS:-gvs-warm,gvs-cold,install-test}"
 BENCH_PHASES="${BENCH_PHASES:-1}"
+
+# ── Config tiers ────────────────────────────────────────────────────────────
+# BENCH_TIER fills in defaults for the three normalization knobs; an
+# explicitly set knob always wins. See the header comment for semantics.
+
+BENCH_TIER="${BENCH_TIER:-}"
+case "$BENCH_TIER" in
+"") ;;
+t1)
+	BENCH_GVS="${BENCH_GVS:-auto}"
+	BENCH_ADVISORY_CHECK="${BENCH_ADVISORY_CHECK:-default}"
+	BENCH_MIN_RELEASE_AGE_MINUTES="${BENCH_MIN_RELEASE_AGE_MINUTES:-default}"
+	;;
+t2)
+	BENCH_GVS="${BENCH_GVS:-on}"
+	BENCH_ADVISORY_CHECK="${BENCH_ADVISORY_CHECK:-off}"
+	BENCH_MIN_RELEASE_AGE_MINUTES="${BENCH_MIN_RELEASE_AGE_MINUTES:-1440}"
+	;;
+*)
+	echo "error: BENCH_TIER must be t1, t2, or unset (got: $BENCH_TIER)" >&2
+	exit 1
+	;;
+esac
+BENCH_GVS="${BENCH_GVS:-pin-fast}"
+BENCH_ADVISORY_CHECK="${BENCH_ADVISORY_CHECK:-default}"
+export BENCH_TIER BENCH_GVS BENCH_ADVISORY_CHECK
+
+# CI is a benchmark variable, not ambient state. Tools flip real
+# behavior on it (aube's GVS heuristic, yarn's immutable installs,
+# bun's frozen lockfile), so an inherited CI=true from GitHub Actions
+# would silently change what's being measured. The ci-loop scenario
+# re-introduces it explicitly as its own labeled row.
+unset CI
 
 # ── Validation ──────────────────────────────────────────────────────────────
 
@@ -459,12 +536,75 @@ expand_template() {
 #
 # Override via `BENCH_MIN_RELEASE_AGE_MINUTES=0` to disable the gate
 # across all PMs (useful for measuring raw resolver speed without
-# the security-feature axis).
+# the security-feature axis), or `default` to pin nothing anywhere —
+# the T1 out-of-box posture: aube/nub keep their compiled-in 1440 and
+# pay the full-packument cost their own default forces, everyone else
+# cruises on corgi. The per-tool *_MRA_* fragments below expand to
+# nothing in that mode.
 MIN_RELEASE_AGE_MINUTES="${BENCH_MIN_RELEASE_AGE_MINUTES:-1440}"
-MIN_RELEASE_AGE_SECONDS=$((MIN_RELEASE_AGE_MINUTES * 60))
-# npm uses days as the unit. Round up so the gate is at least as
-# strict as aube's, never weaker. (60*24 = 1440 → 1 day exactly.)
-MIN_RELEASE_AGE_DAYS=$(((MIN_RELEASE_AGE_MINUTES + 60 * 24 - 1) / (60 * 24)))
+export BENCH_MIN_RELEASE_AGE_MINUTES="$MIN_RELEASE_AGE_MINUTES"
+if [ "$MIN_RELEASE_AGE_MINUTES" = "default" ]; then
+	AUBE_MRA_ENV=""
+	NPM_MRA_FLAG=""
+	PNPM_MRA_FLAG=""
+	BUN_MRA_FLAG=""
+	DENO_MRA_FLAG=""
+else
+	MIN_RELEASE_AGE_SECONDS=$((MIN_RELEASE_AGE_MINUTES * 60))
+	# npm uses days as the unit. Round up so the gate is at least as
+	# strict as aube's, never weaker. (60*24 = 1440 → 1 day exactly.)
+	MIN_RELEASE_AGE_DAYS=$(((MIN_RELEASE_AGE_MINUTES + 60 * 24 - 1) / (60 * 24)))
+	AUBE_MRA_ENV="npm_config_minimum_release_age=${MIN_RELEASE_AGE_MINUTES}"
+	NPM_MRA_FLAG="${NPM_MRA_FLAG}"
+	PNPM_MRA_FLAG="${PNPM_MRA_FLAG}"
+	BUN_MRA_FLAG="--minimum-release-age=${MIN_RELEASE_AGE_SECONDS}"
+	DENO_MRA_FLAG="${DENO_MRA_FLAG}"
+fi
+
+# Global-virtual-store axis (BENCH_GVS, see header). FAST_GVS_ENV is the
+# npm_config alias consumed by aube and nub; PNPM_GVS_FLAG is pnpm's
+# spelling of the same setting (enableGlobalVirtualStore, experimental
+# since pnpm 10.12). `pin-fast` reproduces upstream's published config:
+# the fast engines pinned on so GitHub Actions' inherited CI=true can't
+# silently flip them to per-project mode, pnpm at its default (off).
+case "$BENCH_GVS" in
+pin-fast)
+	FAST_GVS_ENV="npm_config_enable_global_virtual_store=true"
+	PNPM_GVS_FLAG=""
+	;;
+on)
+	FAST_GVS_ENV="npm_config_enable_global_virtual_store=true"
+	PNPM_GVS_FLAG="--config.enable-global-virtual-store=true"
+	;;
+off)
+	FAST_GVS_ENV="npm_config_enable_global_virtual_store=false"
+	PNPM_GVS_FLAG="--config.enable-global-virtual-store=false"
+	;;
+auto)
+	FAST_GVS_ENV=""
+	PNPM_GVS_FLAG=""
+	;;
+*)
+	echo "error: BENCH_GVS must be pin-fast, on, off, or auto (got: $BENCH_GVS)" >&2
+	exit 1
+	;;
+esac
+
+# Advisory-check axis (BENCH_ADVISORY_CHECK, see header). Only aube/nub
+# carry the OSV MAL-* gate; `off` is the T2 same-work pin (pnpm has no
+# OSV check, npm's audit is already disabled via --no-audit).
+case "$BENCH_ADVISORY_CHECK" in
+default)
+	FAST_ADVISORY_ENV=""
+	;;
+off)
+	FAST_ADVISORY_ENV="npm_config_advisory_check=off"
+	;;
+*)
+	echo "error: BENCH_ADVISORY_CHECK must be default or off (got: $BENCH_ADVISORY_CHECK)" >&2
+	exit 1
+	;;
+esac
 
 # Per-tool boilerplate factored out of the `CMDS` declarations below.
 # Every bun invocation threads the same hermetic environment
@@ -475,7 +615,7 @@ MIN_RELEASE_AGE_DAYS=$(((MIN_RELEASE_AGE_MINUTES + 60 * 24 - 1) / (60 * 24)))
 # `--minimum-release-age` is bun's name for the same supply-chain
 # gate aube defaults on; matching the value here keeps the bench
 # from advantaging bun by silently skipping work aube does.
-BUN_BASE="HOME={home} BUN_INSTALL={home}/.bun {bin} install --cache-dir {cache} --ignore-scripts --no-summary --minimum-release-age=${MIN_RELEASE_AGE_SECONDS}"
+BUN_BASE="HOME={home} BUN_INSTALL={home}/.bun {bin} install --cache-dir {cache} --ignore-scripts --no-summary ${BUN_MRA_FLAG}"
 
 # aube reads the global store root from `$XDG_DATA_HOME/aube/store`
 # (falling back to `$HOME/.local/share/aube/store`). We must pin
@@ -489,24 +629,25 @@ BUN_BASE="HOME={home} BUN_INSTALL={home}/.bun {bin} install --cache-dir {cache} 
 # compiled-in default (1440) regardless of
 # `BENCH_MIN_RELEASE_AGE_MINUTES`, silently breaking the
 # apples-to-apples guarantee for any non-default override.
-AUBE_ENV="HOME={home} XDG_CACHE_HOME={cache} XDG_DATA_HOME={home}/.local/share npm_config_minimum_release_age=${MIN_RELEASE_AGE_MINUTES}"
+AUBE_ENV="HOME={home} XDG_CACHE_HOME={cache} XDG_DATA_HOME={home}/.local/share ${AUBE_MRA_ENV} ${FAST_ADVISORY_ENV}"
 
-# Per-scenario AUBE_ENV variant that pins aube's global virtual store on
-# via the `enableGlobalVirtualStore` setting's auto-synthesized env-var
-# alias (`npm_config_<snake_case>` — see `aube-settings/build.rs`).
+# Per-scenario AUBE_ENV variant carrying the GVS axis resolved from
+# BENCH_GVS via the `enableGlobalVirtualStore` setting's auto-synthesized
+# env-var alias (`npm_config_<snake_case>` — see `aube-settings/build.rs`).
 # Using an env var rather than `--enable-gvs` means scenarios that go
 # through `aube test` (which triggers auto-install internally) get the
 # same forcing as direct `aube install` calls. The setting wins over
-# `Linker::new`'s `CI` heuristic, so GitHub Actions' inherited `CI=true`
-# cannot silently flip the mode.
-AUBE_ENV_GVS_ON="$AUBE_ENV npm_config_enable_global_virtual_store=true"
+# `Linker::new`'s `CI` heuristic. With BENCH_GVS=auto the fragment is
+# empty and the heuristic decides (CI is scrubbed, so on a dev-shaped
+# env that resolves to GVS-on).
+AUBE_ENV_GVS="$AUBE_ENV ${FAST_GVS_ENV}"
 
 # nub embeds the aube engine, including its settings layer, so the same
-# npm_config_* aliases (minimum-release-age, enableGlobalVirtualStore)
-# steer it. Isolation mirrors AUBE_ENV: engine cache at
-# $XDG_CACHE_HOME/nub/pm, CAS store at $XDG_DATA_HOME/nub/store.
-NUB_ENV="HOME={home} XDG_CACHE_HOME={cache} XDG_DATA_HOME={home}/.local/share npm_config_minimum_release_age=${MIN_RELEASE_AGE_MINUTES}"
-NUB_ENV_GVS_ON="$NUB_ENV npm_config_enable_global_virtual_store=true"
+# npm_config_* aliases (minimum-release-age, advisoryCheck,
+# enableGlobalVirtualStore) steer it. Isolation mirrors AUBE_ENV: engine
+# cache at $XDG_CACHE_HOME/nub/pm, CAS store at $XDG_DATA_HOME/nub/store.
+NUB_ENV="HOME={home} XDG_CACHE_HOME={cache} XDG_DATA_HOME={home}/.local/share ${AUBE_MRA_ENV} ${FAST_ADVISORY_ENV}"
+NUB_ENV_GVS="$NUB_ENV ${FAST_GVS_ENV}"
 
 # Scenario keys describe what's on disk before the run. Every install
 # scenario assumes a committed lockfile is present; the axes are
@@ -516,19 +657,19 @@ NUB_ENV_GVS_ON="$NUB_ENV npm_config_enable_global_virtual_store=true"
 cmd_template() {
 	case "$1:$2" in
 	gvs-warm:aube | gvs-cold:aube)
-		echo "cd {project} && $AUBE_ENV_GVS_ON {bin} install --frozen-lockfile >/dev/null 2>&1"
+		echo "cd {project} && $AUBE_ENV_GVS {bin} install --frozen-lockfile >/dev/null 2>&1"
 		;;
 	gvs-warm:nub | gvs-cold:nub)
-		echo "cd {project} && $NUB_ENV_GVS_ON {bin} install --frozen-lockfile >/dev/null 2>&1"
+		echo "cd {project} && $NUB_ENV_GVS {bin} install --frozen-lockfile >/dev/null 2>&1"
 		;;
 	gvs-warm:bun | gvs-cold:bun)
 		echo "cd {project} && $BUN_BASE --frozen-lockfile >/dev/null 2>&1"
 		;;
 	gvs-warm:npm)
-		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline --min-release-age=${MIN_RELEASE_AGE_DAYS} >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline ${NPM_MRA_FLAG} >/dev/null 2>&1"
 		;;
 	gvs-warm:pnpm | gvs-cold:pnpm)
-		echo "cd {project} && HOME={home} {bin} install --frozen-lockfile --ignore-scripts --config.minimum-release-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} {bin} install --frozen-lockfile --ignore-scripts ${PNPM_MRA_FLAG} ${PNPM_GVS_FLAG} >/dev/null 2>&1"
 		;;
 	gvs-warm:yarn | gvs-cold:yarn)
 		# Yarn 4: --immutable replaces --frozen-lockfile and aborts
@@ -542,7 +683,7 @@ cmd_template() {
 		# scripts are off unless --allow-scripts is passed.
 		# `--minimum-dependency-age` is flagged "Unstable" in deno's
 		# help but the flag itself parses fine; takes minutes.
-		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet --minimum-dependency-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet ${DENO_MRA_FLAG} >/dev/null 2>&1"
 		;;
 	gvs-warm:vlt | gvs-cold:vlt)
 		# vlt's --frozen-lockfile mirrors pnpm/npm/aube semantics: refuse
@@ -552,10 +693,10 @@ cmd_template() {
 		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --frozen-lockfile >/dev/null 2>&1"
 		;;
 	gvs-cold:npm)
-		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps --min-release-age=${MIN_RELEASE_AGE_DAYS} >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps ${NPM_MRA_FLAG} >/dev/null 2>&1"
 		;;
 	install-test:aube)
-		echo "cd {project} && $AUBE_ENV_GVS_ON {bin} test >/dev/null 2>&1"
+		echo "cd {project} && $AUBE_ENV_GVS {bin} test >/dev/null 2>&1"
 		;;
 	install-test:nub)
 		# nub has no `test` verb that auto-installs; the equivalent
@@ -563,22 +704,22 @@ cmd_template() {
 		# the embedded engine) followed by `nub run test`. nub discovers
 		# Node from $PATH, so the isolated HOME doesn't trigger Node
 		# provisioning here.
-		echo "cd {project} && $NUB_ENV_GVS_ON {bin} install >/dev/null 2>&1 && $NUB_ENV_GVS_ON {bin} run test >/dev/null 2>&1"
+		echo "cd {project} && $NUB_ENV_GVS {bin} install >/dev/null 2>&1 && $NUB_ENV_GVS {bin} run test >/dev/null 2>&1"
 		;;
 	install-test:bun)
 		echo "cd {project} && $BUN_BASE --frozen-lockfile >/dev/null 2>&1 && HOME={home} BUN_INSTALL={home}/.bun {bin} run test >/dev/null 2>&1"
 		;;
 	install-test:npm)
-		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install-test --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline --min-release-age=${MIN_RELEASE_AGE_DAYS} >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install-test --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline ${NPM_MRA_FLAG} >/dev/null 2>&1"
 		;;
 	install-test:pnpm)
-		echo "cd {project} && HOME={home} {bin} install-test --frozen-lockfile --ignore-scripts --config.minimum-release-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} {bin} install-test --frozen-lockfile --ignore-scripts ${PNPM_MRA_FLAG} ${PNPM_GVS_FLAG} >/dev/null 2>&1"
 		;;
 	install-test:yarn)
 		echo "cd {project} && HOME={home} {bin} install --immutable >/dev/null 2>&1 && HOME={home} {bin} test >/dev/null 2>&1"
 		;;
 	install-test:deno)
-		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet --minimum-dependency-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1 && HOME={home} DENO_DIR={cache} {bin} task --quiet test >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet ${DENO_MRA_FLAG} >/dev/null 2>&1 && HOME={home} DENO_DIR={cache} {bin} task --quiet test >/dev/null 2>&1"
 		;;
 	install-test:vlt)
 		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --frozen-lockfile >/dev/null 2>&1 && HOME={home} npm_config_cache={cache} {bin} run test >/dev/null 2>&1"
@@ -803,7 +944,7 @@ TOOLS_CSV=$(
 	IFS=,
 	echo "${TOOLS[*]}"
 )
-BENCH_TOOLS="$TOOLS_CSV" BENCH_SCENARIOS="$BENCH_SCENARIOS" node "$SCRIPT_DIR/generate-results.js" "$BENCH_DIR" "$RESULTS_MD"
+BENCH_TOOLS="$TOOLS_CSV" BENCH_SCENARIOS="$BENCH_SCENARIOS" RUNS="$RUNS" WARMUP="$WARMUP" node "$SCRIPT_DIR/generate-results.js" "$BENCH_DIR" "$RESULTS_MD"
 if [ -s "$PHASES_FILE" ]; then
 	echo ""
 	node "$SCRIPT_DIR/generate-phase-results.mjs" "$PHASES_FILE" "$BENCH_DIR/aube-install-phases.md"
