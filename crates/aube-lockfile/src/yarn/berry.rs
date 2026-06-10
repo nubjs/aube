@@ -461,7 +461,7 @@ fn collect_peer_meta(block: &yaml_serde::Mapping) -> BTreeMap<String, crate::Pee
 /// (`#...`) that berry appends to pin the imported checksum is
 /// stripped — aube's `LocalSource` records the path only, and the
 /// checksum round-trips via `yarn_checksum`.
-fn file_protocol_source(body: &str) -> LocalSource {
+pub(super) fn file_protocol_source(body: &str) -> LocalSource {
     let path = PathBuf::from(strip_hash_fragment(body));
     let is_tarball = path
         .extension()
@@ -510,7 +510,7 @@ fn patch_spec_matches(
         .is_some_and(|expected| expected == &path)
 }
 
-fn strip_hash_fragment(s: &str) -> &str {
+pub(super) fn strip_hash_fragment(s: &str) -> &str {
     s.split_once('#').map(|(a, _)| a).unwrap_or(s)
 }
 

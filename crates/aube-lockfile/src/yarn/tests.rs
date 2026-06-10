@@ -199,6 +199,55 @@ sourcemap-codec@^1.4.8:
     );
 }
 
+/// A yarn-classic `link:` dep is a local on-disk package, not a
+/// registry one: yarn records the block keyed by the spec
+/// `name@link:<path>` with `version "0.0.0"` and no `resolved` URL.
+/// The parser must recognize the protocol and attach a
+/// `LocalSource::Link` so the linker symlinks the directory; without
+/// it the dep falls through as a registry package, and the installer
+/// builds a `<name>/-/<name>-0.0.0.tgz` registry URL that 404s and
+/// aborts the whole install.
+///
+/// Shape taken from facebook/react's committed yarn.lock
+/// (`eslint-plugin-react-internal@link:./scripts/eslint-rules`), found
+/// by differential corpus testing against react.
+#[test]
+fn test_parse_classic_link_protocol_is_local_not_registry() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"# yarn lockfile v1
+
+"eslint-plugin-react-internal@link:./scripts/eslint-rules":
+  version "0.0.0"
+  uid ""
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(
+        &[],
+        &[(
+            "eslint-plugin-react-internal",
+            "link:./scripts/eslint-rules",
+        )],
+    );
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    let key = LocalSource::Link(PathBuf::from("./scripts/eslint-rules"))
+        .dep_path("eslint-plugin-react-internal");
+    let pkg = graph
+        .packages
+        .get(&key)
+        .expect("link: dep must be keyed by its LocalSource::Link dep_path");
+    assert!(
+        matches!(&pkg.local_source, Some(LocalSource::Link(p)) if p == &PathBuf::from("./scripts/eslint-rules")),
+        "link: dep must carry LocalSource::Link so the linker symlinks instead of fetching a 0.0.0 tarball"
+    );
+
+    let dep = graph.importers["."]
+        .iter()
+        .find(|d| d.name == "eslint-plugin-react-internal")
+        .expect("link: dep must resolve as a direct dep of the importer");
+    assert_eq!(dep.dep_path, key);
+}
+
 /// Round-trip safety: our writer emits the canonical
 /// `"name@version"` spec first and the npm-alias spec alongside it.
 /// On reparse the `[0]` spec carries no `npm:`, so the alias must
