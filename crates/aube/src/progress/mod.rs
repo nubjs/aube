@@ -81,18 +81,39 @@ fn env_truthy(name: &str) -> bool {
     })
 }
 
-/// Build the standard `aube VERSION by jdx.dev · <msg>` one-line
-/// header used by the no-op and fast-mode summaries. Centralizes the
-/// header shape so the install-finished, already-up-to-date, and
-/// fast-mode-summary paths all read consistently.
-pub(crate) fn aube_prefix_line(msg: &str) -> String {
+/// The styled product segment of the standard one-line header:
+/// `aube VERSION by jdx.dev` when running as the aube CLI, or the
+/// embedder's registered `<name> <version>` when a host product wraps
+/// the command layer (`aube_util::ua::set_user_agent_product`). An
+/// embedded engine introducing itself by the host product's name is
+/// the same audience contract as the user-agent override — the header
+/// names the product actually in charge, and the `by jdx.dev`
+/// attribution only applies to the aube CLI itself. Centralized so
+/// the no-op/fast-mode summaries and both progress-bar headers (TTY +
+/// CI) stay consistent.
+pub(crate) fn product_header() -> String {
+    if let Some(product) = aube_util::ua::user_agent_product() {
+        // First `name/version` token = the running product (the UA tail
+        // and any retained `aube/x.y.z` token are registry-facing detail,
+        // not header material).
+        let first = product.split_whitespace().next().unwrap_or(product);
+        let (name, version) = first.split_once('/').unwrap_or((first, ""));
+        return format!("{} {}", style::emagenta(name).bold(), style::edim(version));
+    }
     format!(
-        "{} {} {} {} {msg}",
+        "{} {} {}",
         style::emagenta("aube").bold(),
         style::edim(crate::version::VERSION.as_str()),
         style::edim("by jdx.dev"),
-        style::edim("·"),
     )
+}
+
+/// Build the standard `<product header> · <msg>` one-line header used
+/// by the no-op and fast-mode summaries. Centralizes the header shape
+/// so the install-finished, already-up-to-date, and fast-mode-summary
+/// paths all read consistently.
+pub(crate) fn aube_prefix_line(msg: &str) -> String {
+    format!("{} {} {msg}", product_header(), style::edim("·"))
 }
 
 /// Install-time progress UI. Cheap to clone (internally `Arc`).
@@ -216,15 +237,11 @@ impl InstallProgress {
     }
 
     fn new_tty() -> Self {
-        // Colored header: magenta bold "aube", dim version, dim "by jdx.dev".
-        // Mirrors the `mise VERSION by @jdx` / `hk VERSION by @jdx` convention
-        // for visual parity across the trio.
-        let header = format!(
-            "{} {} {}",
-            style::emagenta("aube").bold(),
-            style::edim(crate::version::VERSION.as_str()),
-            style::edim("by jdx.dev"),
-        );
+        // Colored product header (see `product_header`): magenta bold name,
+        // dim version, dim "by jdx.dev" for the aube CLI itself. Mirrors the
+        // `mise VERSION by @jdx` / `hk VERSION by @jdx` convention for visual
+        // parity across the trio.
+        let header = product_header();
         // Layout: header, animated bar, count segment, optional bytes
         // segment (running download, with `/ ~estimated` when
         // available), phase-gated rate, ETA. Mirrors the CI-mode
