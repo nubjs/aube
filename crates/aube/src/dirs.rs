@@ -216,10 +216,13 @@ pub fn workspace_or_project_root() -> miette::Result<PathBuf> {
 }
 
 fn no_root_error(initial_cwd: &Path) -> miette::Report {
+    // Derived from the configured workspace-yaml list (an embedder may
+    // restrict it), so the error never names a file discovery would not
+    // actually read. Stock list, discovery order: aube-workspace.yaml,
+    // pnpm-workspace.yaml.
     miette!(
-        "no package.json or workspace yaml \
-         (pnpm-workspace.yaml / aube-workspace.yaml) found in {} \
-         or any parent directory",
+        "no package.json or workspace yaml ({}) found in {} or any parent directory",
+        aube_manifest::workspace::workspace_yaml_names().join(" / "),
         initial_cwd.display()
     )
 }
