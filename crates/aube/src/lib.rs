@@ -523,6 +523,13 @@ enum Commands {
 /// command.
 pub use aube_settings::set_embedder_overlay;
 
+/// Env-family restriction for embedders, re-exported from `aube-util`:
+/// limit which environment-variable families (npm-compatible
+/// `npm_config_*`, aube-owned `AUBE_*`, ecosystem-neutral externals)
+/// are consulted for settings and operational toggles. Defaults to
+/// all families; call once per process before invoking any command.
+pub use aube_util::env::{EnvFamilies, set_env_families};
+
 /// CLI entry point shared by the `aube`, `aubr`, and `aubx` binaries.
 ///
 /// Parses `std::env::args_os()`, dispatches the subcommand, and exits the

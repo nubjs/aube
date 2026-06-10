@@ -464,6 +464,14 @@ pub fn workspace_yaml_value<'a>(
 
 fn raw_from_env<'a>(meta: &meta::SettingMeta, env: &'a [(String, String)]) -> Option<&'a str> {
     for alias in meta.env_vars.iter().rev() {
+        // Honor the process-wide env-family restriction: an embedder
+        // that disabled e.g. the `AUBE_*` family must not see
+        // `AUBE_NODE_LINKER` resolve while `npm_config_node_linker`
+        // keeps working. Default is all families — no behavior change
+        // for the standalone CLI.
+        if !aube_util::env::env_family_enabled(alias) {
+            continue;
+        }
         for (key, raw) in env.iter().rev() {
             if key == alias {
                 return Some(raw);

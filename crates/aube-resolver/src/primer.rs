@@ -263,7 +263,7 @@ fn random_byte() -> u8 {
 }
 
 fn primer_cache_dir() -> Option<PathBuf> {
-    if let Some(base) = std::env::var_os("AUBE_CACHE_DIR") {
+    if let Some(base) = aube_util::env::var_os("AUBE_CACHE_DIR") {
         return Some(PathBuf::from(base).join("primer"));
     }
     cache_base_dir().map(|p| p.join("aube").join("primer"))

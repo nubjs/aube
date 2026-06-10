@@ -111,9 +111,8 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
     }
     let xdg = aube_util::env::xdg_config_home();
     let home = home_dir();
-    let user_rc_override = std::env::var("NPM_CONFIG_USERCONFIG")
-        .ok()
-        .or_else(|| std::env::var("npm_config_userconfig").ok())
+    let user_rc_override = aube_util::env::var("NPM_CONFIG_USERCONFIG")
+        .or_else(|| aube_util::env::var("npm_config_userconfig"))
         .and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
     let tagged = load_npmrc_entries_tagged_with_home(
         home.as_deref(),
@@ -182,9 +181,8 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     // only need these two keys, and confining the env read to the
     // public entry point keeps `_with_home` fully injectable for
     // tests.
-    let user_rc_override = std::env::var("NPM_CONFIG_USERCONFIG")
-        .ok()
-        .or_else(|| std::env::var("npm_config_userconfig").ok())
+    let user_rc_override = aube_util::env::var("NPM_CONFIG_USERCONFIG")
+        .or_else(|| aube_util::env::var("npm_config_userconfig"))
         .and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
     let entries = load_npmrc_entries_with_home(
         home.as_deref(),

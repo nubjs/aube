@@ -25,7 +25,7 @@ pub const CONCURRENCY_CEILING: u32 = 256;
 /// the range — callers fall back to the default (npmrc / setting /
 /// hard-coded). Out-of-range and non-numeric values warn.
 pub fn parse_concurrency_env() -> Option<u32> {
-    let raw = std::env::var_os("AUBE_CONCURRENCY")?;
+    let raw = crate::env::var_os("AUBE_CONCURRENCY")?;
     if let Some(s) = raw.to_str()
         && let Ok(n) = s.parse::<u32>()
         && (CONCURRENCY_FLOOR..=CONCURRENCY_CEILING).contains(&n)

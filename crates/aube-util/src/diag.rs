@@ -267,6 +267,11 @@ impl DiagConfig {
      * per-event log is the costly bit.
      */
     pub fn from_env() -> Option<Self> {
+        // Deliberately NOT routed through the env-family gate
+        // (`crate::env::var_os`): `AUBE_DIAG_*` only controls what gets
+        // logged, never what aube does, and diagnostics should stay
+        // reachable even in a family-restricted embedding when
+        // debugging that very embedding.
         let file = std::env::var_os("AUBE_DIAG_FILE").map(PathBuf::from);
         let print = std::env::var_os("AUBE_DIAG_PRINT").is_some();
         let summary_env = std::env::var_os("AUBE_DIAG_SUMMARY").is_some();

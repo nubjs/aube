@@ -82,7 +82,7 @@ pub async fn run(args: LoginArgs) -> miette::Result<()> {
 /// a masked password field so the token doesn't echo to the terminal or
 /// end up in shell scrollback.
 fn read_token() -> miette::Result<String> {
-    if let Ok(tok) = std::env::var("AUBE_AUTH_TOKEN") {
+    if let Some(tok) = aube_util::env::var("AUBE_AUTH_TOKEN") {
         let tok = tok.trim();
         if !tok.is_empty() {
             return Ok(tok.to_string());
@@ -180,7 +180,7 @@ async fn web_login(registry: &str) -> miette::Result<String> {
 
     eprintln!("Open this URL in your browser to sign in:");
     eprintln!("  {login_url}");
-    if std::io::stderr().is_terminal() && std::env::var_os("AUBE_NO_BROWSER").is_none() {
+    if std::io::stderr().is_terminal() && aube_util::env::var_os("AUBE_NO_BROWSER").is_none() {
         let _ = open_browser(&login_url);
     }
     eprintln!("Waiting for authentication...");

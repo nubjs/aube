@@ -84,6 +84,8 @@ pub fn snapshot() -> Option<KernelSnapshot> {
  * other platforms.
  */
 pub fn enabled() -> bool {
+    // Not routed through the env-family gate — pure diagnostics, same
+    // rationale as `diag::DiagConfig::from_env`.
     std::env::var_os("AUBE_DIAG_KERNEL").is_some() && snapshot().is_some()
 }
 

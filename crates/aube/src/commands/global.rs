@@ -69,7 +69,7 @@ impl GlobalLayout {
 /// existing pnpm users already have the right dir on PATH), then a
 /// platform-specific pnpm-style default.
 fn resolve_home() -> miette::Result<PathBuf> {
-    if let Ok(v) = std::env::var("AUBE_HOME")
+    if let Some(v) = aube_util::env::var("AUBE_HOME")
         && !v.is_empty()
     {
         return Ok(PathBuf::from(v));

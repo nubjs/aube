@@ -88,6 +88,9 @@ struct InstallPhaseTimings {
 impl InstallPhaseTimings {
     fn from_env() -> Self {
         Self {
+            // `AUBE_BENCH_*` bypasses the env-family gate on purpose:
+            // bench instrumentation only writes timing output, same
+            // diagnostics-only rationale as `AUBE_DIAG_*`.
             path: std::env::var_os("AUBE_BENCH_PHASES_FILE").map(std::path::PathBuf::from),
             phases_ms: BTreeMap::new(),
             last_kernel_snap: aube_util::diag_kernel::snapshot(),
@@ -898,9 +901,9 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 let persistent_for_save = persistent.clone();
                 // Hoist env-driven flags out of the per-tarball loop.
                 let streaming_sha512_enabled =
-                    std::env::var_os("AUBE_DISABLE_STREAMING_SHA512").is_none();
+                    aube_util::env::var_os("AUBE_DISABLE_STREAMING_SHA512").is_none();
                 let tarball_stream_enabled =
-                    std::env::var_os("AUBE_DISABLE_TARBALL_STREAM").is_none();
+                    aube_util::env::var_os("AUBE_DISABLE_TARBALL_STREAM").is_none();
                 // JoinSet over bare Vec<JoinHandle>. If the first
                 // fetch errors and we return via `?`, a plain Vec
                 // drops the remaining JoinHandles which detaches the

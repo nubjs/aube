@@ -511,10 +511,14 @@ pub(crate) fn resolve_virtual_store_dir(
     // Keep all three aliases here — dropping `AUBE_VIRTUAL_STORE_DIR`
     // silently routes through the default branch even though
     // `aube_settings::resolved::virtual_store_dir` honors the env value.
+    // Each alias also has to pass the env-family gate, otherwise a
+    // family-restricted process would see "explicit env" here while the
+    // resolver (correctly) ignores the variable.
     let has_explicit_env = ctx.env.iter().any(|(k, _)| {
-        k == "npm_config_virtual_store_dir"
+        (k == "npm_config_virtual_store_dir"
             || k == "NPM_CONFIG_VIRTUAL_STORE_DIR"
-            || k == "AUBE_VIRTUAL_STORE_DIR"
+            || k == "AUBE_VIRTUAL_STORE_DIR")
+            && aube_util::env::env_family_enabled(k)
     });
     if !(has_explicit_npmrc || has_explicit_yaml || has_explicit_env) {
         return default_from_modules_dir();

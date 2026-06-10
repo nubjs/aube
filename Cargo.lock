@@ -439,6 +439,7 @@ name = "aube-settings"
 version = "1.18.2"
 dependencies = [
  "aube-manifest",
+ "aube-util",
  "serde",
  "toml",
  "yaml_serde",
