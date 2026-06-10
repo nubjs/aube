@@ -19,6 +19,12 @@
       "exit_code": 12
     },
     {
+      "name": "ERR_AUBE_OUTDATED_LOCKFILE",
+      "category": "Lockfile",
+      "description": "A `--frozen-lockfile` install found the lockfile out of date with `package.json` / `pnpm-workspace.yaml` (same condition as pnpm's `ERR_PNPM_OUTDATED_LOCKFILE`).",
+      "exit_code": 13
+    },
+    {
       "name": "ERR_AUBE_NO_MATCHING_VERSION",
       "category": "Resolver",
       "description": "No published version of the named package satisfies the requested range.",

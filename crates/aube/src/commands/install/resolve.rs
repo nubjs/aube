@@ -351,6 +351,7 @@ pub(super) fn select_lockfile_result(
                     graph.check_catalogs_drift(workspace_catalogs)
                 {
                     return Err(miette!(
+                        code = aube_codes::errors::ERR_AUBE_OUTDATED_LOCKFILE,
                         "lockfile is out of date with pnpm-workspace.yaml: {reason}\n\
                          help: run without --frozen-lockfile to update the lockfile"
                     ));
@@ -364,6 +365,7 @@ pub(super) fn select_lockfile_result(
                     kind,
                 ) {
                     return Err(miette!(
+                        code = aube_codes::errors::ERR_AUBE_OUTDATED_LOCKFILE,
                         "lockfile is out of date with package.json: {reason}\n\
                          help: run without --frozen-lockfile to update the lockfile, \
                          or run `aube install --no-frozen-lockfile` to regenerate it"
