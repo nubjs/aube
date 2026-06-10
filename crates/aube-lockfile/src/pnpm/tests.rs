@@ -2569,6 +2569,100 @@ snapshots:
 }
 
 #[test]
+fn parse_synthesizes_npm_alias_whose_target_is_a_file_package() {
+    // A `file:` dep consumed under a different in-tree name gets the
+    // same implicit alias encoding as a registry alias — the importer
+    // key is the alias and `version:` is `<real_name>@file:<path>` —
+    // but the target package lives in the lockfile's local-package
+    // set, not in `packages:`/`snapshots:` keyed by name@version.
+    // The alias synthesis must resolve against local packages too, or
+    // the whole lockfile fails to parse (which takes down read-only
+    // commands along with install). Shape taken verbatim from
+    // vitejs/vite's committed pnpm-lock.yaml (playground/ssr-deps),
+    // found by differential corpus testing against vite.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(
+        &path,
+        r#"
+lockfileVersion: '9.0'
+
+importers:
+  playground/ssr-deps:
+    dependencies:
+      '@vitejs/test-optimized-cjs-with-nested-external':
+        specifier: file:./optimized-with-nested-external
+        version: '@vitejs/test-optimized-with-nested-external@file:playground/ssr-deps/optimized-with-nested-external'
+      '@vitejs/test-optimized-with-nested-external':
+        specifier: file:./optimized-with-nested-external
+        version: file:playground/ssr-deps/optimized-with-nested-external
+
+packages:
+  '@vitejs/test-optimized-with-nested-external@file:playground/ssr-deps/optimized-with-nested-external':
+    resolution: {directory: playground/ssr-deps/optimized-with-nested-external, type: directory}
+
+snapshots:
+  '@vitejs/test-optimized-with-nested-external@file:playground/ssr-deps/optimized-with-nested-external': {}
+"#,
+    )
+    .unwrap();
+
+    let graph = parse(&path).unwrap();
+
+    let importer = graph
+        .importers
+        .get("playground/ssr-deps")
+        .expect("playground/ssr-deps importer");
+    assert_eq!(importer.len(), 2);
+
+    // Local packages are keyed by the FS-safe hashed form
+    // (`LocalSource::dep_path`), never the raw `name@file:<path>`
+    // spelling — the graph key doubles as the `.aube/` subdir name,
+    // and the linker resolves a dep by looking `<name>@<tail>` up in
+    // `graph.packages` directly. The synthesized alias clone must
+    // land on the same convention or the linker never finds it.
+    let source =
+        LocalSource::Directory("playground/ssr-deps/optimized-with-nested-external".into());
+    let alias_key = source.dep_path("@vitejs/test-optimized-cjs-with-nested-external");
+    let real_key = source.dep_path("@vitejs/test-optimized-with-nested-external");
+
+    for (name, key) in [
+        ("@vitejs/test-optimized-cjs-with-nested-external", &alias_key),
+        ("@vitejs/test-optimized-with-nested-external", &real_key),
+    ] {
+        let dep = importer
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("importer dep {name} missing"));
+        assert_eq!(
+            &dep.dep_path, key,
+            "importer DirectDep for {name} must point at the hashed local key"
+        );
+    }
+
+    let alias_pkg = graph
+        .packages
+        .get(&alias_key)
+        .expect("synthesized alias-keyed package for the file: target");
+    assert_eq!(
+        alias_pkg.name,
+        "@vitejs/test-optimized-cjs-with-nested-external"
+    );
+    assert_eq!(
+        alias_pkg.alias_of.as_deref(),
+        Some("@vitejs/test-optimized-with-nested-external")
+    );
+    assert!(
+        alias_pkg.local_source.is_some(),
+        "alias clone keeps the file: local_source so the linker links the directory, not the registry"
+    );
+
+    let real_pkg = graph.packages.get(&real_key).expect("real file: entry");
+    assert_eq!(real_pkg.name, "@vitejs/test-optimized-with-nested-external");
+    assert!(real_pkg.alias_of.is_none());
+}
+
+#[test]
 fn parse_synthesizes_npm_alias_for_transitive_deps() {
     // pnpm encodes npm-aliased *transitive* deps as
     // `<alias>: <real>@<resolved>` inside a snapshot's
