@@ -16,6 +16,7 @@ pub const ERR_AUBE_NO_LOCKFILE: &str = "ERR_AUBE_NO_LOCKFILE";
 pub const ERR_AUBE_LOCKFILE_PARSE: &str = "ERR_AUBE_LOCKFILE_PARSE";
 pub const ERR_AUBE_LOCKFILE_UNSUPPORTED_FORMAT: &str = "ERR_AUBE_LOCKFILE_UNSUPPORTED_FORMAT";
 pub const ERR_AUBE_RESOLUTION_SHAPE_MISMATCH: &str = "ERR_AUBE_RESOLUTION_SHAPE_MISMATCH";
+pub const ERR_AUBE_OUTDATED_LOCKFILE: &str = "ERR_AUBE_OUTDATED_LOCKFILE";
 
 // ── resolver ─────────────────────────────────────────────────────────
 pub const ERR_AUBE_NO_MATCHING_VERSION: &str = "ERR_AUBE_NO_MATCHING_VERSION";
@@ -150,6 +151,12 @@ pub const ALL: &[CodeMeta] = &[
         category: category::LOCKFILE,
         description: "A registry-style lockfile dependency path is backed by a git, local directory, or direct tarball resolution.",
         exit_code: Some(13),
+    },
+    CodeMeta {
+        name: ERR_AUBE_OUTDATED_LOCKFILE,
+        category: category::LOCKFILE,
+        description: "A `--frozen-lockfile` install found the lockfile out of date with `package.json` / `pnpm-workspace.yaml` (same condition as pnpm's `ERR_PNPM_OUTDATED_LOCKFILE`).",
+        exit_code: Some(16),
     },
     // Resolver
     CodeMeta {
