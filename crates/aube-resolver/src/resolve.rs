@@ -80,10 +80,11 @@ impl Resolver {
 
     /// Build the final `LockfileGraph` from accumulated resolver state.
     ///
-    /// Runs the catalog-pick materialization, hoists auto-installed
-    /// peers when `auto_install_peers` is on, and applies peer-context
-    /// suffixes. Returns the post-peer-context graph ready for lockfile
-    /// emission.
+    /// Runs the catalog-pick materialization, temporarily hoists
+    /// auto-installed peers when `auto_install_peers` is on, applies
+    /// peer-context suffixes, then strips the hoisted importer entries
+    /// again. Returns the post-peer-context graph ready for lockfile
+    /// emission, with `importers` mirroring the manifests.
     fn finalize_resolved_graph(
         &self,
         importers: BTreeMap<String, Vec<DirectDep>>,
@@ -128,16 +129,20 @@ impl Resolver {
             workspace_extra_fields: BTreeMap::new(),
         };
 
-        // Second pass: hoist every auto-installed peer to its importer's
-        // direct deps so pnpm-style `node_modules/<peer>` top-level
-        // symlinks get created and the lockfile's `importers.` section
-        // lists them the way pnpm does with `auto-install-peers=true`.
-        // Skipped entirely when the setting is off — matches pnpm, which
-        // leaves the importer's `dependencies` untouched in that mode.
-        let hoisted = if self.auto_install_peers {
+        // Second pass: temporarily hoist every auto-installed peer to its
+        // importer's direct deps so the peer-context pass below resolves
+        // direct deps' peers from the importer scope — the same view
+        // pnpm's `auto-install-peers=true` resolution has. The additions
+        // are stripped again after `apply_peer_contexts`: pnpm keeps
+        // auto-installed peers in the resolved graph/snapshots but never
+        // writes them as importer specifiers or links them at the top
+        // level of `node_modules/`. Skipped entirely when the setting is
+        // off — matches pnpm, which leaves the importer's `dependencies`
+        // untouched in that mode.
+        let (hoisted, auto_installed_peers) = if self.auto_install_peers {
             hoist_auto_installed_peers(canonical)
         } else {
-            canonical
+            (canonical, crate::AutoInstalledPeers::new())
         };
 
         // Third pass: compute peer-context suffixes for every reachable
@@ -150,7 +155,8 @@ impl Resolver {
         };
         let _diag_peer =
             aube_util::diag::Span::new(aube_util::diag::Category::Resolver, "peer_context_apply");
-        let contextualized = apply_peer_contexts(hoisted, &peer_options)?;
+        let mut contextualized = apply_peer_contexts(hoisted, &peer_options)?;
+        crate::remove_auto_installed_peers(&mut contextualized, &auto_installed_peers);
         drop(_diag_peer);
         tracing::debug!(
             "peer-context pass produced {} contextualized packages",

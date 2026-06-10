@@ -38,10 +38,11 @@ JSON
 	# Top-level symlink follows.
 	assert_link_exists node_modules/use-sync-external-store
 
-	# Auto-installed peer is hoisted to the root importer — pnpm
-	# parity. react should be a top-level symlink even though the
-	# user didn't list it.
-	assert_link_exists node_modules/react
+	# The auto-installed peer is resolution-internal: pnpm 10 does NOT
+	# surface it as a top-level `node_modules/react` symlink (only
+	# packages declared in package.json get root links).
+	run test -e node_modules/react
+	assert_failure
 
 	# Some react version must exist under .aube (which version doesn't
 	# matter — depends on whatever latest satisfies ^16.8 || ^17 || ^18).
@@ -49,13 +50,14 @@ JSON
 	assert_success
 	assert_output --partial "react@"
 
-	# Lockfile's importers section lists react with the declared peer
-	# range as the specifier — that's what pnpm writes for hoisted
-	# auto-installed peers.
-	run bash -c 'grep -A2 "^      react:" aube-lock.yaml | head -3'
+	# The lockfile's importers section lists only what package.json
+	# declares. pnpm 10 never writes auto-installed peers as importer
+	# specifiers — a lockfile that does is rejected by
+	# `pnpm install --frozen-lockfile` (ERR_PNPM_OUTDATED_LOCKFILE).
+	run awk '/^importers:/,/^packages:/' aube-lock.yaml
 	assert_success
-	assert_output --partial "specifier:"
-	assert_output --partial "^16.8.0"
+	assert_output --partial "use-sync-external-store:"
+	refute_output --partial "react:"
 
 	# The use-sync-external-store directory name should include a
 	# `_react@...` peer suffix — that's the core parity change. The

@@ -490,9 +490,10 @@ pub(super) fn apply_lockfile_graph_platform_rules(
     // logged delta a pure measure of `apply_peer_contexts`'s
     // additions, not filter_graph's prunes.
     let mut hoist_elapsed: Option<std::time::Duration> = None;
+    let mut auto_installed_peers = aube_resolver::AutoInstalledPeers::new();
     if needs_peer_pass {
         let hoist_start = std::time::Instant::now();
-        graph = aube_resolver::hoist_auto_installed_peers(graph);
+        (graph, auto_installed_peers) = aube_resolver::hoist_auto_installed_peers(graph);
         hoist_elapsed = Some(hoist_start.elapsed());
     }
     aube_resolver::platform::filter_graph(
@@ -513,6 +514,11 @@ pub(super) fn apply_lockfile_graph_platform_rules(
         let apply_start = std::time::Instant::now();
         graph = aube_resolver::apply_peer_contexts(graph, &peer_options)
             .map_err(|e| miette!("peer-context pass failed: {e}"))?;
+        // The hoisted importer entries were scaffolding for the two
+        // passes above (peer-context scopes + filter_graph
+        // reachability); pnpm never surfaces auto-installed peers as
+        // importer deps, so drop them before linking/serialization.
+        aube_resolver::remove_auto_installed_peers(&mut graph, &auto_installed_peers);
         tracing::debug!(
             "peer-context pass (lockfile={:?}) {} → {} packages in {:.1?}",
             kind,
