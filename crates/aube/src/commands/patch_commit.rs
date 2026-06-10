@@ -140,8 +140,9 @@ fn build_patch(state: &PatchState) -> Result<String> {
             let dst_bytes = std::fs::read(&dst).unwrap_or_default();
             if src_bytes != dst_bytes {
                 eprintln!(
-                    "warning: {} differs but is binary — skipping (aube can't diff binary files)",
-                    rel.display()
+                    "warning: {} differs but is binary — skipping ({} can't diff binary files)",
+                    rel.display(),
+                    aube_util::ua::product_name()
                 );
             }
             continue;
