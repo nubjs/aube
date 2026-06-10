@@ -567,6 +567,13 @@ pub use aube_manifest::set_manifest_config_namespaces;
 /// before invoking any command.
 pub use engines::set_aube_engine_check;
 
+/// `packageManager`-field acceptance override for embedders: which
+/// names count as the running tool (strict-version checked against
+/// the registered version) and which as compatible drop-ins. Defaults
+/// to self `aube` at the compiled version, compatible `pnpm`. Call
+/// once per process before invoking any command.
+pub use startup::{PackageManagerNames, set_package_manager_names};
+
 /// CLI entry point shared by the `aube`, `aubr`, and `aubx` binaries.
 ///
 /// Parses `std::env::args_os()`, dispatches the subcommand, and exits the

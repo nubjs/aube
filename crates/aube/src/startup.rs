@@ -319,6 +319,67 @@ pub(crate) enum PackageManagerGuard {
     WarnRunOnly,
 }
 
+/// The `packageManager`-field identities the guardrails accept.
+///
+/// `self_names` are treated as "the running tool":
+/// `packageManagerStrictVersion` compares the pinned version against
+/// `self_version`. `compatible_names` are accepted drop-in targets the
+/// tool cannot version-match (aube can't download or re-exec a pinned
+/// pnpm). Everything else is foreign and warns or errors per
+/// `packageManagerStrict`.
+///
+/// `Default` is aube's stock policy — self `aube` at the compiled
+/// version, compatible `pnpm`. An embedder presenting a different
+/// brand surface registers its own identity via
+/// [`set_package_manager_names`].
+#[derive(Debug, Clone)]
+pub struct PackageManagerNames {
+    /// Names treated as the running tool itself.
+    pub self_names: Vec<String>,
+    /// The version `self_names` pins are compared against under
+    /// `packageManagerStrictVersion`.
+    pub self_version: String,
+    /// Names accepted as compatible drop-in targets.
+    pub compatible_names: Vec<String>,
+}
+
+impl Default for PackageManagerNames {
+    fn default() -> Self {
+        Self {
+            self_names: vec!["aube".to_string()],
+            self_version: env!("CARGO_PKG_VERSION").to_string(),
+            compatible_names: vec!["pnpm".to_string()],
+        }
+    }
+}
+
+impl PackageManagerNames {
+    /// All accepted names (self + compatible), backtick-quoted and
+    /// joined with `sep`, for guard messages.
+    fn accepted_list(&self, sep: &str) -> String {
+        self.self_names
+            .iter()
+            .chain(self.compatible_names.iter())
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+}
+
+static PACKAGE_MANAGER_NAMES: std::sync::OnceLock<PackageManagerNames> = std::sync::OnceLock::new();
+
+/// Override which `packageManager` names the guardrails accept — see
+/// [`PackageManagerNames`]. Idempotent: second calls are silently
+/// ignored, matching the other process-global `set_*` helpers. Call
+/// once per process before invoking any command.
+pub fn set_package_manager_names(names: PackageManagerNames) {
+    let _ = PACKAGE_MANAGER_NAMES.set(names);
+}
+
+fn package_manager_names() -> &'static PackageManagerNames {
+    PACKAGE_MANAGER_NAMES.get_or_init(PackageManagerNames::default)
+}
+
 pub(crate) fn enforce_package_manager_guardrails(
     settings: &StartupSettings,
     command: Option<&Commands>,
@@ -351,44 +412,69 @@ pub(crate) fn enforce_package_manager_guardrails(
         ));
     };
 
+    apply_package_manager_policy(
+        package_manager_names(),
+        settings,
+        command,
+        &path,
+        name,
+        version,
+    )
+}
+
+/// The post-parse half of [`enforce_package_manager_guardrails`],
+/// split out so the name-acceptance policy is testable against a
+/// non-global [`PackageManagerNames`] value.
+fn apply_package_manager_policy(
+    names: &PackageManagerNames,
+    settings: &StartupSettings,
+    command: Option<&Commands>,
+    path: &std::path::Path,
+    name: &str,
+    version: &str,
+) -> miette::Result<PackageManagerGuard> {
     let normalized = version.strip_suffix("-DEBUG").unwrap_or(version);
-    match name {
-        "aube" => {
-            if settings.package_manager_strict_version && normalized != env!("CARGO_PKG_VERSION") {
-                return Err(miette!(
-                    "packageManager requires aube@{version}, but this is aube@{}",
-                    env!("CARGO_PKG_VERSION")
-                ));
-            }
-            Ok(PackageManagerGuard::Ok)
+    if names.self_names.iter().any(|n| n == name) {
+        if settings.package_manager_strict_version && normalized != names.self_version {
+            return Err(miette!(
+                "packageManager requires {name}@{version}, but this is {name}@{}",
+                names.self_version
+            ));
         }
-        "pnpm" => {
-            if settings.package_manager_strict_version {
-                return Err(miette!(
-                    "packageManager requires exact pnpm@{version}, but aube cannot download or re-exec a specific pnpm version. Use pnpm directly, set packageManagerStrictVersion=false, or pin packageManager to aube@{}.",
-                    env!("CARGO_PKG_VERSION")
-                ));
-            }
-            Ok(PackageManagerGuard::Ok)
+        return Ok(PackageManagerGuard::Ok);
+    }
+    if names.compatible_names.iter().any(|n| n == name) {
+        if settings.package_manager_strict_version {
+            return Err(miette!(
+                "packageManager requires exact {name}@{version}, but aube cannot download or re-exec a specific {name} version. Use {name} directly, set packageManagerStrictVersion=false, or pin packageManager to {}@{}.",
+                names
+                    .self_names
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("aube"),
+                names.self_version
+            ));
         }
-        other => {
-            let mode = match settings.package_manager_strict {
-                PackageManagerStrictMode::Error => package_manager_guard_mode(command),
-                _ => PackageManagerGuardMode::WarnAndSkipAutoInstall,
-            };
-            match mode {
-                PackageManagerGuardMode::Error => Err(miette!(
-                    "packageManager in {} uses unsupported package manager `{other}`. aube's packageManagerStrict=error guard only accepts `aube` and `pnpm`; remove or change the `packageManager` field, or set `package-manager-strict=warn` (the default) or `=off` in .npmrc to soften this guard.",
-                    path.display()
-                )),
-                PackageManagerGuardMode::WarnAndSkipAutoInstall => {
-                    eprintln!(
-                        "warning: packageManager in {} uses unsupported package manager `{other}`; continuing but auto-install is disabled. Switch packageManager to `aube`/`pnpm`, set packageManagerStrict=off, or pass `--no-install` to skip the install probe explicitly.",
-                        path.display()
-                    );
-                    Ok(PackageManagerGuard::WarnRunOnly)
-                }
-            }
+        return Ok(PackageManagerGuard::Ok);
+    }
+
+    let mode = match settings.package_manager_strict {
+        PackageManagerStrictMode::Error => package_manager_guard_mode(command),
+        _ => PackageManagerGuardMode::WarnAndSkipAutoInstall,
+    };
+    match mode {
+        PackageManagerGuardMode::Error => Err(miette!(
+            "packageManager in {} uses unsupported package manager `{name}`. aube's packageManagerStrict=error guard only accepts {}; remove or change the `packageManager` field, or set `package-manager-strict=warn` (the default) or `=off` in .npmrc to soften this guard.",
+            path.display(),
+            names.accepted_list(" and ")
+        )),
+        PackageManagerGuardMode::WarnAndSkipAutoInstall => {
+            eprintln!(
+                "warning: packageManager in {} uses unsupported package manager `{name}`; continuing but auto-install is disabled. Switch packageManager to {}, set packageManagerStrict=off, or pass `--no-install` to skip the install probe explicitly.",
+                path.display(),
+                names.accepted_list("/")
+            );
+            Ok(PackageManagerGuard::WarnRunOnly)
         }
     }
 }
@@ -448,5 +534,63 @@ pub(crate) fn compute_effective_filter(cli: &Cli) -> aube_workspace::selector::E
         filter_prods: cli.filter_prod.clone(),
         fail_if_no_match: cli.fail_if_no_match,
         include_workspace_root: cli.include_workspace_root || cli.workspace_root,
+    }
+}
+
+#[cfg(test)]
+mod package_manager_names_tests {
+    use super::*;
+
+    fn settings(strict: PackageManagerStrictMode, strict_version: bool) -> StartupSettings {
+        StartupSettings {
+            loglevel: None,
+            package_manager_strict: strict,
+            package_manager_strict_version: strict_version,
+        }
+    }
+
+    fn embedder_names() -> PackageManagerNames {
+        PackageManagerNames {
+            self_names: vec!["mytool".to_string()],
+            self_version: "2.1.0".to_string(),
+            compatible_names: vec!["pnpm".to_string()],
+        }
+    }
+
+    #[test]
+    fn registered_self_name_version_matches_self_version_not_aubes() {
+        let names = embedder_names();
+        let path = std::path::Path::new("package.json");
+        let strict = settings(PackageManagerStrictMode::Error, true);
+        let ok = apply_package_manager_policy(&names, &strict, None, path, "mytool", "2.1.0");
+        assert!(matches!(ok, Ok(PackageManagerGuard::Ok)), "got {ok:?}");
+        let err = apply_package_manager_policy(&names, &strict, None, path, "mytool", "9.9.9")
+            .expect_err("strict-version mismatch must error");
+        assert!(
+            err.to_string().contains("this is mytool@2.1.0"),
+            "mismatch must compare against the registered self version, got: {err}"
+        );
+    }
+
+    #[test]
+    fn name_outside_the_acceptance_set_is_foreign_and_lists_configured_names() {
+        // With a custom acceptance set, the stock `aube` name is no
+        // longer special — it goes down the foreign-PM arm, and the
+        // guard message advertises the configured names.
+        let names = embedder_names();
+        let path = std::path::Path::new("package.json");
+        let err = apply_package_manager_policy(
+            &names,
+            &settings(PackageManagerStrictMode::Error, false),
+            None,
+            path,
+            "aube",
+            "1.0.0",
+        )
+        .expect_err("foreign name must error under packageManagerStrict=error");
+        assert!(
+            err.to_string().contains("only accepts `mytool` and `pnpm`"),
+            "guard message must list the configured acceptance set, got: {err}"
+        );
     }
 }
