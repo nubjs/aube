@@ -356,12 +356,18 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // every downstream write site (the `--lockfile-only` short-circuit
     // below *and* the re-resolve branch further down) can preserve it
     // instead of quietly converting the project to another filename.
-    // Must happen before the `--lockfile-only` block so that path
-    // doesn't bypass the format-preserving write logic. Skipped when
-    // `lockfile=false` — no lockfile is read and no format is
-    // preserved, so the install always writes nothing (see below).
+    // Declaration-aware: when no lockfile exists yet but package.json
+    // declares a package manager, the declared tool's format is the
+    // write target (pin-over-inference), and a declaration that
+    // contradicts the on-disk lockfiles — or several tools' lockfiles
+    // with no declaration — fails the install here with a structured
+    // error before anything is resolved or written. Must happen before
+    // the `--lockfile-only` block so that path doesn't bypass the
+    // format-preserving write logic. Skipped when `lockfile=false` —
+    // no lockfile is read and no format is preserved, so the install
+    // always writes nothing (see below).
     let source_kind_before = if lockfile_enabled {
-        aube_lockfile::detect_existing_lockfile_kind(&lockfile_dir)
+        crate::commands::resolve_lockfile_kind_for_write(&lockfile_dir)?
     } else {
         None
     };

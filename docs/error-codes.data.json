@@ -31,6 +31,18 @@
       "exit_code": 16
     },
     {
+      "name": "ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH",
+      "category": "Lockfile",
+      "description": "`package.json` declares a package manager (`packageManager` or `devEngines.packageManager`) but the only lockfile(s) on disk belong to other tools. Regenerate the declared tool's lockfile, convert with `aube import`, or fix the declaration.",
+      "exit_code": 17
+    },
+    {
+      "name": "ERR_AUBE_LOCKFILE_AMBIGUOUS",
+      "category": "Lockfile",
+      "description": "Lockfiles from two or more package managers coexist and `package.json` doesn't declare which tool owns the project. Remove the stale lockfile(s) or add a `packageManager` declaration.",
+      "exit_code": 18
+    },
+    {
       "name": "ERR_AUBE_NO_MATCHING_VERSION",
       "category": "Resolver",
       "description": "No published version of the named package satisfies the requested range.",

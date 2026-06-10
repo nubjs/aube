@@ -1,5 +1,6 @@
 pub mod bun;
 pub mod dep_path_filename;
+mod detect;
 mod drift;
 pub mod graph_hash;
 mod io;
@@ -10,6 +11,10 @@ pub mod pnpm;
 mod source;
 pub mod yarn;
 
+pub use detect::{
+    DeclarationSource, DeclaredPackageManager, ResolvedLockfileKind, declared_package_manager,
+    resolve_project_lockfile_kind,
+};
 pub use drift::DriftStatus;
 pub use io::{
     Error, LockfileKind, active_lockfile_has_conflict_markers, aube_lock_filename,

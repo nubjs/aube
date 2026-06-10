@@ -607,7 +607,7 @@ pub async fn run(
         };
     let workspace_catalogs = super::load_workspace_catalogs(&cwd)?;
     let workspace_package_versions = workspace_package_versions(&cwd)?;
-    let mut resolver = super::build_resolver(&cwd, &manifest, workspace_catalogs);
+    let mut resolver = super::build_resolver(&cwd, &manifest, workspace_catalogs)?;
     if let Some(host) = read_package_host {
         resolver = resolver
             .with_read_package_hook(Box::new(host) as Box<dyn aube_resolver::ReadPackageHook>);
@@ -1336,9 +1336,13 @@ fn merge_filtered_update_lockfile(
     let importer_path = super::workspace_importer_path(workspace_root, pkg_dir)?;
     let remove_pkg_lockfile = importer_path != ".";
     // The nested per-package update wrote its transient lockfile in
-    // the fresh-project fallback format (`defaultLockfileFormat`;
+    // the same resolved format its own write path used — the
+    // `package.json`-declared package manager's on a fresh package
+    // dir, else the fresh-project fallback (`defaultLockfileFormat`;
     // aube-lock.yaml unless overridden).
-    let pkg_lockfile = pkg_dir.join(super::default_lockfile_kind_for_cwd(pkg_dir).filename());
+    let pkg_kind = super::resolve_lockfile_kind_for_write(pkg_dir)?
+        .unwrap_or_else(|| super::default_lockfile_kind_for_cwd(pkg_dir));
+    let pkg_lockfile = pkg_dir.join(pkg_kind.filename());
     if !pkg_lockfile.exists() {
         return Ok(());
     }
