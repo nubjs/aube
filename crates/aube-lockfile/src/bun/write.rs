@@ -40,6 +40,16 @@ pub fn write(
             continue;
         }
         canonical.entry(pkg.spec_key()).or_insert(pkg);
+        // Git- and url-sourced packages are referenced by their hashed
+        // FS-safe dep_path (`ms@git+<hash>`) in importer DirectDeps and
+        // parent dependency maps, which never matches the
+        // `name@version` spec key. Alias them under the dep_path-
+        // derived canonical key too, or the hoist tree drops them and
+        // the entry vanishes from `packages` (bun then fails frozen
+        // installs with "Failed to resolve root prod dependency").
+        canonical
+            .entry(crate::npm::canonical_key_from_dep_path(&pkg.dep_path))
+            .or_insert(pkg);
     }
 
     // Build the hoist tree from every importer's direct deps (not just
@@ -348,14 +358,96 @@ pub fn write(
         // collapsed to the alias name and produced a gratuitous diff
         // against bun's own output.
         let ident_name = pkg.alias_of.as_deref().unwrap_or(&pkg.name);
-        let ident = format!("{}@{}", ident_name, pkg.version);
-        let integrity = pkg.integrity.clone().unwrap_or_default();
-        let entry = Value::Array(vec![
-            Value::String(ident),
-            Value::String(String::new()),
-            Value::Object(meta),
-            Value::String(integrity),
-        ]);
+        let entry = if let Some(LocalSource::Git(git)) = pkg.local_source.as_ref() {
+            // bun's git tuple: `[ident, {meta}, "<owner>-<repo>-<commit>",
+            // integrity]` — no registry-URL slot, and the repo-tag string
+            // (bun's cache key) is required: bun 1.3.14 rejects a frozen
+            // install without it. The ident keeps the git specifier form
+            // (`ms@github:vercel/ms#<commit>`); a bun-authored lockfile
+            // round-trips its raw ident tail via `pkg.version`, while a
+            // fresh resolve carries the real semver there and the ident
+            // is rebuilt from the git source.
+            let version_is_git_ident = pkg.version.starts_with("github:")
+                || pkg.version.starts_with("git+")
+                || pkg.version.starts_with("git://")
+                || pkg.version.starts_with("git@");
+            // bun pins git idents to the SHORT (7-char) commit sha and
+            // silently skips the package on install when the ident
+            // carries the full 40-char form (bun 1.3.14 exits 0 but
+            // materializes nothing) — truncate exactly like bun does.
+            // Non-sha committishes (tags, branches) pass through.
+            let commit = if git.resolved.is_empty() {
+                git.committish.clone().unwrap_or_default()
+            } else {
+                git.resolved.clone()
+            };
+            let commit = if commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()) {
+                commit[..7].to_string()
+            } else {
+                commit
+            };
+            let ident_tail = if version_is_git_ident {
+                pkg.version.clone()
+            } else if let Some(hosted) = crate::parse_hosted_git(&git.url) {
+                let shorthand = match hosted.host {
+                    crate::HostedGitHost::GitHub => "github",
+                    crate::HostedGitHost::GitLab => "gitlab",
+                    crate::HostedGitHost::Bitbucket => "bitbucket",
+                };
+                format!("{shorthand}:{}/{}#{commit}", hosted.owner, hosted.repo)
+            } else if git.url.starts_with("git://") || git.url.starts_with("git+") {
+                format!("{}#{commit}", git.url)
+            } else {
+                format!("git+{}#{commit}", git.url)
+            };
+            // Tag commit: prefer the committish embedded in a round-
+            // tripped ident (bun pins short SHAs there) so the tag and
+            // ident stay in step; full SHAs are accepted too.
+            let tag_commit = ident_tail
+                .rsplit_once('#')
+                .map(|(_, c)| c.to_string())
+                .unwrap_or(commit);
+            let repo_tag = match crate::parse_hosted_git(&git.url) {
+                Some(hosted) => format!("{}-{}-{tag_commit}", hosted.owner, hosted.repo),
+                None => {
+                    let stem = git
+                        .url
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("repo")
+                        .trim_end_matches(".git");
+                    format!("{stem}-{tag_commit}")
+                }
+            };
+            let mut elems = vec![
+                Value::String(format!("{ident_name}@{ident_tail}")),
+                Value::Object(meta),
+                Value::String(repo_tag),
+            ];
+            // The integrity element is bun's hash of the artifact *it*
+            // fetches and is verified on cold installs (bun 1.3.14
+            // fails IntegrityCheckFailed on a mismatch), so only a
+            // value that round-tripped from a bun-authored lockfile may
+            // be re-emitted. Fresh resolves carry aube's own tarball
+            // SRI on `pkg.integrity`, which hashes a different artifact
+            // — omit the element instead (bun accepts the 3-tuple).
+            if version_is_git_ident
+                && let Some(integrity) = pkg.integrity.clone().filter(|s| !s.is_empty())
+            {
+                elems.push(Value::String(integrity));
+            }
+            Value::Array(elems)
+        } else {
+            let ident = format!("{}@{}", ident_name, pkg.version);
+            let integrity = pkg.integrity.clone().unwrap_or_default();
+            Value::Array(vec![
+                Value::String(ident),
+                Value::String(String::new()),
+                Value::Object(meta),
+                Value::String(integrity),
+            ])
+        };
         package_entries.push((bun_key, entry));
     }
 

@@ -1565,3 +1565,131 @@ fn test_roundtrip_workspace_peer_dependencies() {
         "workspace peerDependencies.react dropped on re-emit:\n{written}"
     );
 }
+
+// bun records a git dep as `[ident, {meta}, "<owner>-<repo>-<commit>",
+// integrity]` where the ident keeps the git specifier form
+// (`ms@github:vercel/ms#<commit>`) — verified against bun 1.3.14, whose
+// frozen install also requires the repo-tag element and fails
+// "Failed to resolve root prod dependency" when the entry is missing
+// entirely. The resolver keys git packages by their hashed dep_path
+// (`ms@git+<hash>`), which never matches the `name@version` canonical
+// key, so the writer used to drop them from `packages` wholesale.
+#[test]
+fn git_sourced_packages_are_emitted_with_bun_git_tuple_shape() {
+    let sha = "1c6264b795492e8fdecbc82cb8802fcfbfc08d26";
+    let sri = fake_sri('g');
+    let local = LocalSource::Git(crate::GitSource {
+        url: "https://github.com/vercel/ms.git".to_string(),
+        committish: Some("2.1.3".to_string()),
+        resolved: sha.to_string(),
+        integrity: None,
+        subpath: None,
+    });
+    let dep_path = local.dep_path("ms");
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        dep_path.clone(),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            integrity: Some(sri.clone()),
+            dep_path: dep_path.clone(),
+            local_source: Some(local),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "ms".to_string(),
+            dep_path,
+            dep_type: DepType::Production,
+            specifier: Some("github:vercel/ms#2.1.3".to_string()),
+        }],
+    );
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("test".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [("ms".to_string(), "github:vercel/ms#2.1.3".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+
+    let body = std::fs::read_to_string(out.path()).unwrap();
+    // bun pins idents to the SHORT 7-char sha; the full form makes
+    // bun 1.3.14 exit 0 without materializing the package.
+    let short = &sha[..7];
+    assert!(
+        body.contains(&format!(
+            "\"ms\": [\"ms@github:vercel/ms#{short}\", {{}}, \"vercel-ms-{short}\"]"
+        )),
+        "git dep must be emitted as bun's git tuple; got:\n{body}"
+    );
+    assert!(
+        !body.contains(&sri),
+        "a fresh resolve's own tarball SRI must not be written as bun's \
+         git integrity (bun verifies it against the artifact it fetches): {body}"
+    );
+
+    // The reader reconstructs the git source from the written entry.
+    let reparsed = parse(out.path()).unwrap();
+    let pkg = reparsed
+        .packages
+        .values()
+        .find(|p| p.name == "ms")
+        .expect("git package must survive a write/parse round-trip");
+    let Some(LocalSource::Git(git)) = &pkg.local_source else {
+        panic!("expected git local source, got {:?}", pkg.local_source);
+    };
+    assert_eq!(git.url, "https://github.com/vercel/ms.git");
+    assert_eq!(git.resolved, short);
+}
+
+// A bun-authored git entry (short-sha ident, bun's own pack integrity)
+// must round-trip verbatim — bun verifies that integrity against the
+// artifact it fetches, so re-keying the ident or dropping the hash
+// would break the next frozen install.
+#[test]
+fn bun_authored_git_entries_round_trip_with_their_integrity() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let sri = fake_sri('b');
+    let content = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {{
+    "": {{
+      "name": "git-rt",
+      "dependencies": {{ "ms": "github:vercel/ms#2.1.3" }},
+    }},
+  }},
+  "packages": {{
+    "ms": ["ms@github:vercel/ms#1c6264b", {{}}, "vercel-ms-1c6264b", "{sri}"],
+  }}
+}}"#
+    );
+    std::fs::write(tmp.path(), &content).unwrap();
+    let graph = parse(tmp.path()).unwrap();
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("git-rt".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [("ms".to_string(), "github:vercel/ms#2.1.3".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let body = std::fs::read_to_string(out.path()).unwrap();
+    assert!(
+        body.contains(&format!(
+            "\"ms\": [\"ms@github:vercel/ms#1c6264b\", {{}}, \"vercel-ms-1c6264b\", \"{sri}\"]"
+        )),
+        "bun-authored git entry must round-trip verbatim; got:\n{body}"
+    );
+}
