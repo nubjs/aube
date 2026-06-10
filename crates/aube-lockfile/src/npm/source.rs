@@ -39,7 +39,16 @@ pub(super) fn local_file_source_from_resolved(resolved: &str) -> Option<LocalSou
 pub(super) fn npm_resolved_field(pkg: &LockedPackage) -> Option<String> {
     pkg.tarball_url.clone().or_else(|| match &pkg.local_source {
         Some(LocalSource::Git(git)) => {
-            let url = if git.url.starts_with("git://") || git.url.starts_with("git+") {
+            // npm canonicalizes hosted git deps to the provider's
+            // sshurl form (`git+ssh://git@github.com/owner/repo.git`)
+            // no matter what protocol the spec used — `github:`
+            // shorthand and `git+https://` specs both land that way
+            // (verified against npm 11.13.0). Anything else churns
+            // the line on the next `npm install`. Non-hosted URLs
+            // keep their stored form behind the `git+` tag.
+            let url = if let Some(hosted) = crate::parse_hosted_git(&git.url) {
+                format!("git+{}", hosted.ssh_url())
+            } else if git.url.starts_with("git://") || git.url.starts_with("git+") {
                 git.url.clone()
             } else {
                 format!("git+{}", git.url)

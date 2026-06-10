@@ -385,6 +385,17 @@ impl HostedGit {
         format!("https://{host}/{}/{}.git", self.owner, self.repo)
     }
 
+    /// `ssh://git@github.com/<owner>/<repo>.git` — the provider's
+    /// sshurl identity, which npm records (behind a `git+` tag) as the
+    /// `resolved` of every hosted git dep regardless of the protocol
+    /// the spec used (hosted-git-info's default representation). The
+    /// npm lockfile writer derives its canonical `resolved` from this
+    /// so a follow-up `npm install` doesn't rewrite the line.
+    pub fn ssh_url(&self) -> String {
+        let host = self.host.host_domain();
+        format!("ssh://git@{host}/{}/{}.git", self.owner, self.repo)
+    }
+
     /// `https://codeload.github.com/<owner>/<repo>/tar.gz/<sha>` (or
     /// each host's equivalent) — a flat HTTPS tarball at the given
     /// commit. Returns `None` unless `committish` is a 40-char hex
