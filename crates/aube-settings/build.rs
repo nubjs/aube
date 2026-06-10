@@ -241,30 +241,34 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
             Some(_) => value_ty.clone(),
             None => format!("Option<{value_ty}>"),
         };
-        let (npmrc_call, ws_call, env_call, cli_call) = match kind {
+        let (npmrc_call, ws_call, env_call, cli_call, overlay_call) = match kind {
             Kind::Bool => (
                 "bool_from_npmrc",
                 "bool_from_workspace_yaml",
                 "bool_from_env",
                 "bool_from_cli",
+                "bool_from_overlay",
             ),
             Kind::String | Kind::Enum => (
                 "string_from_npmrc",
                 "string_from_workspace_yaml",
                 "string_from_env",
                 "string_from_cli",
+                "string_from_overlay",
             ),
             Kind::U64 => (
                 "u64_from_npmrc",
                 "u64_from_workspace_yaml",
                 "u64_from_env",
                 "u64_from_cli",
+                "u64_from_overlay",
             ),
             Kind::VecString => (
                 "string_list_from_npmrc",
                 "string_list_from_workspace_yaml",
                 "string_list_from_env",
                 "string_list_from_cli",
+                "string_list_from_overlay",
             ),
         };
 
@@ -293,18 +297,25 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
         // surfaces the parse failure as `None` so the caller's default
         // applies instead of a silently-overridden value.
         for (i, src) in order.iter().enumerate() {
-            let (call, arg) = match src.as_str() {
-                "cli" => (cli_call, "ctx.cli"),
-                "env" => (env_call, "ctx.env"),
-                "projectAubeConfig" => (npmrc_call, "ctx.project_aube_config"),
-                "projectNpmrc" => (npmrc_call, "ctx.project_npmrc"),
-                "userAubeConfig" => (npmrc_call, "ctx.user_aube_config"),
-                "userNpmrc" => (npmrc_call, "ctx.user_npmrc"),
-                "workspaceYaml" => (ws_call, "ctx.workspace_yaml"),
-                other => panic!("{name}: unknown source `{other}` in precedence"),
+            // The overlay is process-global state rather than a
+            // `ResolveCtx` field, so its helper takes only the setting
+            // name. Every other source reads a ctx slice.
+            let expr = if src == "overlay" {
+                format!("super::{overlay_call}({name:?})")
+            } else {
+                let (call, arg) = match src.as_str() {
+                    "cli" => (cli_call, "ctx.cli"),
+                    "env" => (env_call, "ctx.env"),
+                    "projectAubeConfig" => (npmrc_call, "ctx.project_aube_config"),
+                    "projectNpmrc" => (npmrc_call, "ctx.project_npmrc"),
+                    "userAubeConfig" => (npmrc_call, "ctx.user_aube_config"),
+                    "userNpmrc" => (npmrc_call, "ctx.user_npmrc"),
+                    "workspaceYaml" => (ws_call, "ctx.workspace_yaml"),
+                    other => panic!("{name}: unknown source `{other}` in precedence"),
+                };
+                format!("super::{call}({name:?}, {arg})")
             };
             let is_last = i + 1 == order.len();
-            let expr = format!("super::{call}({name:?}, {arg})");
             let suffix = if kind == Kind::Enum && is_last {
                 format!(".and_then(|s| {value_ty}::from_str_normalized(&s))")
             } else {
@@ -547,10 +558,11 @@ fn pascal_case(name: &str) -> String {
 /// didn't mention in the default order so every source is still
 /// consulted.
 fn resolve_precedence(declared: &[String]) -> Vec<String> {
-    // CLI and env are always highest-precedence, in that order. The
-    // per-setting `precedence` override only reorders the file-based
-    // sources. Anyone who declares `cli` or `env` in their precedence
-    // list gets it silently dropped because it's already pinned on top.
+    // CLI, the embedder overlay, and env are always
+    // highest-precedence, in that order. The per-setting `precedence`
+    // override only reorders the file-based sources. Anyone who
+    // declares `cli`, `overlay`, or `env` in their precedence list
+    // gets it silently dropped because it's already pinned on top.
     //
     // The default file order encodes two principles: scope locality
     // (project > user) and aube authority within a scope (aubeConfig >
@@ -574,7 +586,7 @@ fn resolve_precedence(declared: &[String]) -> Vec<String> {
         // `settings.toml` overrides that predate the scope split can
         // keep using the short names.
         let expansion: &[&str] = match src.as_str() {
-            "cli" | "env" => continue,
+            "cli" | "overlay" | "env" => continue,
             "npmrc" => &["projectNpmrc", "userNpmrc"],
             "aubeConfig" => &["projectAubeConfig", "userAubeConfig"],
             other => &[other],
@@ -591,7 +603,7 @@ fn resolve_precedence(declared: &[String]) -> Vec<String> {
             files.push(src.to_string());
         }
     }
-    let mut out = vec!["cli".to_string(), "env".to_string()];
+    let mut out = vec!["cli".to_string(), "overlay".to_string(), "env".to_string()];
     out.extend(files);
     out
 }

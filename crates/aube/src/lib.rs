@@ -516,6 +516,13 @@ enum Commands {
     External(Vec<String>),
 }
 
+/// Programmatic settings overlay for embedders, re-exported from
+/// `aube-settings` so library callers can pin settings (ranked below
+/// CLI flags, above environment variables) without depending on the
+/// settings crate directly. Call once per process before invoking any
+/// command.
+pub use aube_settings::set_embedder_overlay;
+
 /// CLI entry point shared by the `aube`, `aubr`, and `aubx` binaries.
 ///
 /// Parses `std::env::args_os()`, dispatches the subcommand, and exits the

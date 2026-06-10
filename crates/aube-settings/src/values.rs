@@ -47,6 +47,50 @@ fn global_cli_overrides() -> &'static [(String, String)] {
     GLOBAL_CLI_OVERRIDES.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// Process-wide programmatic settings overlay registered by an
+/// embedding caller. Consulted by the generated accessors as its own
+/// source, ranked just below CLI flags and just above environment
+/// variables (see the precedence chain on [`resolved`]).
+static EMBEDDER_OVERLAY: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Register programmatic setting overrides once per process, before
+/// any settings resolution happens.
+///
+/// This is the seam for tools that embed aube's command layer as a
+/// library: it lets them pin the settings they care about without
+/// synthesizing CLI flags or mutating the process environment. Keys
+/// are canonical setting names exactly as spelled in `settings.toml`
+/// (`nodeLinker`, `storeDir`, …) — alias spellings (kebab-case,
+/// env-style) are not matched. Values use the same raw string forms
+/// `.npmrc` accepts (`"true"`/`"false"` for bools, comma-separated
+/// lists, …); a value that fails its setting's parser is skipped, the
+/// same way an unparseable `.npmrc` entry is.
+///
+/// The overlay ranks just below CLI and just above env: explicit user
+/// flags keep winning, while the embedder wins over ambient
+/// environment and every file source.
+///
+/// Idempotent — second calls are silently ignored, matching the other
+/// `set_global_*` helpers. The constraint is load-bearing: resolution
+/// may already have read the first value, so late mutation would
+/// produce split-brain results.
+pub fn set_embedder_overlay(overlay: Vec<(String, String)>) {
+    debug_assert!(
+        overlay.iter().all(|(k, _)| meta::find(k).is_some()),
+        "embedder overlay contains a key that is not a canonical setting name: {:?}",
+        overlay
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| meta::find(k).is_none())
+            .collect::<Vec<_>>()
+    );
+    let _ = EMBEDDER_OVERLAY.set(overlay);
+}
+
+fn embedder_overlay() -> &'static [(String, String)] {
+    EMBEDDER_OVERLAY.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
 /// Bundle of source inputs consumed by the per-setting typed
 /// accessors in [`resolved`]. Each field is a borrowed view so
 /// callers can reuse the same owned values across many lookups
@@ -154,7 +198,8 @@ pub fn process_env() -> &'static [(String, String)] {
 /// Default precedence, high-to-low:
 ///
 /// ```text
-/// cli > env
+/// cli > overlay (process-wide, set_embedder_overlay)
+///     > env
 ///     > project_aube_config (<cwd>/.config/aube/config.toml)
 ///     > project_npmrc       (<cwd>/.npmrc + npmrcAuthFile)
 ///     > workspace_yaml      (pnpm-workspace.yaml / aube-workspace.yaml)
@@ -173,8 +218,9 @@ pub fn process_env() -> &'static [(String, String)] {
 ///   tools (npm, pnpm, yarn) also read.
 ///
 /// The per-setting `precedence` override in `settings.toml` reorders
-/// the file-based sources but cannot demote `cli` or `env` off the
-/// top — CLI flags and environment variables always win. Bare names
+/// the file-based sources but cannot demote `cli`, `overlay`, or `env`
+/// off the top — CLI flags, the embedder overlay, and environment
+/// variables always win, in that order. Bare names
 /// `npmrc` and `aubeConfig` in a `precedence` list expand to their
 /// project+user pair (project first); use the scope-qualified names
 /// `projectNpmrc`/`userNpmrc`/`projectAubeConfig`/`userAubeConfig` for
@@ -425,6 +471,58 @@ fn raw_from_env<'a>(meta: &meta::SettingMeta, env: &'a [(String, String)]) -> Op
         }
     }
     None
+}
+
+/// Raw overlay value for `meta`, if the embedder registered one.
+/// Matches the canonical setting name only; iterates from the end so
+/// a later duplicate key wins, mirroring the other list-shaped
+/// sources.
+fn raw_from_overlay(meta: &meta::SettingMeta) -> Option<&'static str> {
+    for (key, raw) in embedder_overlay().iter().rev() {
+        if key == meta.name {
+            return Some(raw);
+        }
+    }
+    None
+}
+
+/// Resolve a `bool` setting from the process-wide embedder overlay.
+/// Returns `None` on unknown setting, wrong type, unparseable value,
+/// or when no overlay was registered.
+pub(crate) fn bool_from_overlay(setting: &str) -> Option<bool> {
+    let meta = meta::find(setting)?;
+    if meta.type_ != "bool" {
+        return None;
+    }
+    raw_from_overlay(meta).and_then(parse_bool)
+}
+
+/// Resolve a `string` setting from the process-wide embedder overlay.
+pub fn string_from_overlay(setting: &str) -> Option<String> {
+    let meta = meta::find(setting)?;
+    if !is_stringish(meta.type_) {
+        return None;
+    }
+    raw_from_overlay(meta).map(ToOwned::to_owned)
+}
+
+/// Resolve an `int` setting from the process-wide embedder overlay.
+pub(crate) fn u64_from_overlay(setting: &str) -> Option<u64> {
+    let meta = meta::find(setting)?;
+    if meta.type_ != "int" {
+        return None;
+    }
+    raw_from_overlay(meta).and_then(|raw| raw.trim().parse::<u64>().ok())
+}
+
+/// Resolve a `list<string>` setting from the process-wide embedder
+/// overlay. Accepts the same stringified forms as `.npmrc`.
+pub(crate) fn string_list_from_overlay(setting: &str) -> Option<Vec<String>> {
+    let meta = meta::find(setting)?;
+    if meta.type_ != "list<string>" {
+        return None;
+    }
+    raw_from_overlay(meta).map(parse_string_list)
 }
 
 /// Resolve a `bool` setting from a captured environment snapshot,
