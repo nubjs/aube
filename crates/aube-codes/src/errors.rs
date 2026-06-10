@@ -16,6 +16,8 @@ pub const ERR_AUBE_NO_LOCKFILE: &str = "ERR_AUBE_NO_LOCKFILE";
 pub const ERR_AUBE_LOCKFILE_PARSE: &str = "ERR_AUBE_LOCKFILE_PARSE";
 pub const ERR_AUBE_LOCKFILE_UNSUPPORTED_FORMAT: &str = "ERR_AUBE_LOCKFILE_UNSUPPORTED_FORMAT";
 pub const ERR_AUBE_OUTDATED_LOCKFILE: &str = "ERR_AUBE_OUTDATED_LOCKFILE";
+#[rustfmt::skip] pub const ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH: &str = "ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH";
+pub const ERR_AUBE_LOCKFILE_AMBIGUOUS: &str = "ERR_AUBE_LOCKFILE_AMBIGUOUS";
 
 // ── resolver ─────────────────────────────────────────────────────────
 pub const ERR_AUBE_NO_MATCHING_VERSION: &str = "ERR_AUBE_NO_MATCHING_VERSION";
@@ -140,6 +142,18 @@ pub const ALL: &[CodeMeta] = &[
         category: category::LOCKFILE,
         description: "A `--frozen-lockfile` install found the lockfile out of date with `package.json` / `pnpm-workspace.yaml` (same condition as pnpm's `ERR_PNPM_OUTDATED_LOCKFILE`).",
         exit_code: Some(13),
+    },
+    CodeMeta {
+        name: ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH,
+        category: category::LOCKFILE,
+        description: "`package.json` declares a package manager (`packageManager` or `devEngines.packageManager`) but the only lockfile(s) on disk belong to other tools. Regenerate the declared tool's lockfile, convert with `aube import`, or fix the declaration.",
+        exit_code: Some(14),
+    },
+    CodeMeta {
+        name: ERR_AUBE_LOCKFILE_AMBIGUOUS,
+        category: category::LOCKFILE,
+        description: "Lockfiles from two or more package managers coexist and `package.json` doesn't declare which tool owns the project. Remove the stale lockfile(s) or add a `packageManager` declaration.",
+        exit_code: Some(15),
     },
     // Resolver
     CodeMeta {

@@ -333,7 +333,7 @@ pub async fn run(
     // When no lockfile exists yet the resolver falls back to aube's
     // own format, so we target that path and the restore step deletes
     // it (since `lockfile_bytes` is `None`).
-    let lockfile_path = no_save::lockfile_path_for_project(&cwd);
+    let lockfile_path = no_save::lockfile_path_for_project(&cwd)?;
     let no_save_snapshot = if no_save {
         Some(no_save::snapshot_manifest_and_lockfile(
             &manifest_path,

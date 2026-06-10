@@ -74,8 +74,13 @@ pub fn build_canonical_map(graph: &LockfileGraph) -> BTreeMap<String, &LockedPac
     canonical
 }
 
-/// Write a lockfile using the existing project lockfile kind, or
-/// `aube-lock.yaml` when the project does not have one yet.
+/// Write a lockfile using the project's resolved lockfile kind —
+/// the existing lockfile's format, the format of the package manager
+/// `package.json` declares when no lockfile exists yet, or
+/// `aube-lock.yaml` when neither pins one. Errors when the
+/// declaration contradicts the on-disk lockfiles or several tools'
+/// lockfiles coexist undeclared (see
+/// [`crate::resolve_project_lockfile_kind`]).
 ///
 /// This is the default write path for commands that mutate the active
 /// project graph (`install`, `add`, `remove`, `update`, `dedupe`, ...).
@@ -84,7 +89,9 @@ pub fn write_lockfile_preserving_existing(
     graph: &LockfileGraph,
     manifest: &aube_manifest::PackageJson,
 ) -> Result<PathBuf, Error> {
-    let kind = detect_existing_lockfile_kind(project_dir).unwrap_or(LockfileKind::Aube);
+    let kind = crate::detect::resolve_project_lockfile_kind(project_dir)?
+        .kind()
+        .unwrap_or(LockfileKind::Aube);
     write_lockfile_as(project_dir, graph, manifest, kind)
 }
 
@@ -329,7 +336,10 @@ fn reject_bun_binary(project_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn lockfile_candidates(project_dir: &Path, include_aube: bool) -> Vec<(PathBuf, LockfileKind)> {
+pub(crate) fn lockfile_candidates(
+    project_dir: &Path,
+    include_aube: bool,
+) -> Vec<(PathBuf, LockfileKind)> {
     let mut out = Vec::new();
     if include_aube {
         // Prefer the branch-specific lockfile (if `gitBranchLockfile` is on
@@ -410,7 +420,7 @@ fn parse_one(
 /// yarn entry is always tagged `Yarn`. Callers that need the precise
 /// variant (install write-back, import conversions, drift logging)
 /// funnel through this helper after confirming the candidate exists.
-fn refine_yarn_kind(path: &Path, kind: LockfileKind) -> LockfileKind {
+pub(crate) fn refine_yarn_kind(path: &Path, kind: LockfileKind) -> LockfileKind {
     if kind == LockfileKind::Yarn && yarn::is_berry_path(path) {
         LockfileKind::YarnBerry
     } else {
@@ -426,6 +436,46 @@ pub enum Error {
     #[error("unsupported lockfile format: {0}")]
     #[diagnostic(code(ERR_AUBE_LOCKFILE_UNSUPPORTED_FORMAT))]
     UnsupportedFormat(String),
+    /// `package.json` declares a package manager but the only
+    /// lockfile(s) on disk belong to other tools. Emitted by
+    /// [`crate::resolve_project_lockfile_kind`]; the fields stay
+    /// machine-readable so embedders can render their own surface.
+    #[error(
+        "package.json declares `{declared}` (via `{field}`), but {expected} is missing — found {found} instead"
+    )]
+    #[diagnostic(
+        code(ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH),
+        help(
+            "generate {expected} with `{declared}` (or `aube import` to convert the existing lockfile), remove the stray lockfile(s), or change the declared package manager"
+        )
+    )]
+    DeclarationMismatch {
+        /// The declared tool name (`pnpm`, `npm`, `yarn`, `bun`).
+        declared: String,
+        /// Which `package.json` field declared it (`packageManager`
+        /// or `devEngines.packageManager`).
+        field: &'static str,
+        /// The declared tool's lockfile filename.
+        expected: &'static str,
+        /// Comma-joined filenames of the lockfiles actually on disk.
+        found: String,
+    },
+    /// Lockfiles from two or more package managers exist and
+    /// `package.json` doesn't say which tool owns the project.
+    /// Emitted by [`crate::resolve_project_lockfile_kind`].
+    #[error(
+        "multiple lockfiles found: {found} — cannot tell which package manager owns this project"
+    )]
+    #[diagnostic(
+        code(ERR_AUBE_LOCKFILE_AMBIGUOUS),
+        help(
+            "remove the stale lockfile(s), or declare the intended package manager in package.json (`packageManager` or `devEngines.packageManager`)"
+        )
+    )]
+    AmbiguousLockfiles {
+        /// Comma-joined filenames of the conflicting lockfiles.
+        found: String,
+    },
     #[error("failed to read lockfile {0}: {1}")]
     Io(std::path::PathBuf, std::io::Error),
     /// Structural/serialization lockfile errors that have no source

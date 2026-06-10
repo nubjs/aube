@@ -345,21 +345,22 @@ pub(crate) fn build_resolver(
     cwd: &std::path::Path,
     manifest: &aube_manifest::PackageJson,
     catalogs: CatalogMap,
-) -> aube_resolver::Resolver {
+) -> miette::Result<aube_resolver::Resolver> {
     let (ws_config, raw_workspace) = aube_manifest::workspace::load_both(cwd).unwrap_or_default();
     let files = FileSources::load(cwd);
     let env = aube_settings::values::process_env();
     let ctx = files.ctx(&raw_workspace, env, &[]);
     // `aube update` and friends always rewrite a lockfile, so pick a
-    // target kind. Detect the existing format to match install's
-    // cross-platform widening rules — a project on `pnpm-lock.yaml`
-    // keeps pnpm's host-only optional set, `aube-lock.yaml` gets the
-    // wide aube default.
-    let target_lockfile_kind = Some(
-        aube_lockfile::detect_existing_lockfile_kind(cwd)
-            .unwrap_or_else(|| default_lockfile_kind(&ctx)),
-    );
-    install::configure_resolver(
+    // target kind. Resolve the project's format (existing lockfile,
+    // or the `package.json`-declared package manager's format on a
+    // fresh project) to match install's cross-platform widening rules
+    // — a project on `pnpm-lock.yaml` keeps pnpm's host-only optional
+    // set, `aube-lock.yaml` gets the wide aube default. Errors when
+    // the declaration contradicts the on-disk lockfiles or several
+    // tools' lockfiles coexist undeclared.
+    let target_lockfile_kind =
+        Some(resolve_lockfile_kind_for_write(cwd)?.unwrap_or_else(|| default_lockfile_kind(&ctx)));
+    Ok(install::configure_resolver(
         aube_resolver::Resolver::new(std::sync::Arc::new(make_client(cwd))),
         cwd,
         manifest,
@@ -380,7 +381,23 @@ pub(crate) fn build_resolver(
             ignore_scripts: false,
         },
         None,
-    )
+    ))
+}
+
+/// Declaration-aware lockfile-kind resolution for `cwd`, collapsed to
+/// the `Option` shape the resolve/write sites consume: `Some(kind)`
+/// when a lockfile exists or `package.json` declares a package
+/// manager (pin-over-inference — the declaration outranks both file
+/// precedence and `defaultLockfileFormat`), `None` when the project
+/// is genuinely fresh and undeclared so the caller falls back to
+/// [`default_lockfile_kind`]. Propagates the structured
+/// declaration-mismatch / ambiguous-lockfiles errors.
+pub(crate) fn resolve_lockfile_kind_for_write(
+    cwd: &std::path::Path,
+) -> miette::Result<Option<aube_lockfile::LockfileKind>> {
+    aube_lockfile::resolve_project_lockfile_kind(cwd)
+        .map(aube_lockfile::ResolvedLockfileKind::kind)
+        .map_err(miette::Report::new)
 }
 
 /// Resolve [`aube_registry::config::FetchPolicy`] from the same

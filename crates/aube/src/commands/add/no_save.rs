@@ -19,17 +19,18 @@ pub(super) struct Snapshot {
 /// `write_lockfile_preserving_existing` produces, including non-aube
 /// lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`,
 /// `bun.lock`, `npm-shrinkwrap.json`). When no lockfile exists yet the
-/// resolver falls back to aube's own format.
-pub(super) fn lockfile_path_for_project(project_dir: &Path) -> PathBuf {
+/// resolver uses the `package.json`-declared package manager's format,
+/// falling back to aube's own.
+pub(super) fn lockfile_path_for_project(project_dir: &Path) -> miette::Result<PathBuf> {
     use aube_lockfile::LockfileKind;
-    let kind = aube_lockfile::detect_existing_lockfile_kind(project_dir)
+    let kind = crate::commands::resolve_lockfile_kind_for_write(project_dir)?
         .unwrap_or_else(|| crate::commands::default_lockfile_kind_for_cwd(project_dir));
     let filename = match kind {
         LockfileKind::Aube => aube_lockfile::aube_lock_filename(project_dir),
         LockfileKind::Pnpm => aube_lockfile::pnpm_lock_filename(project_dir),
         other => other.filename().to_string(),
     };
-    project_dir.join(filename)
+    Ok(project_dir.join(filename))
 }
 
 pub(super) fn snapshot_manifest_and_lockfile(

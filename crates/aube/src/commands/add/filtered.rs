@@ -42,7 +42,7 @@ pub(super) async fn run(
     supply_chain::run_cli_name_gates(&root, &args.packages, args.allow_low_downloads).await?;
 
     let mut snapshots = Vec::new();
-    let lockfile_path = no_save::lockfile_path_for_project(&root);
+    let lockfile_path = no_save::lockfile_path_for_project(&root)?;
     let root_lockfile_snapshot = if args.no_save {
         no_save::snapshot_lockfile(&lockfile_path)?
     } else {
