@@ -192,6 +192,86 @@ fn test_write_preserves_git_resolved_url() {
     assert!(matches!(pkg.local_source, Some(LocalSource::Git(_))));
 }
 
+// npm canonicalizes a hosted git dep's `resolved` to the provider's
+// sshurl form no matter what protocol the spec used — `github:owner/
+// repo#tag` and `git+https://github.com/owner/repo.git#tag` both land
+// as `git+ssh://git@github.com/owner/repo.git#<sha>` (verified against
+// npm 11.13.0). The resolver stores the https clone URL for the
+// `github:` shorthand, so the writer must re-derive the canonical form
+// or `npm install` rewrites the line on its first run.
+#[test]
+fn test_write_canonicalizes_hosted_git_resolved_to_sshurl() {
+    let sha = "1c6264b795492e8fdecbc82cb8802fcfbfc08d26";
+    let mut graph = LockfileGraph::default();
+    let local = LocalSource::Git(GitSource {
+        url: "https://github.com/vercel/ms.git".to_string(),
+        committish: Some("2.1.3".to_string()),
+        resolved: sha.to_string(),
+        integrity: None,
+        subpath: None,
+    });
+    let dep_path = local.dep_path("ms");
+    graph.packages.insert(
+        dep_path.clone(),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            dep_path: dep_path.clone(),
+            local_source: Some(local),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "ms".to_string(),
+            dep_path,
+            dep_type: DepType::Production,
+            specifier: Some("github:vercel/ms#2.1.3".to_string()),
+        }],
+    );
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("test".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [("ms".to_string(), "github:vercel/ms#2.1.3".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+
+    let body = std::fs::read_to_string(out.path()).unwrap();
+    assert!(
+        body.contains(&format!(
+            "\"resolved\": \"git+ssh://git@github.com/vercel/ms.git#{sha}\""
+        )),
+        "hosted git resolved URL must use npm's canonical sshurl form; got:\n{body}"
+    );
+
+    // A non-hosted git URL keeps its stored form — only the three
+    // hosted providers get the sshurl identity.
+    let self_hosted = LocalSource::Git(GitSource {
+        url: "https://git.example.com/owner/repo.git".to_string(),
+        committish: None,
+        resolved: sha.to_string(),
+        integrity: None,
+        subpath: None,
+    });
+    let pkg = LockedPackage {
+        name: "repo".to_string(),
+        version: "1.0.0".to_string(),
+        dep_path: self_hosted.dep_path("repo"),
+        local_source: Some(self_hosted),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::source::npm_resolved_field(&pkg).as_deref(),
+        Some(format!("git+https://git.example.com/owner/repo.git#{sha}").as_str())
+    );
+}
+
 #[test]
 fn test_write_skips_non_git_local_sources() {
     let local = LocalSource::Directory(PathBuf::from("vendor/local-dir"));
