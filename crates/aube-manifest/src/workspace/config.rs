@@ -27,14 +27,19 @@ static WORKSPACE_YAML_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 /// disk by some other tool doesn't change what the embedding product
 /// reads or writes.
 ///
+/// The empty list disables the workspace-yaml surface entirely: no
+/// file is probed or parsed (loads return defaults, settings resolve
+/// from their other sources), [`workspace_yaml_existing`] /
+/// [`workspace_yaml_target`] return `None`, and
+/// [`config_write_target`] always routes to `package.json`. For
+/// embedders whose config surface is `package.json` + `.npmrc` only —
+/// a stray workspace yaml on disk is then deliberately unread, and
+/// surfacing that fact to the user is the embedder's job.
+///
 /// Idempotent — second calls and calls after the first read are
 /// silently ignored, matching the other process-global `set_*`
-/// helpers (consumers may cache derived paths). Empty lists are
-/// ignored: at least one filename must remain probe-able.
+/// helpers (consumers may cache derived paths).
 pub fn set_workspace_yaml_names(names: &[&str]) {
-    if names.is_empty() {
-        return;
-    }
     let _ = WORKSPACE_YAML_NAMES.set(names.iter().map(|s| s.to_string()).collect());
 }
 
@@ -779,9 +784,13 @@ pub fn workspace_yaml_existing(project_dir: &Path) -> Option<PathBuf> {
 /// on disk. This raw helper is for the rare caller that genuinely
 /// needs a workspace yaml path even on a fresh project (e.g. the
 /// node-gyp bootstrap dummy file).
-pub fn workspace_yaml_target(project_dir: &Path) -> PathBuf {
+///
+/// `None` when the workspace-yaml surface is disabled (an embedder
+/// passed the empty list to [`set_workspace_yaml_names`]) — there is
+/// then no filename a fresh yaml could legitimately be created under.
+pub fn workspace_yaml_target(project_dir: &Path) -> Option<PathBuf> {
     workspace_yaml_existing(project_dir)
-        .unwrap_or_else(|| project_dir.join(&workspace_yaml_names()[0]))
+        .or_else(|| Some(project_dir.join(workspace_yaml_names().first()?)))
 }
 
 /// Where the next mutation of a workspace-level setting should land.

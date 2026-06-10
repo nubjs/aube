@@ -201,11 +201,12 @@ fn bootstrap_blocking(
     // (`workspace_packages` is empty so `has_workspace` is false).
     // `workspace_yaml_target` picks a filename the walk actually
     // probes for, which tracks `set_workspace_yaml_names` overrides.
-    aube_util::fs_atomic::atomic_write(
-        &aube_manifest::workspace::workspace_yaml_target(tool_dir),
-        b"",
-    )
-    .into_diagnostic()?;
+    // `None` means the embedder disabled the workspace-yaml surface —
+    // the walk then probes no yaml names, so there is no marker to
+    // write (and no yaml-based root discovery to deadlock on).
+    if let Some(marker) = aube_manifest::workspace::workspace_yaml_target(tool_dir) {
+        aube_util::fs_atomic::atomic_write(&marker, b"").into_diagnostic()?;
+    }
     // Forward the outer project's `.npmrc` so private registries and
     // auth tokens configured at project scope carry through to the
     // recursive install. The subprocess's cwd is `tool_dir`, so

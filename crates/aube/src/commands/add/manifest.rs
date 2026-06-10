@@ -545,7 +545,14 @@ pub(super) async fn update_manifest_for_add(
         let yaml_root = crate::dirs::find_workspace_yaml_root(cwd)
             .or_else(|| crate::dirs::find_workspace_root(cwd))
             .unwrap_or_else(|| cwd.to_path_buf());
-        let yaml_path = aube_manifest::workspace::workspace_yaml_target(&yaml_root);
+        let Some(yaml_path) = aube_manifest::workspace::workspace_yaml_target(&yaml_root) else {
+            // Embedder disabled the workspace-yaml surface: there is no
+            // file `--save-catalog` could write. Refuse loudly instead
+            // of inventing a home the configuration says not to read.
+            return Err(miette!(
+                "--save-catalog needs a workspace yaml, but the workspace-yaml surface is disabled in this configuration; declare the catalog under `workspaces.catalog` in package.json instead"
+            ));
+        };
         crate::commands::catalogs::upsert_catalog_entries(&yaml_path, &catalog_upserts)?;
     }
 

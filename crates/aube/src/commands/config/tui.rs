@@ -717,9 +717,11 @@ fn edit_target(meta: &settings_meta::SettingMeta) -> Option<EditTarget> {
         }
     }
 
-    workspace_key.map(|key| EditTarget::WorkspaceYaml {
-        path: aube_manifest::workspace::workspace_yaml_target(&cwd),
-        key,
+    workspace_key.and_then(|key| {
+        Some(EditTarget::WorkspaceYaml {
+            path: aube_manifest::workspace::workspace_yaml_target(&cwd)?,
+            key,
+        })
     })
 }
 

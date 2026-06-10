@@ -36,7 +36,7 @@ fn restricted_name_list_hides_excluded_yamls_and_redirects_fresh_writes() {
     );
     assert_eq!(
         workspace_yaml_target(dir.path()),
-        dir.path().join("pnpm-workspace.yaml"),
+        Some(dir.path().join("pnpm-workspace.yaml")),
         "fresh writes must land on the first configured filename"
     );
 
@@ -51,6 +51,6 @@ fn restricted_name_list_hides_excluded_yamls_and_redirects_fresh_writes() {
     assert_eq!(config.packages, vec!["pkgs/*".to_string()]);
     assert_eq!(
         workspace_yaml_target(dir2.path()),
-        dir2.path().join("pnpm-workspace.yaml")
+        Some(dir2.path().join("pnpm-workspace.yaml"))
     );
 }

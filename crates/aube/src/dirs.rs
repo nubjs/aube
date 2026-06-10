@@ -220,9 +220,18 @@ fn no_root_error(initial_cwd: &Path) -> miette::Report {
     // restrict it), so the error never names a file discovery would not
     // actually read. Stock list, discovery order: aube-workspace.yaml,
     // pnpm-workspace.yaml.
+    let yaml_names = aube_manifest::workspace::workspace_yaml_names();
+    if yaml_names.is_empty() {
+        // Embedder disabled the workspace-yaml surface; discovery only
+        // probed package.json, so only name what was actually read.
+        return miette!(
+            "no package.json found in {} or any parent directory",
+            initial_cwd.display()
+        );
+    }
     miette!(
         "no package.json or workspace yaml ({}) found in {} or any parent directory",
-        aube_manifest::workspace::workspace_yaml_names().join(" / "),
+        yaml_names.join(" / "),
         initial_cwd.display()
     )
 }
