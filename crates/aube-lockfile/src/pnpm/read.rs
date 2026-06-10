@@ -640,17 +640,83 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         );
     }
 
+    // Bridge from the lockfile-canonical spelling of each
+    // importer-declared local package (`<name>@<specifier>`, e.g.
+    // `pkg@file:vendor/pkg` — the exact string an npm-alias
+    // `version:` or a rewritten transitive alias value references)
+    // to the final hashed key the package is stored under. Needed
+    // by the alias synthesis below: aliases whose target is a
+    // `file:` package reference it by the canonical spelling, but
+    // `local_packages` is keyed by `LocalSource::dep_path` hashes.
+    let local_by_canonical: BTreeMap<String, String> = {
+        let mut m = BTreeMap::new();
+        for (final_key, pkg) in &local_packages {
+            if let Some(l) = &pkg.local_source {
+                m.insert(format!("{}@{}", pkg.name, l.specifier()), final_key.clone());
+            }
+        }
+        // The snapshot keys recorded at importer-parse time cover
+        // spellings that a later resolution-block refinement or
+        // importer rebase no longer reproduces from the final
+        // `local_source`.
+        for (dep_path, snapshot_key) in &local_snapshot_keys {
+            let final_key = local_rekeys.get(dep_path).unwrap_or(dep_path);
+            m.entry(snapshot_key.clone())
+                .or_insert_with(|| final_key.clone());
+        }
+        m
+    };
+
+    // Merge the synthesized local (`file:`/`link:`) packages in
+    // *before* alias synthesis so alias targets can resolve against
+    // them. No same-key collision is possible: the main loop above
+    // skips every key in `local_canonical_keys`.
+    for (k, v) in local_packages {
+        packages.insert(k, v);
+    }
+
     // Synthesize alias-keyed LockedPackages for npm-aliased importer
     // deps. pnpm v9 only writes the canonical (real-name-keyed) entry
     // in `packages:`; we clone it under the alias dep_path with
     // `name=alias` and `alias_of=Some(real)` so the linker — which
     // already supports this shape via the resolver-fresh path — can
     // create `node_modules/<alias>` symlinks correctly.
+    //
+    // Aliases targeting an importer-declared *local* (`file:`)
+    // package — pnpm writes `version: <real>@file:<path>` when a
+    // local dep is consumed under a different in-tree name, e.g.
+    // vite's playground/ssr-deps fixtures — get the same treatment,
+    // except the clone is keyed like every other local package
+    // (`LocalSource::dep_path(alias)`, the hashed form that is safe
+    // as a filesystem name) and every reference to the raw alias
+    // spelling is remapped afterwards.
+    let mut alias_local_renames: BTreeMap<String, String> = BTreeMap::new();
     for (alias_dep_path, real_dep_path, alias_name, real_name) in alias_remaps {
         // Skip if the alias entry already exists (aube-written
         // lockfile that emitted both `aliasOf:` and an alias-keyed
-        // packages entry).
-        if packages.contains_key(&alias_dep_path) {
+        // packages entry), or if an earlier remap for the same
+        // alias spelling already synthesized the local clone.
+        if packages.contains_key(&alias_dep_path)
+            || alias_local_renames.contains_key(&alias_dep_path)
+        {
+            continue;
+        }
+        let bare_real = real_dep_path
+            .split('(')
+            .next()
+            .unwrap_or(&real_dep_path)
+            .to_string();
+        if let Some(local_key) = local_by_canonical.get(&bare_real)
+            && let Some(real_pkg) = packages.get(local_key)
+            && let Some(local) = real_pkg.local_source.clone()
+        {
+            let final_alias_key = local.dep_path(&alias_name);
+            let mut aliased = real_pkg.clone();
+            aliased.name = alias_name;
+            aliased.dep_path = final_alias_key.clone();
+            aliased.alias_of = Some(real_name);
+            alias_local_renames.insert(alias_dep_path, final_alias_key.clone());
+            packages.insert(final_alias_key, aliased);
             continue;
         }
         let Some(real_pkg) = packages
@@ -671,8 +737,28 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         packages.insert(alias_dep_path, aliased);
     }
 
-    for (k, v) in local_packages {
-        packages.insert(k, v);
+    // Point every reference at the rekeyed local-alias entries: the
+    // importer DirectDeps and the snapshot dep values were written
+    // with the raw `<alias>@file:<path>` spelling before the hashed
+    // key existed.
+    if !alias_local_renames.is_empty() {
+        for deps in importers.values_mut() {
+            for dep in deps {
+                if let Some(new_key) = alias_local_renames.get(&dep.dep_path) {
+                    dep.dep_path.clone_from(new_key);
+                }
+            }
+        }
+        for pkg in packages.values_mut() {
+            for map in [&mut pkg.dependencies, &mut pkg.optional_dependencies] {
+                for (dep_name, value) in map.iter_mut() {
+                    let referenced = format!("{dep_name}@{value}");
+                    if let Some(new_key) = alias_local_renames.get(&referenced) {
+                        *value = dep_path_tail(new_key, dep_name).to_string();
+                    }
+                }
+            }
+        }
     }
 
     let settings = raw
