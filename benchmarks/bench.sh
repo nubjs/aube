@@ -47,7 +47,28 @@ set -euo pipefail
 #                  only the nub version; the runner knows the vendored
 #                  submodule rev and passes it through).
 #   BENCH_SCENARIOS — comma-separated scenario keys to run
-#                     (default: all)
+#                     (default: gvs-warm,gvs-cold,install-test).
+#                     Opt-in keys beyond the default set:
+#                       ci-loop       — S10: warm CI loop (install
+#                                       short-circuit + test dispatch),
+#                                       emitted as TWO rows: ci-loop-noci
+#                                       (CI unset) and ci-loop-ci
+#                                       (CI=true) — the env flip is the
+#                                       measurement. GVS is deliberately
+#                                       unpinned here so each tool's own
+#                                       CI heuristic shows up.
+#                       add-dep       — S11: warm everything, inject one
+#                                       pinned dep (left-pad@1.3.0) into
+#                                       package.json, time the non-frozen
+#                                       install. package.json edit, not
+#                                       each tool's `add` verb, so every
+#                                       tool does identical work.
+#                       branch-switch — S12: node_modules settled for
+#                                       lockfile A, swap in the committed
+#                                       fixture-b.package.json (~15
+#                                       version deltas) + its pre-built
+#                                       native lockfile B, time the
+#                                       incremental install.
 #   BENCH_PHASES — set to 0 to skip aube phase timing samples
 #
 #   BENCH_HERMETIC=1 — route all registry traffic through a local
@@ -382,6 +403,20 @@ done
 # Keep a pristine copy of package.json
 cp "$SCRIPT_DIR/fixture.package.json" "$BENCH_DIR/original-package.json"
 
+# Branch-B fixture for the branch-switch scenario: fixture.package.json
+# with ~15 direct deps pinned to older exact versions (all comfortably
+# past any minimum-release-age gate). Each tool's native lockfile B is
+# generated during populate (uplink-bracketed) and saved alongside the
+# A lockfile.
+FIXTURE_B_SRC="$SCRIPT_DIR/fixture-b.package.json"
+
+# The single pinned dep the add-dep scenario injects. Ancient, zero
+# transitive deps, unscoped (the prefetch below assumes an unscoped
+# tarball path) — the measurement is the resolve/packument/link path,
+# not this package's size.
+ADD_DEP_NAME="left-pad"
+ADD_DEP_VERSION="1.3.0"
+
 # ── Populate stores and caches ─────────────────────────────────────────────
 # One warm install per tool so the lockfile + cache + store are all
 # populated before the scenario matrix runs. Everything is hermetic
@@ -396,6 +431,66 @@ cp "$SCRIPT_DIR/fixture.package.json" "$BENCH_DIR/original-package.json"
 if [ "${BENCH_HERMETIC:-0}" = "1" ]; then
 	hermetic_use_warm_uplink
 fi
+
+# One warm (non-frozen) install for $tool in $dir. Factored out of the
+# populate loop so the branch-switch B-lockfile generation below can
+# reuse the exact same invocations. Runs in a subshell so the `cd`
+# doesn't leak.
+populate_install() {
+	local tool=$1 dir=$2 bin=$3 home=$4 store=$5 cache=$6
+	case "$tool" in
+	aube)
+		(cd "$dir" && HOME="$home" XDG_CACHE_HOME="$cache" XDG_DATA_HOME="$home/.local/share" "$bin" install)
+		;;
+	nub)
+		# Same isolation shape as aube: nub's engine cache lands at
+		# $XDG_CACHE_HOME/nub/pm and its CAS store at
+		# $XDG_DATA_HOME/nub/store. Scripts are off by default (the
+		# embedded engine's default), matching aube.
+		(cd "$dir" && HOME="$home" XDG_CACHE_HOME="$cache" XDG_DATA_HOME="$home/.local/share" "$bin" install)
+		;;
+	npm)
+		# `--legacy-peer-deps` is the only way npm tolerates the
+		# fixture's mixed peer-dep ranges (eslint 9 vs 8, etc.).
+		# pnpm/aube handle this via `autoInstallPeers=true` by
+		# default; using npm's strict mode here would just make
+		# the populate step fail before we even reach the
+		# scenarios. Yes, this is the classic "npm is stricter"
+		# caveat you read in every benchmark footnote.
+		(cd "$dir" && HOME="$home" npm_config_cache="$cache" "$bin" install \
+			--ignore-scripts --no-audit --no-fund --legacy-peer-deps)
+		;;
+	pnpm)
+		(cd "$dir" && HOME="$home" "$bin" install --ignore-scripts --no-frozen-lockfile)
+		;;
+	yarn)
+		# Yarn 4 (berry). enableScripts/cacheFolder/nodeLinker are
+		# already pinned in .yarnrc.yml, so we only need to ask for
+		# a fresh install here.
+		(cd "$dir" && HOME="$home" "$bin" install)
+		;;
+	bun)
+		# Bun takes `--cache-dir` as a CLI flag and `BUN_INSTALL` as
+		# the global install prefix. Point both at the hermetic temp
+		# to keep it from touching `~/.bun`.
+		(cd "$dir" && HOME="$home" BUN_INSTALL="$home/.bun" "$bin" install \
+			--cache-dir "$cache" --ignore-scripts --no-summary --force)
+		;;
+	deno)
+		# Deno 2 reads package.json and writes deno.lock + populates
+		# node_modules. DENO_DIR is the per-tool cache and global
+		# install location. Lifecycle scripts are skipped by default
+		# (Deno requires explicit --allow-scripts to opt in).
+		(cd "$dir" && HOME="$home" DENO_DIR="$cache" "$bin" install --quiet)
+		;;
+	vlt)
+		# vlt respects npm_config_cache for its package cache and
+		# reads .npmrc for the registry. Skips lifecycle scripts by
+		# default unless an allowlist is configured.
+		(cd "$dir" && HOME="$home" npm_config_cache="$cache" "$bin" install)
+		;;
+	esac
+}
 
 for i in "${!TOOLS[@]}"; do
 	tool="${TOOLS[$i]}"
@@ -419,65 +514,48 @@ for i in "${!TOOLS[@]}"; do
 		"$dir/deno.lock" \
 		"$dir/vlt-lock.json"
 
-	case "$tool" in
-	aube)
-		cd "$dir" && HOME="$home" XDG_CACHE_HOME="$cache" XDG_DATA_HOME="$home/.local/share" "$bin" install
-		;;
-	nub)
-		# Same isolation shape as aube: nub's engine cache lands at
-		# $XDG_CACHE_HOME/nub/pm and its CAS store at
-		# $XDG_DATA_HOME/nub/store. Scripts are off by default (the
-		# embedded engine's default), matching aube.
-		cd "$dir" && HOME="$home" XDG_CACHE_HOME="$cache" XDG_DATA_HOME="$home/.local/share" "$bin" install
-		;;
-	npm)
-		# `--legacy-peer-deps` is the only way npm tolerates the
-		# fixture's mixed peer-dep ranges (eslint 9 vs 8, etc.).
-		# pnpm/aube handle this via `autoInstallPeers=true` by
-		# default; using npm's strict mode here would just make
-		# the populate step fail before we even reach the
-		# scenarios. Yes, this is the classic "npm is stricter"
-		# caveat you read in every benchmark footnote.
-		cd "$dir" && HOME="$home" npm_config_cache="$cache" "$bin" install \
-			--ignore-scripts --no-audit --no-fund --legacy-peer-deps
-		;;
-	pnpm)
-		cd "$dir" && HOME="$home" "$bin" install --ignore-scripts --no-frozen-lockfile
-		;;
-	yarn)
-		# Yarn 4 (berry). enableScripts/cacheFolder/nodeLinker are
-		# already pinned in .yarnrc.yml, so we only need to ask for
-		# a fresh install here.
-		cd "$dir" && HOME="$home" "$bin" install
-		;;
-	bun)
-		# Bun takes `--cache-dir` as a CLI flag and `BUN_INSTALL` as
-		# the global install prefix. Point both at the hermetic temp
-		# to keep it from touching `~/.bun`.
-		cd "$dir" && HOME="$home" BUN_INSTALL="$home/.bun" "$bin" install \
-			--cache-dir "$cache" --ignore-scripts --no-summary --force
-		;;
-	deno)
-		# Deno 2 reads package.json and writes deno.lock + populates
-		# node_modules. DENO_DIR is the per-tool cache and global
-		# install location. Lifecycle scripts are skipped by default
-		# (Deno requires explicit --allow-scripts to opt in).
-		cd "$dir" && HOME="$home" DENO_DIR="$cache" "$bin" install --quiet
-		;;
-	vlt)
-		# vlt respects npm_config_cache for its package cache and
-		# reads .npmrc for the registry. Skips lifecycle scripts by
-		# default unless an allowlist is configured.
-		cd "$dir" && HOME="$home" npm_config_cache="$cache" "$bin" install
-		;;
-	esac
+	populate_install "$tool" "$dir" "$bin" "$home" "$store" "$cache"
 
 	if [ ! -f "$dir/$lockfile_name" ]; then
 		echo "error: $lockfile_name was not created for $tool in $dir" >&2
 		exit 1
 	fi
 	cp "$dir/$lockfile_name" "$BENCH_DIR/saved-lockfile-$tool"
+
+	# Branch-switch needs each tool's *native* lockfile for the B
+	# fixture too. Generate it while the uplink bracket is still open:
+	# start from the settled A state (lockfile + node_modules present)
+	# so the B lockfile is the minimal-diff shape a real branch switch
+	# would produce, then restore the A package.json + lockfile.
+	case ",$BENCH_SCENARIOS," in
+	*,branch-switch,*)
+		echo "Populating branch-B lockfile for $tool..."
+		cp "$FIXTURE_B_SRC" "$dir/package.json"
+		populate_install "$tool" "$dir" "$bin" "$home" "$store" "$cache"
+		if [ ! -f "$dir/$lockfile_name" ]; then
+			echo "error: branch-B $lockfile_name was not created for $tool in $dir" >&2
+			exit 1
+		fi
+		cp "$dir/$lockfile_name" "$BENCH_DIR/saved-lockfile-b-$tool"
+		cp "$BENCH_DIR/original-package.json" "$dir/package.json"
+		cp "$BENCH_DIR/saved-lockfile-$tool" "$dir/$lockfile_name"
+		;;
+	esac
 done
+
+# The add-dep scenario resolves one extra package at bench time; pull
+# its packument + tarball through Verdaccio while the uplink is open so
+# the no-uplink timed runs don't 404. (Unscoped tarball path — keep
+# ADD_DEP_NAME unscoped or extend this.)
+case ",$BENCH_SCENARIOS," in
+*,add-dep,*)
+	if [ -n "$BENCH_REGISTRY_URL" ]; then
+		echo "Prefetching ${ADD_DEP_NAME}@${ADD_DEP_VERSION} into the hermetic registry..."
+		curl -fsS "$BENCH_REGISTRY_URL/$ADD_DEP_NAME" -o /dev/null
+		curl -fsS "$BENCH_REGISTRY_URL/$ADD_DEP_NAME/-/$ADD_DEP_NAME-$ADD_DEP_VERSION.tgz" -o /dev/null
+	fi
+	;;
+esac
 
 if [ "${BENCH_HERMETIC:-0}" = "1" ]; then
 	hermetic_use_no_uplink
@@ -501,9 +579,12 @@ fi
 #   {lockfile}      — saved lockfile path (source of the copy)
 #   {lockfile_dest} — per-tool lockfile destination in the project
 #                     directory (matches the pm's native filename)
+#   {lockfile_b}    — saved branch-B lockfile path (branch-switch only;
+#                     expands to an empty path for tools that never
+#                     populated one)
 
 expand_template() {
-	local tpl=$1 project=$2 bin=$3 home=$4 store=$5 cache=$6 lockfile=$7 lockfile_dest=$8
+	local tpl=$1 project=$2 bin=$3 home=$4 store=$5 cache=$6 lockfile=$7 lockfile_dest=$8 lockfile_b=${9:-}
 	tpl="${tpl//\{project\}/$project}"
 	tpl="${tpl//\{bin\}/$bin}"
 	tpl="${tpl//\{home\}/$home}"
@@ -511,6 +592,7 @@ expand_template() {
 	tpl="${tpl//\{cache\}/$cache}"
 	tpl="${tpl//\{lockfile\}/$lockfile}"
 	tpl="${tpl//\{lockfile_dest\}/$lockfile_dest}"
+	tpl="${tpl//\{lockfile_b\}/$lockfile_b}"
 	echo "$tpl"
 }
 
@@ -724,6 +806,74 @@ cmd_template() {
 	install-test:vlt)
 		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --frozen-lockfile >/dev/null 2>&1 && HOME={home} npm_config_cache={cache} {bin} run test >/dev/null 2>&1"
 		;;
+
+	# ── ci-loop (S10): the warm CI loop, measured out-of-box ──────────
+	# Same shape as install-test, with one deliberate difference: NO GVS
+	# pin on aube/nub (plain $AUBE_ENV/$NUB_ENV, not the _GVS variants)
+	# and no pnpm GVS flag. The scenario exists to expose what each tool
+	# does on its own under CI=true vs CI unset — aube's Linker heuristic
+	# flips its global virtual store off under CI, and pinning it would
+	# erase exactly the behavior being measured. BENCH_GVS does not apply
+	# here by design.
+	ci-loop:aube)
+		echo "cd {project} && $AUBE_ENV {bin} test >/dev/null 2>&1"
+		;;
+	ci-loop:nub)
+		echo "cd {project} && $NUB_ENV {bin} install >/dev/null 2>&1 && $NUB_ENV {bin} run test >/dev/null 2>&1"
+		;;
+	ci-loop:bun)
+		echo "cd {project} && $BUN_BASE --frozen-lockfile >/dev/null 2>&1 && HOME={home} BUN_INSTALL={home}/.bun {bin} run test >/dev/null 2>&1"
+		;;
+	ci-loop:npm)
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install-test --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline ${NPM_MRA_FLAG} >/dev/null 2>&1"
+		;;
+	ci-loop:pnpm)
+		echo "cd {project} && HOME={home} {bin} install-test --frozen-lockfile --ignore-scripts ${PNPM_MRA_FLAG} >/dev/null 2>&1"
+		;;
+	ci-loop:yarn)
+		# Note: .yarnrc.yml pins enableImmutableInstalls=false (needed
+		# for populate), so yarn's CI=true row is not fully stock — the
+		# immutable-install flip is suppressed. Recorded here so nobody
+		# reads the yarn CI delta as out-of-box.
+		echo "cd {project} && HOME={home} {bin} install --immutable >/dev/null 2>&1 && HOME={home} {bin} test >/dev/null 2>&1"
+		;;
+	ci-loop:deno)
+		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet ${DENO_MRA_FLAG} >/dev/null 2>&1 && HOME={home} DENO_DIR={cache} {bin} task --quiet test >/dev/null 2>&1"
+		;;
+	ci-loop:vlt)
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --frozen-lockfile >/dev/null 2>&1 && HOME={home} npm_config_cache={cache} {bin} run test >/dev/null 2>&1"
+		;;
+
+	# ── dev-install: the timed command for add-dep and branch-switch ──
+	# The developer-loop spelling of `install`: no --frozen-lockfile, so
+	# the tool may re-resolve when package.json/lockfile drifted (add-dep
+	# forces that; branch-switch hands it a valid lockfile B and measures
+	# the node_modules diff). GVS / release-age / advisory knobs apply as
+	# resolved above.
+	dev-install:aube)
+		echo "cd {project} && $AUBE_ENV_GVS {bin} install >/dev/null 2>&1"
+		;;
+	dev-install:nub)
+		echo "cd {project} && $NUB_ENV_GVS {bin} install >/dev/null 2>&1"
+		;;
+	dev-install:bun)
+		echo "cd {project} && $BUN_BASE >/dev/null 2>&1"
+		;;
+	dev-install:npm)
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline ${NPM_MRA_FLAG} >/dev/null 2>&1"
+		;;
+	dev-install:pnpm)
+		echo "cd {project} && HOME={home} {bin} install --ignore-scripts ${PNPM_MRA_FLAG} ${PNPM_GVS_FLAG} >/dev/null 2>&1"
+		;;
+	dev-install:yarn)
+		echo "cd {project} && HOME={home} {bin} install >/dev/null 2>&1"
+		;;
+	dev-install:deno)
+		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --quiet ${DENO_MRA_FLAG} >/dev/null 2>&1"
+		;;
+	dev-install:vlt)
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install >/dev/null 2>&1"
+		;;
 	esac
 }
 
@@ -825,6 +975,85 @@ run_bench_preinstall() {
 			--command-name "$tool" \
 			"$cmd" \
 			--export-json "$BENCH_DIR/${bench_name}-${tool}.json" ||
+			true
+	done
+}
+
+# Generalized "restore A → settle → mutate → time" runner for the
+# staged scenarios (ci-loop, add-dep, branch-switch).
+#
+#   $1 timed_key       — cmd_template key for the TIMED command
+#   $2 settle_key      — cmd_template key run once untimed in prepare,
+#                        after restoring package.json A + lockfile A +
+#                        wiping node_modules, so the timed run starts
+#                        from a settled, declared state
+#   $3 result_name     — hyperfine JSON basename (also the results row
+#                        key; may differ from the scenario key, e.g.
+#                        ci-loop → ci-loop-ci / ci-loop-noci)
+#   $4 post_settle_tpl — optional template appended to prepare AFTER the
+#                        settle run (the mutation: inject a dep, swap in
+#                        the B fixture, …). Empty = no mutation.
+#   $5 ci_mode         — "ci" to run hyperfine (and thus every prepare +
+#                        timed command) with CI=true; default is the
+#                        scrubbed environment (CI unset globally above).
+run_bench_staged() {
+	local timed_key=$1 settle_key=$2 result_name=$3 post_settle_tpl=$4 ci_mode=${5:-}
+
+	for i in "${!TOOLS[@]}"; do
+		local tool="${TOOLS[$i]}"
+		local project="${TOOL_PROJECTS[$i]}"
+		local bin="${TOOL_BINS[$i]}"
+		local home="${TOOL_HOMES[$i]}"
+		local store="${TOOL_STORES[$i]}"
+		local cache="${TOOL_CACHES[$i]}"
+		local lockfile="$BENCH_DIR/saved-lockfile-$tool"
+		local lockfile_b="$BENCH_DIR/saved-lockfile-b-$tool"
+		local lockfile_dest
+		lockfile_dest="$project/$(lockfile_name_for "$tool")"
+
+		local timed_tpl settle_tpl
+		timed_tpl=$(cmd_template "$timed_key" "$tool")
+		settle_tpl=$(cmd_template "$settle_key" "$tool")
+		if [ -z "$timed_tpl" ] || [ -z "$settle_tpl" ]; then
+			echo "warning: no $result_name command for $tool — skipping" >&2
+			continue
+		fi
+
+		local cmd settle warm_prep
+		cmd=$(expand_template "$timed_tpl" "$project" "$bin" "$home" "$store" "$cache" "$lockfile" "$lockfile_dest" "$lockfile_b")
+		settle=$(expand_template "$settle_tpl" "$project" "$bin" "$home" "$store" "$cache" "$lockfile" "$lockfile_dest" "$lockfile_b")
+		warm_prep=$(expand_template "$WARM_PREP" "$project" "$bin" "$home" "$store" "$cache" "$lockfile" "$lockfile_dest" "$lockfile_b")
+
+		# package.json A first (staged scenarios mutate it), then the
+		# lockfile-A restore + node_modules wipe, then the settle run,
+		# then the mutation.
+		local prepare="cp $BENCH_DIR/original-package.json $project/package.json && $warm_prep && $settle"
+		if [ -n "$post_settle_tpl" ]; then
+			local post_settle
+			post_settle=$(expand_template "$post_settle_tpl" "$project" "$bin" "$home" "$store" "$cache" "$lockfile" "$lockfile_dest" "$lockfile_b")
+			prepare="$prepare && $post_settle"
+		fi
+
+		# CI is a recorded matrix variable: scrubbed everywhere, set
+		# only for the ci-loop-ci row. hyperfine's children (prepare +
+		# timed command) inherit its environment.
+		local -a env_prefix=(env -u CI)
+		if [ "$ci_mode" = "ci" ]; then
+			env_prefix=(env CI=true)
+		fi
+
+		local tool_runs
+		tool_runs=$(runs_for_tool "$tool")
+		echo ""
+		echo "  $tool:"
+		"${env_prefix[@]}" hyperfine \
+			--warmup "$WARMUP" \
+			--runs "$tool_runs" \
+			--ignore-failure \
+			--prepare "$prepare" \
+			--command-name "$tool" \
+			"$cmd" \
+			--export-json "$BENCH_DIR/${result_name}-${tool}.json" ||
 			true
 	done
 }
@@ -933,6 +1162,44 @@ fi
 echo ""
 echo "━━━ Benchmark 3: install + run test (already installed) ━━━"
 run_scenario "install-test" run_bench_preinstall "install-test"
+
+# ── Benchmark 4: warm CI loop, CI unset vs CI=true (S10) ──────────────────
+# install-test's developer loop, re-measured as an explicitly-labeled CI
+# story: two rows, identical on-disk state, the only delta is the CI env
+# var. Tools are run out-of-box w.r.t. their store heuristics (no GVS
+# pin — see the ci-loop cmd_template comment), so the row pair shows
+# exactly what a real CI user gets vs what a dev-machine user gets.
+
+echo ""
+echo "━━━ Benchmark 4: warm CI loop (CI unset) ━━━"
+run_scenario "ci-loop" run_bench_staged "ci-loop" "ci-loop" "ci-loop-noci" ""
+
+echo ""
+echo "━━━ Benchmark 4b: warm CI loop (CI=true) ━━━"
+run_scenario "ci-loop" run_bench_staged "ci-loop" "ci-loop" "ci-loop-ci" "" ci
+
+# ── Benchmark 5: add one dep (S11) ─────────────────────────────────────────
+# Warm everything, settle a frozen install, inject one pinned dep into
+# package.json, time the non-frozen install. This is the resolution/
+# packument path under each tool's resolved config — note aube/nub's
+# advisory check (when not pinned off) fires on exactly this flow.
+
+echo ""
+echo "━━━ Benchmark 5: add one dep (${ADD_DEP_NAME}@${ADD_DEP_VERSION}) ━━━"
+run_scenario "add-dep" run_bench_staged "dev-install" "gvs-warm" "add-dep" \
+	"node $SCRIPT_DIR/add-dep.mjs {project}/package.json $ADD_DEP_NAME $ADD_DEP_VERSION"
+
+# ── Benchmark 6: branch switch (S12) ───────────────────────────────────────
+# node_modules settled and valid for lockfile A; swap in package.json B
+# + the tool's native lockfile B (~15 version deltas, generated during
+# populate); time the incremental install. The most common real dev
+# operation — and the cell where diff-based installers shine vs
+# all-or-nothing state checks.
+
+echo ""
+echo "━━━ Benchmark 6: branch switch (~15 version deltas) ━━━"
+run_scenario "branch-switch" run_bench_staged "dev-install" "gvs-warm" "branch-switch" \
+	"cp $FIXTURE_B_SRC {project}/package.json && cp {lockfile_b} {lockfile_dest}"
 
 # ── Summary ────────────────────────────────────────────────────────────────
 

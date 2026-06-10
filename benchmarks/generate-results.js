@@ -27,6 +27,14 @@ const benchmarks = [
   ['gvs-warm', 'Fresh install (warm cache)'],
   ['gvs-cold', 'Fresh install (cold cache)'],
   ['install-test', 'npm install && npm run test'],
+  // S10: same on-disk state, the CI env var is the only delta between
+  // the two rows. Labeled as what it measures — an install
+  // short-circuit plus script dispatch — not as a generic "install".
+  ['ci-loop-noci', 'Warm CI loop, CI unset (install short-circuit + test)'],
+  ['ci-loop-ci', 'Warm CI loop, CI=true (install short-circuit + test)'],
+  // S11 / S12: the resolution-path and incremental-install cells.
+  ['add-dep', 'Add one dep (package.json edit + non-frozen install)'],
+  ['branch-switch', 'Branch switch (~15 lockfile deltas, warm node_modules)'],
 ]
 const SELECTED_BENCHMARKS = new Set(
   (process.env.BENCH_SCENARIOS || benchmarks.map(([name]) => name).join(','))
@@ -34,6 +42,12 @@ const SELECTED_BENCHMARKS = new Set(
     .map((s) => s.trim())
     .filter(Boolean),
 )
+// bench.sh spells S10 as one scenario key (`ci-loop`) but emits two
+// result rows; expand the selection so both land in the output.
+if (SELECTED_BENCHMARKS.has('ci-loop')) {
+  SELECTED_BENCHMARKS.add('ci-loop-noci')
+  SELECTED_BENCHMARKS.add('ci-loop-ci')
+}
 
 const TOOLS = (process.env.BENCH_TOOLS || 'aube,pnpm')
   .split(',')
