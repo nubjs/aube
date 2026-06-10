@@ -736,10 +736,10 @@ else
 	# strict as aube's, never weaker. (60*24 = 1440 → 1 day exactly.)
 	MIN_RELEASE_AGE_DAYS=$(((MIN_RELEASE_AGE_MINUTES + 60 * 24 - 1) / (60 * 24)))
 	AUBE_MRA_ENV="npm_config_minimum_release_age=${MIN_RELEASE_AGE_MINUTES}"
-	NPM_MRA_FLAG="${NPM_MRA_FLAG}"
-	PNPM_MRA_FLAG="${PNPM_MRA_FLAG}"
+	NPM_MRA_FLAG="--min-release-age=${MIN_RELEASE_AGE_DAYS}"
+	PNPM_MRA_FLAG="--config.minimum-release-age=${MIN_RELEASE_AGE_MINUTES}"
 	BUN_MRA_FLAG="--minimum-release-age=${MIN_RELEASE_AGE_SECONDS}"
-	DENO_MRA_FLAG="${DENO_MRA_FLAG}"
+	DENO_MRA_FLAG="--minimum-dependency-age=${MIN_RELEASE_AGE_MINUTES}"
 fi
 
 # Global-virtual-store axis (BENCH_GVS, see header). FAST_GVS_ENV is the
