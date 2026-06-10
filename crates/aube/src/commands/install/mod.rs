@@ -8,6 +8,7 @@ mod advisory;
 mod args;
 mod bin_linking;
 mod critical_path;
+mod default_trust;
 mod delta;
 mod dep_selection;
 mod fetch;
@@ -33,6 +34,7 @@ mod workspace;
 use advisory::resolve_osv_routing_settings;
 pub use args::{InstallArgs, InstallOptions};
 pub(crate) use bin_linking::{PkgJsonCache, link_dep_bins, materialized_pkg_dir};
+pub(crate) use default_trust::DefaultTrustFloor;
 pub use dep_selection::DepSelection;
 pub(super) use fetch::fetch_packages;
 use fetch::{
@@ -306,15 +308,27 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let ws_package_versions = workspace_plan.ws_package_versions;
     let ws_dirs = workspace_plan.ws_dirs;
     let lifecycle_manifests = workspace_plan.lifecycle_manifests;
+    let default_trust_enabled = aube_settings::resolved::default_trust(&settings_ctx);
     let (build_policy, policy_warnings) =
         if let Some(override_policy) = opts.build_policy_override.as_deref() {
             (override_policy.clone(), Vec::new())
         } else {
+            // With the `defaultTrust` floor active the documented
+            // precedence puts explicit `allowBuilds` entries above
+            // `dangerouslyAllowAllBuilds` in both directions, so the
+            // allow-all posture composes via `allow_all_except_denied`
+            // (explicit `false` survives). Without the floor, the
+            // pnpm-parity short-circuit (allow-all drops the map)
+            // stays untouched.
+            let compose_allow_all = opts.dangerously_allow_all_builds && default_trust_enabled;
             let (mut build_policy, policy_warnings) = build_policy_from_manifest_sources(
                 lifecycle_manifests.iter().map(|(_, manifest)| manifest),
                 &ws_config_shared,
-                opts.dangerously_allow_all_builds,
+                opts.dangerously_allow_all_builds && !compose_allow_all,
             );
+            if compose_allow_all {
+                build_policy = build_policy.allow_all_except_denied();
+            }
             if let Some(inherited) = opts.inherited_build_policy.as_deref() {
                 build_policy.merge(inherited);
             }
@@ -573,6 +587,10 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // frozen-lockfile path or when the prewarm short-circuits.
     let mut prewarm_graph_hashes: Option<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>> =
         None;
+    // Whether the post-resolve OSV routing actually covered this
+    // install (assigned by both branches below). Input to the
+    // `defaultTrust` floor.
+    let osv_gate_active;
     let (graph, package_indices, cached_count, fetch_count) = match lockfile_result {
         Ok((graph, kind)) => {
             let graph = resolve::apply_lockfile_graph_platform_rules(
@@ -617,7 +635,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // every frozen reinstall actually run the routing
             // (previously skipped, surfaced by review).
             let osv_settings = resolve_osv_routing_settings(&cwd);
-            super::add_supply_chain::run_post_resolve_osv_routing(
+            osv_gate_active = super::add_supply_chain::run_post_resolve_osv_routing(
                 &cwd,
                 &graph,
                 /*fresh_resolution=*/ false,
@@ -1348,7 +1366,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             let fresh_resolution =
                 super::add_supply_chain::lockfile_has_new_picks(&cwd, prior_lockfile, &graph);
             let osv_settings = resolve_osv_routing_settings(&cwd);
-            super::add_supply_chain::run_post_resolve_osv_routing(
+            osv_gate_active = super::add_supply_chain::run_post_resolve_osv_routing(
                 &cwd,
                 &graph,
                 fresh_resolution,
@@ -1811,6 +1829,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         prog_ref,
         phase_timings: &mut phase_timings,
     })?;
+    let default_trust_floor = default_trust::DefaultTrustFloor::from_settings(
+        &settings_ctx,
+        opts.minimum_release_age_override,
+        osv_gate_active,
+    );
     finalize::run_finalize_phase(finalize::FinalizePhaseInput {
         cwd: &cwd,
         settings_ctx: &settings_ctx,
@@ -1822,6 +1845,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         direct_dep_info: &direct_dep_info,
         deprecations: &deprecations,
         build_policy: &build_policy,
+        default_trust_floor: &default_trust_floor,
         jail_policy: &jail_policy,
         stats: &stats,
         node_linker,
