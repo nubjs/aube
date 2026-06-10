@@ -113,6 +113,47 @@ teardown() {
 	assert_success
 }
 
+@test "package-lock.json captures cross-platform optionals like npm does" {
+	# npm records every optional-dep variant in package-lock.json with
+	# its os/cpu fields, host notwithstanding — and `npm ci` *requires*
+	# an entry for every root optionalDependency even when it doesn't
+	# match the host (EUSAGE "Missing: fsevents@x.y.z from lock file"
+	# otherwise), so a host-only package-lock written on Linux is
+	# rejected by npm on Linux itself. aube matches npm's shape.
+	cat >package-lock.json <<-'JSON'
+		{
+		  "name": "npm-lock-cross-platform",
+		  "version": "0.0.0",
+		  "lockfileVersion": 3,
+		  "requires": true,
+		  "packages": {
+		    "": {
+		      "name": "npm-lock-cross-platform",
+		      "version": "0.0.0"
+		    }
+		  }
+		}
+	JSON
+	cat >package.json <<-'JSON'
+		{
+		  "name": "npm-lock-cross-platform",
+		  "version": "0.0.0",
+		  "optionalDependencies": {
+		    "aube-test-optional-win32": "1.0.0"
+		  }
+		}
+	JSON
+	run aube install --no-frozen-lockfile
+	assert_success
+	assert_not_exists aube-lock.yaml
+	# The win32-only optional must not land in node_modules on non-win32
+	# hosts…
+	assert_not_exists node_modules/aube-test-optional-win32
+	# …but it MUST get a packages entry so `npm ci` accepts the file.
+	run grep -F '"node_modules/aube-test-optional-win32"' package-lock.json
+	assert_success
+}
+
 @test "pnpm.supportedArchitectures widens the match set" {
 	cat >package.json <<-'JSON'
 		{
