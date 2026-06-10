@@ -70,6 +70,25 @@ set -euo pipefail
 #                                       native lockfile B, time the
 #                                       incremental install.
 #   BENCH_PHASES — set to 0 to skip aube phase timing samples
+#   BENCH_FIXTURE — which fixture to bench. Default: the single-package
+#                  fixture.package.json (with fixture-b.package.json as
+#                  its branch-B variant). Any other value names a
+#                  directory under benchmarks/fixtures/ that is copied
+#                  wholesale into each tool's project dir, with an
+#                  optional sibling `<name>-b` directory as the
+#                  branch-B variant. `workspace-descript` is the
+#                  5-member pnpm workspace (Electron-app shell, two
+#                  peer-heavy React UI members, an express/prisma
+#                  service, a tooling member; ~230 direct deps, ~2.9k
+#                  resolved; committed REAL-pnpm-generated
+#                  pnpm-lock.yaml in both A and B variants — the
+#                  committed lockfile is seeded as pnpm's and nub's
+#                  benchmarked lockfile, which makes it the
+#                  foreign-lockfile testbed for nub). Workspace
+#                  fixtures use workspace:* ranges + pnpm-workspace.yaml;
+#                  run them with BENCH_TOOLS drawn from
+#                  nub,aube,pnpm,bun,yarn — npm/deno/vlt don't speak
+#                  that combination and will fail populate.
 #
 #   BENCH_HERMETIC=1 — route all registry traffic through a local
 #                      Verdaccio instance pre-populated from npmjs. This
@@ -192,6 +211,45 @@ export BENCH_TIER BENCH_GVS BENCH_ADVISORY_CHECK
 # would silently change what's being measured. The ci-loop scenario
 # re-introduces it explicitly as its own labeled row.
 unset CI
+
+# The workspace-descript fixture carries electron in devDependencies.
+# Lifecycle scripts are off in every scenario, so its postinstall (the
+# binary CDN download) never runs — this is belt and suspenders so no
+# tool's auto-install path can ever turn a bench run into a CDN test.
+export ELECTRON_SKIP_BINARY_DOWNLOAD=1
+
+# ── Fixture selection ───────────────────────────────────────────────────────
+# FIXTURE_SRC is either a single package.json (the default fixture) or
+# a directory copied wholesale into each tool's project. FIXTURE_B_SRC
+# is the branch-B variant used by the branch-switch scenario.
+BENCH_FIXTURE="${BENCH_FIXTURE:-default}"
+case "$BENCH_FIXTURE" in
+default)
+	FIXTURE_SRC="$SCRIPT_DIR/fixture.package.json"
+	FIXTURE_B_SRC="$SCRIPT_DIR/fixture-b.package.json"
+	;;
+*)
+	FIXTURE_SRC="$SCRIPT_DIR/fixtures/$BENCH_FIXTURE"
+	FIXTURE_B_SRC="$SCRIPT_DIR/fixtures/${BENCH_FIXTURE}-b"
+	if [ ! -d "$FIXTURE_SRC" ]; then
+		echo "error: unknown BENCH_FIXTURE '$BENCH_FIXTURE' (no $FIXTURE_SRC)" >&2
+		exit 1
+	fi
+	;;
+esac
+if [ ! -e "$FIXTURE_B_SRC" ]; then
+	case ",$BENCH_SCENARIOS," in
+	*,branch-switch,*)
+		echo "error: branch-switch needs a B variant at $FIXTURE_B_SRC" >&2
+		exit 1
+		;;
+	esac
+fi
+# hermetic.bash reads these: the warm pass installs the active fixture
+# (not unconditionally fixture.package.json), and the warm sentinel is
+# tagged per fixture so switching fixtures re-warms the registry.
+export BENCH_FIXTURE
+export BENCH_FIXTURE_SRC="$FIXTURE_SRC"
 
 # ── Validation ──────────────────────────────────────────────────────────────
 
@@ -350,13 +408,22 @@ for i in "${!TOOLS[@]}"; do
 	dir="${TOOL_PROJECTS[$i]}"
 	home="${TOOL_HOMES[$i]}"
 	mkdir -p "$dir" "$home" "${TOOL_CACHES[$i]}"
-	cp "$SCRIPT_DIR/fixture.package.json" "$dir/package.json"
+	if [ -d "$FIXTURE_SRC" ]; then
+		# Directory fixture (workspace): copy the whole tree — member
+		# package.jsons, pnpm-workspace.yaml, and any committed
+		# lockfile ride along.
+		cp -R "$FIXTURE_SRC/." "$dir/"
+	else
+		cp "$FIXTURE_SRC" "$dir/package.json"
+	fi
 
 	# pnpm reads storeDir / cacheDir from pnpm-workspace.yaml; the
 	# other tools take them via CLI flags or env vars at command
-	# time, so nothing to write on disk up front.
+	# time, so nothing to write on disk up front. Append rather than
+	# overwrite: a workspace fixture ships its own pnpm-workspace.yaml
+	# (the `packages:` list) that must survive.
 	if [ "$tool" = "pnpm" ]; then
-		printf "storeDir: %s\ncacheDir: %s\n" "${TOOL_STORES[$i]}" "${TOOL_CACHES[$i]}" >"$dir/pnpm-workspace.yaml"
+		printf "storeDir: %s\ncacheDir: %s\n" "${TOOL_STORES[$i]}" "${TOOL_CACHES[$i]}" >>"$dir/pnpm-workspace.yaml"
 	fi
 
 	# Yarn 4 ignores .npmrc for registry and only ships a PnP linker by
@@ -400,15 +467,31 @@ for i in "${!TOOLS[@]}"; do
 	fi
 done
 
-# Keep a pristine copy of package.json
-cp "$SCRIPT_DIR/fixture.package.json" "$BENCH_DIR/original-package.json"
-
-# Branch-B fixture for the branch-switch scenario: fixture.package.json
-# with ~15 direct deps pinned to older exact versions (all comfortably
-# past any minimum-release-age gate). Each tool's native lockfile B is
+# Pristine manifest overlays. The staged scenarios (ci-loop, add-dep,
+# branch-switch) mutate package.json mid-prepare, so they need a way to
+# restore "manifest state A" (and apply "manifest state B") that works
+# for both fixture shapes: an overlay dir holding only the fixture's
+# package.json files (root + workspace members), applied with
+# `cp -R <overlay>/. <project>/`. For the branch-B variant the deltas
+# are ~15 direct deps pinned to older exact versions (all comfortably
+# past any minimum-release-age gate); each tool's native lockfile B is
 # generated during populate (uplink-bracketed) and saved alongside the
 # A lockfile.
-FIXTURE_B_SRC="$SCRIPT_DIR/fixture-b.package.json"
+FIXTURE_A_OVERLAY="$BENCH_DIR/fixture-a-overlay"
+FIXTURE_B_OVERLAY="$BENCH_DIR/fixture-b-overlay"
+build_fixture_overlay() {
+	local src=$1 dst=$2
+	mkdir -p "$dst"
+	if [ -f "$src" ]; then
+		cp "$src" "$dst/package.json"
+	else
+		(cd "$src" && find . -name package.json -not -path '*/node_modules/*' | tar cf - -T -) | tar xf - -C "$dst"
+	fi
+}
+build_fixture_overlay "$FIXTURE_SRC" "$FIXTURE_A_OVERLAY"
+if [ -e "$FIXTURE_B_SRC" ]; then
+	build_fixture_overlay "$FIXTURE_B_SRC" "$FIXTURE_B_OVERLAY"
+fi
 
 # The single pinned dep the add-dep scenario injects. Ancient, zero
 # transitive deps, unscoped (the prefetch below assumes an unscoped
@@ -505,6 +588,7 @@ for i in "${!TOOLS[@]}"; do
 	# leave a stale one behind that would fool the pm into a
 	# different code path.
 	rm -rf "$dir/node_modules" \
+		"$dir"/packages/*/node_modules \
 		"$dir/pnpm-lock.yaml" \
 		"$dir/aube-lock.yaml" \
 		"$dir/package-lock.json" \
@@ -513,6 +597,17 @@ for i in "${!TOOLS[@]}"; do
 		"$dir/bun.lockb" \
 		"$dir/deno.lock" \
 		"$dir/vlt-lock.json"
+
+	# Workspace fixtures ship a committed, REAL-pnpm-generated lockfile.
+	# Seed it back after the wipe for the tools whose native format it
+	# is (pnpm itself, and nub whose native lockfile is pnpm-lock.yaml):
+	# the benchmarked lockfile is then the committed one — for nub this
+	# is the foreign-lockfile posture, operating against a lockfile that
+	# real pnpm wrote — rather than whatever this tool's resolver would
+	# freshly pick.
+	if [ -d "$FIXTURE_SRC" ] && [ -f "$FIXTURE_SRC/$lockfile_name" ]; then
+		cp "$FIXTURE_SRC/$lockfile_name" "$dir/$lockfile_name"
+	fi
 
 	populate_install "$tool" "$dir" "$bin" "$home" "$store" "$cache"
 
@@ -530,14 +625,18 @@ for i in "${!TOOLS[@]}"; do
 	case ",$BENCH_SCENARIOS," in
 	*,branch-switch,*)
 		echo "Populating branch-B lockfile for $tool..."
-		cp "$FIXTURE_B_SRC" "$dir/package.json"
+		cp -R "$FIXTURE_B_OVERLAY/." "$dir/"
+		# Same committed-lockfile seeding as the A populate above.
+		if [ -d "$FIXTURE_B_SRC" ] && [ -f "$FIXTURE_B_SRC/$lockfile_name" ]; then
+			cp "$FIXTURE_B_SRC/$lockfile_name" "$dir/$lockfile_name"
+		fi
 		populate_install "$tool" "$dir" "$bin" "$home" "$store" "$cache"
 		if [ ! -f "$dir/$lockfile_name" ]; then
 			echo "error: branch-B $lockfile_name was not created for $tool in $dir" >&2
 			exit 1
 		fi
 		cp "$dir/$lockfile_name" "$BENCH_DIR/saved-lockfile-b-$tool"
-		cp "$BENCH_DIR/original-package.json" "$dir/package.json"
+		cp -R "$FIXTURE_A_OVERLAY/." "$dir/"
 		cp "$BENCH_DIR/saved-lockfile-$tool" "$dir/$lockfile_name"
 		;;
 	esac
@@ -1024,10 +1123,10 @@ run_bench_staged() {
 		settle=$(expand_template "$settle_tpl" "$project" "$bin" "$home" "$store" "$cache" "$lockfile" "$lockfile_dest" "$lockfile_b")
 		warm_prep=$(expand_template "$WARM_PREP" "$project" "$bin" "$home" "$store" "$cache" "$lockfile" "$lockfile_dest" "$lockfile_b")
 
-		# package.json A first (staged scenarios mutate it), then the
-		# lockfile-A restore + node_modules wipe, then the settle run,
-		# then the mutation.
-		local prepare="cp $BENCH_DIR/original-package.json $project/package.json && $warm_prep && $settle"
+		# Manifest state A first (staged scenarios mutate package.json,
+		# including workspace-member ones), then the lockfile-A restore
+		# + node_modules wipe, then the settle run, then the mutation.
+		local prepare="cp -R $FIXTURE_A_OVERLAY/. $project/ && $warm_prep && $settle"
 		if [ -n "$post_settle_tpl" ]; then
 			local post_settle
 			post_settle=$(expand_template "$post_settle_tpl" "$project" "$bin" "$home" "$store" "$cache" "$lockfile" "$lockfile_dest" "$lockfile_b")
@@ -1116,8 +1215,11 @@ COLD_WIPE='{store} {cache} {home}/.pnpm-store {home}/.local/share/aube {home}/.l
 # Warm-cache lockfile restore: wipe the project-local state (lockfile
 # + node_modules) and drop the saved lockfile back. Uses the per-tool
 # `lockfile_dest` placeholder so each pm gets its native filename.
-WARM_PREP="rm -rf {project}/node_modules {project}/pnpm-lock.yaml {project}/aube-lock.yaml {project}/package-lock.json {project}/yarn.lock {project}/bun.lock {project}/bun.lockb {project}/deno.lock {project}/vlt-lock.json && cp {lockfile} {lockfile_dest}"
-COLD_PREP="rm -rf {project}/node_modules {project}/pnpm-lock.yaml {project}/aube-lock.yaml {project}/package-lock.json {project}/yarn.lock {project}/bun.lock {project}/bun.lockb {project}/deno.lock {project}/vlt-lock.json $COLD_WIPE && mkdir -p {home} && cp {lockfile} {lockfile_dest}"
+# `{project}/packages/*/node_modules` covers workspace fixtures' member
+# node_modules; on the single-package fixture the glob doesn't match and
+# `rm -rf` ignores the literal path.
+WARM_PREP="rm -rf {project}/node_modules {project}/packages/*/node_modules {project}/pnpm-lock.yaml {project}/aube-lock.yaml {project}/package-lock.json {project}/yarn.lock {project}/bun.lock {project}/bun.lockb {project}/deno.lock {project}/vlt-lock.json && cp {lockfile} {lockfile_dest}"
+COLD_PREP="rm -rf {project}/node_modules {project}/packages/*/node_modules {project}/pnpm-lock.yaml {project}/aube-lock.yaml {project}/package-lock.json {project}/yarn.lock {project}/bun.lock {project}/bun.lockb {project}/deno.lock {project}/vlt-lock.json $COLD_WIPE && mkdir -p {home} && cp {lockfile} {lockfile_dest}"
 
 # ── Benchmark 1: Fresh install, warm cache ─────────────────────────────────
 # Lockfile present, node_modules deleted, store and cache warm.
@@ -1199,7 +1301,7 @@ run_scenario "add-dep" run_bench_staged "dev-install" "gvs-warm" "add-dep" \
 echo ""
 echo "━━━ Benchmark 6: branch switch (~15 version deltas) ━━━"
 run_scenario "branch-switch" run_bench_staged "dev-install" "gvs-warm" "branch-switch" \
-	"cp $FIXTURE_B_SRC {project}/package.json && cp {lockfile_b} {lockfile_dest}"
+	"cp -R $FIXTURE_B_OVERLAY/. {project}/ && cp {lockfile_b} {lockfile_dest}"
 
 # ── Summary ────────────────────────────────────────────────────────────────
 

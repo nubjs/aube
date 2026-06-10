@@ -146,10 +146,17 @@ _hermetic_warm() {
 	# Non-default BENCH_TOOLS gets its own sentinel; the default
 	# sentinel cannot cover a tool set that includes anything outside
 	# the default warm pass (e.g. re-enabling vlt), so don't fall back
-	# to it.
+	# to it. Non-default fixtures (BENCH_FIXTURE, e.g. the
+	# workspace-descript workspace) likewise get their own sentinel —
+	# a registry warmed for one fixture is full of 404-holes for
+	# another.
+	local fixture_tag=""
+	if [ -n "${BENCH_FIXTURE:-}" ] && [ "${BENCH_FIXTURE}" != "default" ]; then
+		fixture_tag=".fx-${BENCH_FIXTURE//[^A-Za-z0-9_.-]/_}"
+	fi
 	local warm_sentinel="$HERMETIC_WARMED_SENTINEL"
-	if [ "${BENCH_TOOLS:-aube,bun,pnpm,npm,yarn,deno}" != "aube,bun,pnpm,npm,yarn,deno" ]; then
-		warm_sentinel="$HERMETIC_STORAGE/.warmed.${BENCH_TOOLS//[^A-Za-z0-9_.-]/_}"
+	if [ "${BENCH_TOOLS:-aube,bun,pnpm,npm,yarn,deno}" != "aube,bun,pnpm,npm,yarn,deno" ] || [ -n "$fixture_tag" ]; then
+		warm_sentinel="$HERMETIC_STORAGE/.warmed.${BENCH_TOOLS//[^A-Za-z0-9_.-]/_}$fixture_tag"
 	fi
 
 	if [ -f "$warm_sentinel" ]; then
@@ -166,7 +173,16 @@ _hermetic_warm() {
 
 	local warm_root
 	warm_root=$(mktemp -d "${TMPDIR:-/tmp}/aube-bench-warm.XXXXXX")
-	cp "$HERMETIC_DIR/fixture.package.json" "$warm_root/base-package.json"
+	# Warm with the ACTIVE fixture (bench.sh exports BENCH_FIXTURE_SRC).
+	# Directory fixtures (workspaces) are staged as a tree; the default
+	# remains the single-package fixture.package.json.
+	local fixture_src="${BENCH_FIXTURE_SRC:-$HERMETIC_DIR/fixture.package.json}"
+	if [ -d "$fixture_src" ]; then
+		mkdir -p "$warm_root/base-fixture"
+		cp -R "$fixture_src/." "$warm_root/base-fixture/"
+	else
+		cp "$fixture_src" "$warm_root/base-package.json"
+	fi
 
 	local reg="http://127.0.0.1:$BENCH_VERDACCIO_PORT"
 	_warm_one() {
@@ -183,7 +199,11 @@ _hermetic_warm() {
 		echo "  warming with $pm ..." >&2
 		local pm_dir="$warm_root/$pm"
 		mkdir -p "$pm_dir/home"
-		cp "$warm_root/base-package.json" "$pm_dir/package.json"
+		if [ -d "$warm_root/base-fixture" ]; then
+			cp -R "$warm_root/base-fixture/." "$pm_dir/"
+		else
+			cp "$warm_root/base-package.json" "$pm_dir/package.json"
+		fi
 		# Pin registry via both `.npmrc` (project + home) and
 		# `npm_config_registry` — aube reads `.npmrc` and does not
 		# honor the env var, while npm honors either. Yarn 4 ignores
