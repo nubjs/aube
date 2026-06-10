@@ -432,3 +432,49 @@ JSON
 	assert_success
 	assert_file_not_exists aube-builds-marker.txt
 }
+
+# Pins the lifecycle-cwd contract: an approved dep build runs with
+# cwd = the package's own materialized directory (the
+# `<virtual-store>/<dep_path>/node_modules/<name>` leaf), and that
+# directory contains the package's own `package.json` — matching
+# pnpm/npm, where install scripts routinely read `./package.json`.
+#
+# Added while investigating a wild-corpus failure (antfu-collective/ni,
+# simple-git-hooks postinstall): the failure there is NOT the cwd —
+# it's that in global-virtual-store mode the *physical* cwd lives in
+# `$XDG_CACHE/aube/virtual-store/`, outside the project, so postinstalls
+# that derive the project root by walking up from `process.cwd()`
+# (simple-git-hooks special-cases `.pnpm`/`.deno`/`.store`, then strips
+# a trailing `node_modules/<name>`) land on the virtual-store key dir,
+# stat a `package.json` that doesn't exist there, and crash. This test
+# keeps the half of the contract that is correct today from regressing
+# when that layout issue is addressed.
+@test "approved dep build runs with cwd = its own package dir" {
+	cat >package.json <<'JSON'
+{
+  "name": "allow-builds-cwd-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "aube-test-cwd-probe": "^1.0.0"
+  },
+  "pnpm": {
+    "allowBuilds": {
+      "aube-test-cwd-probe": true
+    }
+  }
+}
+JSON
+	run aube install
+	assert_success
+	# The probe writes ./cwd-probe.txt into its own cwd; reaching it
+	# through the project-level symlink proves the script ran in the
+	# materialized package dir the project actually links to.
+	local probe=node_modules/aube-test-cwd-probe/cwd-probe.txt
+	assert_file_exists "$probe"
+	# Line 1: process.cwd() — must end at the package's own dir.
+	# Line 2: whether `<cwd>/package.json` existed.
+	run sed -n 1p "$probe"
+	assert_output --regexp '/node_modules/aube-test-cwd-probe$'
+	run sed -n 2p "$probe"
+	assert_output "true"
+}
