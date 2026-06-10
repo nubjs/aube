@@ -648,14 +648,14 @@ pub(crate) struct ResolverConfigInputs<'a> {
     /// Lockfile format aube will write on the way out, or `None` when
     /// `lockfile=false` and no lockfile will be written at all. Drives
     /// whether the resolver widens its platform filter to cover every
-    /// common OS/CPU/libc combination: aube-lock.yaml is meant to be a
-    /// cross-platform committed artifact, so `Some(Aube)` opts in to
-    /// the wide default. Foreign formats (`Some(Pnpm | Npm | …)`) keep
-    /// pnpm's host-only default so aube doesn't silently bake more
-    /// packages into them than the native tool would have written, and
-    /// `None` skips widening entirely — nothing consumes the extra
-    /// resolutions. Callers compute this as
-    /// `lockfile_enabled.then(|| source_kind_before.unwrap_or(Aube))`.
+    /// common OS/CPU/libc combination: formats whose native tools
+    /// record every optional-dep platform variant regardless of host
+    /// (`Some(Aube | Pnpm | Bun | Npm)`) opt in to the wide default so
+    /// aube's output matches what the native tool would have written.
+    /// Yarn classic carries no per-package os/cpu metadata, so it
+    /// keeps the host-only default, and `None` skips widening entirely
+    /// — nothing consumes the extra resolutions. Callers compute this
+    /// as `lockfile_enabled.then(|| source_kind_before.unwrap_or(Aube))`.
     pub(crate) target_lockfile_kind: Option<aube_lockfile::LockfileKind>,
     /// When `true`, the resolver caches full (non-corgi) packuments on
     /// disk so the next install/update can reuse them without a
@@ -700,23 +700,28 @@ pub(crate) fn configure_resolver(
     let force_metadata_primer = resolve_force_metadata_primer(settings_ctx);
     let (sup_os, sup_cpu, sup_libc) =
         aube_manifest::effective_supported_architectures(manifest, workspace_config);
-    // aube-lock.yaml, pnpm-lock.yaml, and bun.lock are all committed,
-    // cross-platform artifacts that carry per-package os/cpu metadata:
-    // if the user hasn't declared `pnpm.supportedArchitectures` we
-    // widen the resolver's platform filter to cover every common
-    // OS/CPU/libc so Linux-native optionals (e.g.
-    // `@rollup/rollup-linux-x64-gnu`) land in the lockfile even when
-    // `aube install` is run on macOS, and macOS-native optionals
-    // (`@esbuild/darwin-arm64`) land in a Linux-CI-generated lockfile.
-    // pnpm and bun both do the same — they record every optional-dep
-    // variant regardless of host — so withholding them from the
-    // committed lockfile leaves cross-platform teammates with "Cannot
-    // find native binding" on install. Install-time filtering (see
-    // `filter_graph` call on the lockfile branch) still runs against
-    // the unmodified manifest setting, so `node_modules` stays trimmed
-    // to the host. Yarn / npm lockfiles don't carry per-package os/cpu
-    // metadata, so widening there would only bloat the lockfile — keep
-    // pnpm's host-only default for those.
+    // aube-lock.yaml, pnpm-lock.yaml, bun.lock, and package-lock.json
+    // are all committed, cross-platform artifacts that carry
+    // per-package os/cpu metadata: if the user hasn't declared
+    // `pnpm.supportedArchitectures` we widen the resolver's platform
+    // filter to cover every common OS/CPU/libc so Linux-native
+    // optionals (e.g. `@rollup/rollup-linux-x64-gnu`) land in the
+    // lockfile even when `aube install` is run on macOS, and
+    // macOS-native optionals (`@esbuild/darwin-arm64`) land in a
+    // Linux-CI-generated lockfile. pnpm, bun, and npm all do the same
+    // — they record every optional-dep variant regardless of host — so
+    // withholding them from the committed lockfile leaves
+    // cross-platform teammates with "Cannot find native binding" on
+    // install. For package-lock.json the stakes are higher still: a
+    // platform-mismatched *root* optional dependency (fsevents on
+    // Linux) that's missing from the lockfile makes `npm ci` refuse
+    // the whole install with EUSAGE "Missing: fsevents@x.y.z from lock
+    // file". Install-time filtering (see `filter_graph` call on the
+    // lockfile branch) still runs against the unmodified manifest
+    // setting, so `node_modules` stays trimmed to the host. Yarn
+    // classic lockfiles have no per-package os/cpu metadata, so
+    // widening there would only bloat the file — keep pnpm's host-only
+    // default for that one.
     let manifest_set_supported_arch =
         !(sup_os.is_empty() && sup_cpu.is_empty() && sup_libc.is_empty());
     let writes_cross_platform_lock = matches!(
@@ -725,6 +730,7 @@ pub(crate) fn configure_resolver(
             aube_lockfile::LockfileKind::Aube
                 | aube_lockfile::LockfileKind::Pnpm
                 | aube_lockfile::LockfileKind::Bun
+                | aube_lockfile::LockfileKind::Npm
         )
     );
     let supported_architectures = if !manifest_set_supported_arch && writes_cross_platform_lock {

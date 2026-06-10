@@ -43,14 +43,17 @@ pub struct SupportedArchitectures {
 }
 
 impl SupportedArchitectures {
-    /// Wide default used when resolving into `aube-lock.yaml` with no
-    /// user-declared `pnpm.supportedArchitectures`. Covers the common
-    /// npm OS / CPU / libc combinations so optional native deps for
-    /// every major platform land in the lockfile on a first resolve —
-    /// a project resolved on macOS installs correctly on Linux CI
-    /// without the user having to hand-edit their manifest. pnpm-lock
-    /// / yarn / npm outputs stay host-only (pnpm parity) so we don't
-    /// silently change the shape of a non-native lockfile.
+    /// Wide default used when resolving into a cross-platform lockfile
+    /// (`aube-lock.yaml`, `pnpm-lock.yaml`, `bun.lock`,
+    /// `package-lock.json`) with no user-declared
+    /// `pnpm.supportedArchitectures`. Covers the common npm OS / CPU /
+    /// libc combinations so optional native deps for every major
+    /// platform land in the lockfile on a first resolve — a project
+    /// resolved on macOS installs correctly on Linux CI without the
+    /// user having to hand-edit their manifest, matching what pnpm,
+    /// bun, and npm themselves record. Yarn classic output stays
+    /// host-only — its lockfile has no per-package os/cpu metadata to
+    /// carry the extra variants.
     ///
     /// darwin-x64 is not in the baseline matrix: Apple Silicon is the
     /// shipping Mac platform, and several major native package
