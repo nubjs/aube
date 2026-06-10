@@ -65,6 +65,7 @@ Aube generates this page from [`settings.toml`](https://github.com/jdx/aube/blob
 | [`maxsockets`](#setting-maxsockets) | `int` | Maximum concurrent connections per origin. |
 | [`strictSsl`](#setting-strictssl) | `bool` | Validate SSL certificates for HTTPS requests. |
 | [`lockfile`](#setting-lockfile) | `bool` | Read and generate aube-lock.yaml. |
+| [`defaultLockfileFormat`](#setting-defaultlockfileformat) | `"aube" \| "pnpm" \| "npm" \| "yarn" \| "bun"` | Lockfile format written when the project has no lockfile yet. |
 | [`lockfileDir`](#setting-lockfiledir) | `path` | Directory the lockfile is written to and read from. |
 | [`preferFrozenLockfile`](#setting-preferfrozenlockfile) | `bool` | Perform a headless install if the lockfile already satisfies package.json. |
 | [`lockfileIncludeTarballUrl`](#setting-lockfileincludetarballurl) | `bool` | Add the full tarball URL to each lockfile entry. |
@@ -1354,6 +1355,33 @@ combined with `lockfile=false` is rejected as a contradiction.
 Examples:
 
 - `echo 'lockfile=false' >> .npmrc && aube install`
+
+### `defaultLockfileFormat` {#setting-defaultlockfileformat}
+
+Lockfile format written when the project has no lockfile yet.
+
+- Type: `"aube" | "pnpm" | "npm" | "yarn" | "bun"`
+- Default: `"aube"`
+- Environment: `npm_config_default_lockfile_format`, `NPM_CONFIG_DEFAULT_LOCKFILE_FORMAT`, `AUBE_DEFAULT_LOCKFILE_FORMAT`
+- .npmrc keys: `defaultLockfileFormat`, `default-lockfile-format`
+- Workspace YAML keys: `defaultLockfileFormat`
+
+When a project already has a lockfile, aube preserves its format in
+place (`pnpm-lock.yaml` stays `pnpm-lock.yaml`, `package-lock.json`
+stays `package-lock.json`, and so on). This setting only controls the
+*fresh-project* case — which format the first install writes when no
+lockfile exists yet. The default is aube's own `aube-lock.yaml`.
+
+Set it to keep a foreign-format lockfile canonical even on fresh
+clones: e.g. `defaultLockfileFormat=pnpm` makes a no-lockfile install
+write `pnpm-lock.yaml`, so a team mixing aube with pnpm never ends up
+with `aube-lock.yaml` checked in by whoever installed first. `npm`
+selects `package-lock.json`, `yarn` selects classic `yarn.lock`, and
+`bun` selects the text-based `bun.lock`.
+
+Examples:
+
+- `echo 'defaultLockfileFormat=pnpm' >> .npmrc && aube install`
 
 ### `lockfileDir` {#setting-lockfiledir}
 

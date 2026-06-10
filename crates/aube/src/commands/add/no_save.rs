@@ -22,8 +22,8 @@ pub(super) struct Snapshot {
 /// resolver falls back to aube's own format.
 pub(super) fn lockfile_path_for_project(project_dir: &Path) -> PathBuf {
     use aube_lockfile::LockfileKind;
-    let kind =
-        aube_lockfile::detect_existing_lockfile_kind(project_dir).unwrap_or(LockfileKind::Aube);
+    let kind = aube_lockfile::detect_existing_lockfile_kind(project_dir)
+        .unwrap_or_else(|| crate::commands::default_lockfile_kind_for_cwd(project_dir));
     let filename = match kind {
         LockfileKind::Aube => aube_lockfile::aube_lock_filename(project_dir),
         LockfileKind::Pnpm => aube_lockfile::pnpm_lock_filename(project_dir),

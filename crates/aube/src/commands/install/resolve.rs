@@ -213,8 +213,10 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
             // `source_kind_before` means "we'll create the default
             // aube-lock.yaml", so the aube-native wide default
             // applies.
-            target_lockfile_kind: lockfile_enabled
-                .then(|| source_kind_before.unwrap_or(LockfileKind::Aube)),
+            target_lockfile_kind: lockfile_enabled.then(|| {
+                source_kind_before
+                    .unwrap_or_else(|| crate::commands::default_lockfile_kind(settings_ctx))
+            }),
             cache_full_packuments: true,
             ignore_scripts,
         },
@@ -258,7 +260,8 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
             }
         }
     }
-    let lo_write_kind = source_kind_before.unwrap_or(LockfileKind::Aube);
+    let lo_write_kind =
+        source_kind_before.unwrap_or_else(|| crate::commands::default_lockfile_kind(settings_ctx));
     // Same runtime-pin recording as the main install path.
     crate::runtime::refresh_lockfile_pin(
         &mut graph,
