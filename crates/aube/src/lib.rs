@@ -545,6 +545,13 @@ pub use aube_util::env::{EnvFamilies, set_env_families};
 /// before invoking any command.
 pub use aube_util::ua::set_user_agent_product;
 
+/// Lifecycle-script UA override for embedders, re-exported from
+/// `aube-util`: replace the product token of `npm_config_user_agent`
+/// alone, leaving the registry header and stream-time tool naming on
+/// the [`set_user_agent_product`] identity. Call once per process
+/// before invoking any command.
+pub use aube_util::ua::set_lifecycle_user_agent_product;
+
 /// Cache-root override for embedders, re-exported from `aube-util`:
 /// relocate the per-user cache root that defaults to
 /// `<XDG_CACHE_HOME>/aube` (packument caches, git clone cache,
@@ -568,6 +575,15 @@ pub use aube_manifest::workspace::set_workspace_yaml_names;
 /// (`overrides`, `resolutions`, `trustedDependencies`, …) are
 /// unaffected. Call once per process before invoking any command.
 pub use aube_manifest::set_manifest_config_namespaces;
+
+/// Canonical-lockfile filename override for embedders, re-exported
+/// from `aube-lockfile`: rename the file backing
+/// [`aube_lockfile::LockfileKind::Aube`] (default `aube-lock.yaml`).
+/// The configured name keeps the kind's top rank in lockfile
+/// detection; branch lockfiles and the `pnpm-lock.<branch>.yaml`
+/// mapping derive from it. Call once per process before invoking any
+/// command.
+pub use aube_lockfile::set_aube_lock_base_filename;
 
 /// `engines.aube` validation toggle for embedders — see
 /// [`engines::set_aube_engine_check`]. Defaults to enabled;
