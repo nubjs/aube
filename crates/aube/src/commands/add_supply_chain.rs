@@ -133,6 +133,12 @@ pub async fn run_gates(
 /// (paranoid → `Required`). Both gates internally short-circuit
 /// on `Off`, but skip the call entirely so an empty graph
 /// doesn't get a useless `transitive_registry_pairs` walk.
+///
+/// Returns whether an OSV gate actually covered this install (`true`
+/// = one of the three backends ran against the graph). The
+/// `defaultTrust` build-policy floor consults this: it only trusts a
+/// listed package when the advisory machinery vouched for the graph,
+/// so turning every advisory check off turns the floor off with it.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_post_resolve_osv_routing(
     cwd: &std::path::Path,
@@ -143,11 +149,12 @@ pub async fn run_post_resolve_osv_routing(
     advisory_check_on_install: AdvisoryCheckOnInstall,
     advisory_bloom_check: AdvisoryBloomCheck,
     advisory_check_every_install: bool,
-) -> miette::Result<()> {
+) -> miette::Result<bool> {
     let needs_live_api = osv_transitive_check || advisory_check_every_install || fresh_resolution;
     if needs_live_api {
         if !matches!(advisory_check, AdvisoryCheck::Off) {
             run_transitive_osv_gate(cwd, graph, advisory_check).await?;
+            return Ok(true);
         }
     } else if !matches!(advisory_bloom_check, AdvisoryBloomCheck::Off) {
         // Bloom preferred over the local-mirror fallback when both
@@ -157,10 +164,12 @@ pub async fn run_post_resolve_osv_routing(
         // hit produces the identical `ERR_AUBE_MALICIOUS_PACKAGE`
         // either way.
         run_transitive_osv_gate_via_bloom(cwd, graph, advisory_bloom_check).await?;
+        return Ok(true);
     } else if !matches!(advisory_check_on_install, AdvisoryCheckOnInstall::Off) {
         run_transitive_osv_gate_via_mirror(cwd, graph, advisory_check_on_install).await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Live-API transitive OSV `MAL-*` check.

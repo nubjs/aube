@@ -163,6 +163,23 @@ impl BuildPolicy {
         )
     }
 
+    /// Switch this policy into allow-all mode while keeping its
+    /// explicit deny entries — the same shape [`Self::denylist`]
+    /// builds. `decide` checks denies before the allow-all
+    /// short-circuit, so `false` entries keep winning.
+    ///
+    /// This is the `dangerouslyAllowAllBuilds` composition for callers
+    /// whose documented precedence puts explicit per-package entries
+    /// above the allow-all posture (e.g. the `defaultTrust` floor's
+    /// chain: explicit entry > allow-all > floor > default deny).
+    /// [`Self::from_config`]'s allow-all short-circuit — which drops
+    /// `false` entries to mirror pnpm's `createAllowBuildFunction` —
+    /// stays the default behavior.
+    pub fn allow_all_except_denied(mut self) -> Self {
+        self.allow_all = true;
+        self
+    }
+
     /// Build an allow-all policy with explicit package-pattern denies.
     pub fn denylist(denied_patterns: &[String]) -> (Self, Vec<BuildPolicyError>) {
         let mut denied = HashSet::new();
@@ -474,6 +491,17 @@ mod tests {
         let (p, errs) = BuildPolicy::from_config(&map, &[], &[], true);
         assert!(errs.is_empty());
         assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Allow);
+    }
+
+    #[test]
+    fn allow_all_except_denied_keeps_explicit_false_entries_winning() {
+        // The composition used when the defaultTrust floor is active:
+        // dangerously-allow-all still runs everything *except* what
+        // the user explicitly carved out with `false`.
+        let p = policy(&[("esbuild", false), ("@babel/*", false)]).allow_all_except_denied();
+        assert_eq!(p.decide("anything-else", "1.0.0"), AllowDecision::Allow);
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Deny);
+        assert_eq!(p.decide("@babel/core", "7.0.0"), AllowDecision::Deny);
     }
 
     #[test]

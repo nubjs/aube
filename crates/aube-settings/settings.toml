@@ -2292,6 +2292,33 @@ examples = ["aube install --dangerously-allow-all-builds"]
 # spelling without simplifying any call site.
 typedAccessorUnused = true
 
+[defaultTrust]
+description = "Let a curated default-trust list run build scripts for well-known packages."
+type = "bool"
+default = "false"
+docs = """
+Opt-in floor under the `allowBuilds` allowlist. When enabled, a
+dependency whose build scripts would otherwise be skipped as
+unreviewed may still run them if every gate holds: the package's
+registry name is on the vendored default-trust list (Bun's curated
+`default-trusted-dependencies.txt`, provenance recorded in the data
+file), the package resolved from a registry (git / file / link /
+tarball sources never qualify), an OSV `MAL-*` advisory gate covered
+this install, and the resolved version has aged past the
+`minimumReleaseAge` window (per its recorded publish time; an unknown
+publish time fails closed). Explicit `allowBuilds` entries always win
+in both directions — `false` carves a package out of the floor — and
+with the floor active an explicit `false` is also honored under
+`dangerouslyAllowAllBuilds`. Disabling any consulted gate
+(`advisoryCheck` family all `off`, or `minimumReleaseAge = 0`)
+disables the floor with it: the floor consults those defenses, it
+never substitutes for them.
+"""
+sources.cli = []
+sources.env = ["npm_config_default_trust", "NPM_CONFIG_DEFAULT_TRUST", "AUBE_DEFAULT_TRUST"]
+sources.npmrc = ["defaultTrust"]
+examples = []
+
 # ========================================= Node.js =========================================
 
 [nodeVersion]

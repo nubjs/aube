@@ -23,6 +23,7 @@ pub(super) struct FinalizePhaseInput<'a> {
     pub(super) deprecations:
         &'a std::sync::Arc<std::sync::Mutex<Vec<crate::deprecations::DeprecationRecord>>>,
     pub(super) build_policy: &'a aube_scripts::BuildPolicy,
+    pub(super) default_trust_floor: &'a super::default_trust::DefaultTrustFloor,
     pub(super) jail_policy: &'a JailBuildPolicy,
     pub(super) stats: &'a aube_linker::LinkStats,
     pub(super) node_linker: aube_linker::NodeLinker,
@@ -61,6 +62,7 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
         direct_dep_info,
         deprecations,
         build_policy,
+        default_trust_floor,
         jail_policy,
         stats,
         node_linker,
@@ -107,6 +109,7 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             aube_dir,
             graph_for_link,
             build_policy,
+            default_trust_floor,
             virtual_store_dir_max_length,
             placements_ref,
         )?;
@@ -135,7 +138,12 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
     //     global store so two projects resolving the same
     //     `(dep-graph, engine)` share a safe directory and divergent
     //     resolutions land at distinct paths.
-    if !ignore_scripts && build_policy.has_any_allow_rule() && !virtual_store_only {
+    // The `defaultTrust` floor can allow builds even when the policy
+    // itself has no allow rules, so it keeps the phase alive too.
+    if !ignore_scripts
+        && (build_policy.has_any_allow_rule() || default_trust_floor.may_allow_any())
+        && !virtual_store_only
+    {
         let phase_start = std::time::Instant::now();
         let side_effects_cache_root =
             side_effects_cache_setting.then(|| side_effects_cache_root(store));
@@ -155,6 +163,7 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             aube_dir,
             graph_for_link,
             build_policy,
+            default_trust_floor,
             virtual_store_dir_max_length,
             child_concurrency,
             placements_ref,
@@ -218,6 +227,7 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             aube_dir,
             graph_for_link,
             build_policy,
+            default_trust_floor,
             virtual_store_dir_max_length,
             placements_ref,
         )?

@@ -367,6 +367,10 @@ pub(crate) async fn run_dep_lifecycle_scripts(
     aube_dir: &std::path::Path,
     graph: &aube_lockfile::LockfileGraph,
     policy: &aube_scripts::BuildPolicy,
+    // The `defaultTrust` floor, consulted only when `policy` leaves a
+    // package `Unspecified`. Pass `DefaultTrustFloor::disabled()` on
+    // paths that must never floor (rebuild).
+    floor: &super::default_trust::DefaultTrustFloor,
     virtual_store_dir_max_length: usize,
     child_concurrency: usize,
     placements: Option<&aube_linker::HoistedPlacements>,
@@ -402,7 +406,13 @@ pub(crate) async fn run_dep_lifecycle_scripts(
     }
 
     let mut jobs: Vec<BuildJob> = Vec::new();
+    let mut floor_trusted: Vec<String> = Vec::new();
     for (dep_path, pkg) in &graph.packages {
+        // True when this package runs only because the `defaultTrust`
+        // floor vouched for it (policy said `Unspecified`). Recorded
+        // alongside the job so the floor is never silent about what
+        // it let through.
+        let mut via_floor = false;
         if let Some(selected) = selected_names {
             // Selective mode: user named this dep explicitly, so
             // bypass the policy. Match by `pkg.name` (the in-tree
@@ -417,9 +427,13 @@ pub(crate) async fn run_dep_lifecycle_scripts(
             // `h3` would miss if we checked against the alias. Attacker
             // writes `"h3-safe": "npm:h3@0.19.0"` to sneak a denied pkg
             // through the allowlist. registry_name() strips alias back to
-            // real name.
+            // real name. `decide_with_floor` consults the `defaultTrust`
+            // floor only on `Unspecified`, so explicit entries always win.
             match policy.decide(pkg.registry_name(), &pkg.version) {
                 aube_scripts::AllowDecision::Allow => {}
+                aube_scripts::AllowDecision::Unspecified if floor.trusts(pkg, &graph.times) => {
+                    via_floor = true;
+                }
                 aube_scripts::AllowDecision::Deny | aube_scripts::AllowDecision::Unspecified => {
                     continue;
                 }
@@ -492,6 +506,9 @@ pub(crate) async fn run_dep_lifecycle_scripts(
             .map(|root| SideEffectsCacheEntry::new(root, &pkg.name, &pkg.version, &package_dir))
             .transpose()?;
         let dep_modules_dir = dep_modules_dir_for(&package_dir, &pkg.name);
+        if via_floor {
+            floor_trusted.push(pkg.spec_key());
+        }
         jobs.push(BuildJob {
             name: pkg.name.clone(),
             registry_name: pkg.registry_name().to_string(),
@@ -505,6 +522,17 @@ pub(crate) async fn run_dep_lifecycle_scripts(
 
     if jobs.is_empty() {
         return Ok(0);
+    }
+
+    // Name what the floor let through — the floor must never be a
+    // silent allow path. One line, not per-package, so big graphs
+    // don't drown the install output.
+    if !floor_trusted.is_empty() {
+        tracing::info!(
+            "defaultTrust: running build scripts for {} default-trusted package(s): {}",
+            floor_trusted.len(),
+            floor_trusted.join(", ")
+        );
     }
 
     // Bootstrap node-gyp once before the fan-out when the ambient
@@ -1098,13 +1126,18 @@ pub(super) fn unreviewed_dep_builds(
     aube_dir: &std::path::Path,
     graph: &aube_lockfile::LockfileGraph,
     policy: &aube_scripts::BuildPolicy,
+    floor: &super::default_trust::DefaultTrustFloor,
     virtual_store_dir_max_length: usize,
     placements: Option<&aube_linker::HoistedPlacements>,
 ) -> miette::Result<Vec<UnreviewedBuild>> {
     let mut unreviewed = Vec::new();
     for (dep_path, pkg) in &graph.packages {
+        // A package the `defaultTrust` floor vouches for is not
+        // unreviewed — its scripts ran. Same decision seam as
+        // `run_dep_lifecycle_scripts` so the warning and the runner
+        // can never disagree about a package's status.
         if !matches!(
-            policy.decide(pkg.registry_name(), &pkg.version),
+            super::default_trust::decide_with_floor(policy, floor, pkg, &graph.times),
             aube_scripts::AllowDecision::Unspecified
         ) {
             continue;

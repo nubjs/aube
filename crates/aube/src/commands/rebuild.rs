@@ -182,6 +182,10 @@ pub async fn run(
                 &aube_dir,
                 &graph,
                 &policy,
+                // No defaultTrust floor on rebuild: no advisory gate
+                // runs here, and `aube rebuild <name>` already
+                // bypasses the policy for explicitly named packages.
+                &super::install::DefaultTrustFloor::disabled(),
                 super::resolve_virtual_store_dir_max_length(&settings_ctx),
                 child_concurrency,
                 hoisted_placements.as_ref(),

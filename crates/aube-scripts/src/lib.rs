@@ -13,6 +13,7 @@
 //! - `--ignore-scripts` forces everything off, matching pnpm/npm.
 
 pub mod content_sniff;
+pub mod default_trust;
 pub mod policy;
 
 #[cfg(target_os = "linux")]
@@ -22,6 +23,7 @@ mod linux_jail;
 mod windows_job;
 
 pub use content_sniff::{Suspicion, SuspicionKind, sniff_lifecycle};
+pub use default_trust::is_default_trusted;
 pub use policy::{AllowDecision, BuildPolicy, BuildPolicyError, pattern_matches};
 
 use aube_manifest::PackageJson;
