@@ -12,6 +12,26 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == "pnpm-lock.yaml");
+    // pnpm never records workspace members in `packages:`/`snapshots:`;
+    // the consuming importer carries `version: link:<dir relative to
+    // that importer>` with the manifest's `workspace:` specifier
+    // preserved. The resolver's workspace-link path records such deps
+    // with a registry-style `name@version` dep_path and no package
+    // entry, so recover each member's directory from the sibling
+    // importers' manifests (read best-effort from disk, same pattern
+    // as the bun writer). Key: `name@version` → importer path.
+    let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut workspace_member_dirs: BTreeMap<String, String> = BTreeMap::new();
+    for importer_path in graph.importers.keys() {
+        if importer_path == "." {
+            continue;
+        }
+        let pj_path = project_dir.join(importer_path).join("package.json");
+        let pj = PackageJson::from_path(&pj_path).unwrap_or_default();
+        if let (Some(name), Some(version)) = (pj.name, pj.version) {
+            workspace_member_dirs.insert(format!("{name}@{version}"), importer_path.clone());
+        }
+    }
     let mut importers = BTreeMap::new();
     let exclude_links = graph.settings.exclude_links_from_lockfile;
     for (importer_path, deps) in &graph.importers {
@@ -25,14 +45,23 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             // DirectDep only carries the manifest-written range, not
             // the resolved source kind — the LocalSource lives on the
             // LockedPackage the dep_path points to.
+            // Workspace-linked deps carry no package entry — match
+            // them by `name@version` against the sibling importers.
+            // Their importer line is `link:`-shaped like any other
+            // link, so `excludeLinksFromLockfile: true` drops them
+            // too (pnpm parity).
+            let workspace_link_dir = (!graph.packages.contains_key(&dep.dep_path))
+                .then(|| workspace_member_dirs.get(&dep.dep_path))
+                .flatten();
             if exclude_links
-                && matches!(
-                    graph
-                        .packages
-                        .get(&dep.dep_path)
-                        .and_then(|p| p.local_source.as_ref()),
-                    Some(LocalSource::Link(_))
-                )
+                && (workspace_link_dir.is_some()
+                    || matches!(
+                        graph
+                            .packages
+                            .get(&dep.dep_path)
+                            .and_then(|p| p.local_source.as_ref()),
+                        Some(LocalSource::Link(_))
+                    ))
             {
                 continue;
             }
@@ -66,7 +95,22 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 .get(&dep.dep_path)
                 .and_then(|p| p.local_source.as_ref())
             {
-                local.specifier()
+                // `link:` paths are stored project-root-relative on
+                // the graph (the parser rebases them); pnpm renders
+                // them relative to the consuming importer
+                // (`link:../core` from `packages/app`). `file:` paths
+                // stay root-relative — that's pnpm's own shape.
+                match local {
+                    LocalSource::Link(_) if importer_path != "." => {
+                        format!(
+                            "link:{}",
+                            link_from_importer(importer_path, &local.path_posix())
+                        )
+                    }
+                    _ => local.specifier(),
+                }
+            } else if let Some(member_dir) = workspace_link_dir {
+                format!("link:{}", link_from_importer(importer_path, member_dir))
             } else if native_pnpm_aliases
                 && let Some(pkg) = graph.packages.get(&dep.dep_path)
                 && let Some(real_name) = pkg.alias_of.as_deref()
@@ -624,6 +668,38 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
     // atomic_write_lockfile for full rationale.
     crate::atomic_write_lockfile(path, yaml.as_bytes())?;
     Ok(())
+}
+
+/// Render a project-root-relative directory as a `link:` target
+/// relative to the consuming importer, the way pnpm writes importer
+/// `version:` values (`packages/app` → `packages/core` renders as
+/// `../core`; the root importer keeps `packages/core` as-is). Pure
+/// lexical computation over `/`-separated components — both inputs are
+/// normalized root-relative paths, so no filesystem access is needed.
+fn link_from_importer(importer_path: &str, target_posix: &str) -> String {
+    if importer_path == "." {
+        return target_posix.to_string();
+    }
+    let from: Vec<&str> = importer_path
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let to: Vec<&str> = target_posix
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend(&to[common..]);
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
 }
 
 fn registry_tarball_url_is_not_derivable(

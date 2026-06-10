@@ -1605,6 +1605,139 @@ fn test_write_byte_identical_to_native_pnpm() {
     }
 }
 
+// pnpm never records workspace members in `packages:`/`snapshots:` —
+// the consuming importer carries `version: link:<dir>` with the path
+// relative to *that importer* and the manifest's `workspace:` specifier
+// preserved (verified against pnpm 10.15.1). The resolver's
+// workspace-link path records such deps with a registry-style
+// `name@version` dep_path and no package entry, so the writer has to
+// recover the member's directory from the sibling importer's manifest.
+#[test]
+fn workspace_deps_write_importer_relative_link_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+    for (rel, body) in [
+        ("packages/app", r#"{"name": "@ws/app", "version": "1.0.0"}"#),
+        (
+            "packages/core",
+            r#"{"name": "@ws/core", "version": "1.0.0"}"#,
+        ),
+    ] {
+        let pkg_dir = dir.path().join(rel);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("package.json"), body).unwrap();
+    }
+
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "ms@2.1.3".to_string(),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            integrity: Some("sha512-abc==".to_string()),
+            dep_path: "ms@2.1.3".to_string(),
+            ..Default::default()
+        },
+    );
+    let mut importers = BTreeMap::new();
+    importers.insert(".".to_string(), vec![]);
+    importers.insert(
+        "packages/app".to_string(),
+        vec![
+            DirectDep {
+                name: "@ws/core".to_string(),
+                dep_path: "@ws/core@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("workspace:^".to_string()),
+            },
+            DirectDep {
+                name: "ms".to_string(),
+                dep_path: "ms@2.1.3".to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("^2.1.3".to_string()),
+            },
+        ],
+    );
+    importers.insert("packages/core".to_string(), vec![]);
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let manifest = PackageJson {
+        name: Some("ws-root".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+
+    write(&lockfile_path, &graph, &manifest).unwrap();
+    let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
+
+    assert!(
+        yaml.contains("version: link:../core"),
+        "workspace dep must render as link relative to the consuming importer: {yaml}"
+    );
+    assert!(
+        !yaml.contains("version: 1.0.0"),
+        "workspace dep must not be recorded as a registry version: {yaml}"
+    );
+    assert!(
+        !yaml.contains("'@ws/core@1.0.0'") && !yaml.contains("@ws/core@1.0.0:"),
+        "workspace member must not appear in packages/snapshots: {yaml}"
+    );
+
+    // The reader synthesizes the member back as a root-relative link,
+    // and a re-write stays byte-stable.
+    let reparsed = parse(&lockfile_path).unwrap();
+    let member = reparsed
+        .packages
+        .values()
+        .find(|p| p.name == "@ws/core")
+        .expect("reparsed graph must carry the workspace member as a link");
+    assert_eq!(
+        member.local_source,
+        Some(LocalSource::Link("packages/core".into()))
+    );
+    let rewrite_path = dir.path().join("pnpm-lock-2.yaml");
+    write(&rewrite_path, &reparsed, &manifest).unwrap();
+    assert_eq!(
+        yaml,
+        std::fs::read_to_string(&rewrite_path).unwrap(),
+        "fresh-resolve and reparsed graphs must serialize identically"
+    );
+}
+
+// Same property at the whole-file level: a workspace lockfile written
+// by native pnpm 10.15.1 (fixture generated from a real install) must
+// survive parse → write byte-identically — in particular the
+// importer-relative `link:../<dir>` versions, which the graph stores
+// root-relative internally.
+#[test]
+fn workspace_lockfile_round_trips_byte_identical_to_native_pnpm() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pnpm-native-workspace.yaml");
+    let original = std::fs::read_to_string(&fixture)
+        .unwrap()
+        .replace("\r\n", "\n");
+
+    let graph = parse(&fixture).unwrap();
+    let manifest = PackageJson {
+        name: Some("workspace-fixture".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("pnpm-lock.yaml");
+    write(&out, &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(&out).unwrap();
+
+    if written != original {
+        let diff = similar_diff(&original, &written);
+        panic!("pnpm writer drifted from native pnpm workspace output:\n{diff}");
+    }
+}
+
 // Minimal line diff for the byte-parity test failure message. We don't
 // pull in a diff crate just for this — the lockfile is small enough
 // that a line-by-line comparison is readable.
