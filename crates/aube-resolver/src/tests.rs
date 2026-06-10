@@ -2213,7 +2213,7 @@ fn hoist_auto_installed_peers_hoists_unmet_peers_to_importer() {
         packages,
         ..Default::default()
     };
-    let hoisted = hoist_auto_installed_peers(graph);
+    let (hoisted, _) = hoist_auto_installed_peers(graph);
     let root = hoisted.importers.get(".").unwrap();
 
     // Sorted by name → [consumer, react].
@@ -2261,7 +2261,7 @@ fn hoist_auto_installed_peers_does_not_hoist_transitive_peers_to_importer() {
         packages,
         ..Default::default()
     };
-    let hoisted = hoist_auto_installed_peers(graph);
+    let (hoisted, _) = hoist_auto_installed_peers(graph);
     let root = hoisted.importers.get(".").unwrap();
 
     assert_eq!(root.len(), 1);
@@ -2304,7 +2304,7 @@ fn hoist_auto_installed_peers_does_not_hoist_auto_peer_peers_to_importer() {
         packages,
         ..Default::default()
     };
-    let hoisted = hoist_auto_installed_peers(graph);
+    let (hoisted, _) = hoist_auto_installed_peers(graph);
     let root = hoisted.importers.get(".").unwrap();
 
     assert_eq!(root.len(), 2);
@@ -2353,7 +2353,7 @@ fn hoist_auto_installed_peers_leaves_already_satisfied_peers_alone() {
         packages,
         ..Default::default()
     };
-    let hoisted = hoist_auto_installed_peers(graph);
+    let (hoisted, _) = hoist_auto_installed_peers(graph);
     let root = hoisted.importers.get(".").unwrap();
 
     // Still just the two original entries — no extra react snuck in.
@@ -2362,6 +2362,60 @@ fn hoist_auto_installed_peers_leaves_already_satisfied_peers_alone() {
     // The user's own pin (17.0.2) survives — not clobbered by the
     // peer range.
     assert_eq!(react_dep.specifier.as_deref(), Some("17.0.2"));
+}
+
+// The hoist is scaffolding for the peer-context pass; once stripped,
+// the importer must mirror the manifest exactly — pnpm 10 never writes
+// auto-installed peers as importer specifiers (`pnpm install
+// --frozen-lockfile` rejects a lockfile that has them), and the
+// resolved peer must survive in `packages` for snapshot wiring.
+#[test]
+fn remove_auto_installed_peers_restores_manifest_shaped_importers() {
+    let mut consumer = mk_locked(
+        "consumer",
+        "1.0.0",
+        &[("react", "18.2.0")],
+        &[("react", "^17 || ^18")],
+    );
+    consumer.dep_path = "consumer@1.0.0".to_string();
+    let react = mk_locked("react", "18.2.0", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    packages.insert("consumer@1.0.0".to_string(), consumer);
+    packages.insert("react@18.2.0".to_string(), react);
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "consumer".to_string(),
+            dep_path: "consumer@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^1".to_string()),
+        }],
+    );
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let (mut hoisted, auto_installed) = hoist_auto_installed_peers(graph);
+
+    // The hoist reports exactly what it added: react into ".".
+    assert_eq!(auto_installed.len(), 1, "expected one importer touched");
+    assert!(auto_installed.get(".").unwrap().contains("react"));
+    assert_eq!(hoisted.importers.get(".").unwrap().len(), 2);
+
+    remove_auto_installed_peers(&mut hoisted, &auto_installed);
+
+    // Importer is back to the manifest's single direct dep…
+    let root = hoisted.importers.get(".").unwrap();
+    assert_eq!(root.len(), 1, "auto-installed peer must not stay hoisted");
+    assert_eq!(root[0].name, "consumer");
+    // …while the resolved peer stays in the package graph for the
+    // peer-context/snapshot wiring.
+    assert!(hoisted.packages.contains_key("react@18.2.0"));
 }
 
 // `detect_unmet_peers` should flag a package whose declared peer

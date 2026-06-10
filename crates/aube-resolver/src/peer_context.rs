@@ -2,10 +2,16 @@
 //!
 //! Two user-visible passes live here:
 //!
-//! * [`hoist_auto_installed_peers`] — promotes peers declared by direct
-//!   dependencies up to importer direct deps, matching pnpm's
-//!   `auto-install-peers=true` behavior. Idempotent on graphs that already
-//!   ship with those hoists (npm v7+ output, lockfile-driven installs).
+//! * [`hoist_auto_installed_peers`] — temporarily promotes peers declared
+//!   by direct dependencies up to importer direct deps so the passes that
+//!   walk importer scopes (peer-context resolution, reachability-based
+//!   graph filtering) see them the way pnpm's `auto-install-peers=true`
+//!   resolution does. The additions are scaffolding, not output: callers
+//!   strip them again with [`remove_auto_installed_peers`] once those
+//!   passes have run, because pnpm never serializes auto-installed peers
+//!   into the lockfile's `importers:` section or links them into the
+//!   project's top-level `node_modules/`. Idempotent on graphs that
+//!   already ship with those hoists (npm v7+ output).
 //! * [`apply_peer_contexts`] — computes pnpm-style `(peer@ver)` suffixes
 //!   on contextualized `dep_path`s. Drives the sibling-symlink wiring in
 //!   `aube-linker` so each subtree that pins different peer versions gets
@@ -15,7 +21,8 @@
 //! up, so the CLI can surface warnings.
 //!
 //! Call order from `Resolver::resolve`: `hoist_auto_installed_peers`
-//! (fresh resolves only) → `apply_peer_contexts` → `detect_unmet_peers`.
+//! (fresh resolves only) → `apply_peer_contexts` →
+//! `remove_auto_installed_peers` → `detect_unmet_peers`.
 
 use crate::version_satisfies;
 use crate::{FxHashMap, FxHashSet};
@@ -95,18 +102,34 @@ pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
     unmet
 }
 
-/// Promote direct dependencies' unmet peers to importer direct deps.
+/// Per-importer names of the peers [`hoist_auto_installed_peers`]
+/// synthesized into that importer's direct deps. Key: importer path.
+/// Feed back into [`remove_auto_installed_peers`] after the passes
+/// that needed the hoisted entries have run.
+pub type AutoInstalledPeers = BTreeMap<String, BTreeSet<String>>;
+
+/// Temporarily promote direct dependencies' unmet peers to importer
+/// direct deps, returning the graph plus a record of what was added.
 ///
 /// Walks each importer's direct dependencies and hoists any peer they
 /// declare that isn't already a direct dep of the importer up to the
-/// importer's `dependencies` list — what pnpm's
-/// `auto-install-peers=true` produces in its v9 lockfile. Peers declared by
-/// transitive dependencies stay in the resolved graph for peer-context
-/// sibling wiring, but they are not surfaced as top-level
-/// `node_modules/<peer>` entries.
+/// importer's `dependencies` list — mirroring how pnpm's
+/// `auto-install-peers=true` resolution treats missing peers as if the
+/// root had requested them. The hoisted entries exist so that
+/// [`apply_peer_contexts`] can resolve peers from the importer scope and
+/// so reachability-based passes (`platform::filter_graph`'s GC) keep
+/// peer-only packages alive. They are *not* part of the final graph:
+/// pnpm never records auto-installed peers as importer specifiers in
+/// `pnpm-lock.yaml` (a lockfile that carries them fails
+/// `pnpm install --frozen-lockfile` with `ERR_PNPM_OUTDATED_LOCKFILE`)
+/// and never links them into the project's top-level `node_modules/`,
+/// so callers must strip the additions with
+/// [`remove_auto_installed_peers`] once the peer-context pass has run.
+/// Peers declared by transitive dependencies stay in the resolved graph
+/// for peer-context sibling wiring and are never hoisted at all.
 ///
 /// Public so lockfile-driven installs that need to re-derive peer
-/// wiring (npm/yarn/bun formats, which don't record peer contexts)
+/// wiring (npm/bun formats, which don't record peer contexts)
 /// can run this before [`apply_peer_contexts`] to match fresh-resolve
 /// behavior. Idempotent in the npm case: npm v7+ already hoists
 /// auto-installed peers into root's `dependencies`, so they arrive
@@ -127,7 +150,8 @@ pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
 ///
 /// Leaves everything else about the graph untouched — no packages are
 /// added or removed, only importer entries grow.
-pub fn hoist_auto_installed_peers(mut graph: LockfileGraph) -> LockfileGraph {
+pub fn hoist_auto_installed_peers(mut graph: LockfileGraph) -> (LockfileGraph, AutoInstalledPeers) {
+    let mut hoisted_names: AutoInstalledPeers = BTreeMap::new();
     let importer_paths: Vec<String> = graph.importers.keys().cloned().collect();
     for importer_path in importer_paths {
         let Some(direct_deps) = graph.importers.get(&importer_path) else {
@@ -210,13 +234,35 @@ pub fn hoist_auto_installed_peers(mut graph: LockfileGraph) -> LockfileGraph {
                 additions.len(),
                 importer_path
             );
+            hoisted_names.insert(
+                importer_path.clone(),
+                additions.iter().map(|d| d.name.clone()).collect(),
+            );
             if let Some(deps) = graph.importers.get_mut(&importer_path) {
                 deps.extend(additions);
                 deps.sort_by(|a, b| a.name.cmp(&b.name));
             }
         }
     }
-    graph
+    (graph, hoisted_names)
+}
+
+/// Strip the importer entries [`hoist_auto_installed_peers`] synthesized,
+/// once the peer-context and graph-filter passes that needed them have
+/// run.
+///
+/// This is what keeps the final graph's `importers` a faithful mirror of
+/// the manifests: auto-installed peers stay resolved in `packages` (and
+/// in each consumer's peer-suffixed snapshot), but they never serialize
+/// as importer specifiers and never get a top-level `node_modules/<peer>`
+/// link — matching pnpm 10. Removing by name is safe because the hoist
+/// only adds names the importer didn't already have.
+pub fn remove_auto_installed_peers(graph: &mut LockfileGraph, hoisted: &AutoInstalledPeers) {
+    for (importer_path, names) in hoisted {
+        if let Some(deps) = graph.importers.get_mut(importer_path) {
+            deps.retain(|d| !names.contains(&d.name));
+        }
+    }
 }
 
 /// Walk the resolved graph top-down from each importer and compute a
