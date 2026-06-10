@@ -17,10 +17,11 @@ use std::path::{Path, PathBuf};
 /// rewrite is skipped entirely when nothing structural changes —
 /// mirrors the no-op-skip guarantee of [`edit_workspace_yaml`].
 ///
-/// Walking both namespaces matters because the read side merges them
-/// (`aube.*` wins on conflict), so an entry recorded in either
-/// location is live; a one-namespace removal would leave a stale
-/// duplicate behind.
+/// Walking every configured namespace matters because the read side
+/// merges them (`aube.*` wins on conflict), so an entry recorded in
+/// either location is live; a one-namespace removal would leave a
+/// stale duplicate behind. Namespaces excluded via
+/// [`crate::set_manifest_config_namespaces`] are never touched.
 pub fn remove_setting_entry(cwd: &Path, key: &str, entry_key: &str) -> Result<bool, crate::Error> {
     let path = cwd.join("package.json");
     if !path.exists() {
@@ -34,7 +35,7 @@ pub fn remove_setting_entry(cwd: &Path, key: &str, entry_key: &str) -> Result<bo
     let before = obj.clone();
 
     let mut existed = false;
-    for ns in ["pnpm", "aube"] {
+    for ns in crate::manifest_config_namespaces() {
         let mut ns_empty = false;
         if let Some(ns_obj) = obj.get_mut(ns).and_then(|v| v.as_object_mut()) {
             if let Some(inner) = ns_obj.get_mut(key).and_then(|v| v.as_object_mut()) {
@@ -99,8 +100,9 @@ where
     // Build the merged view (pnpm first, aube overrides on conflict)
     // before mutating, so the closure sees the same map the install
     // path would.
+    let namespaces = crate::manifest_config_namespaces();
     let mut merged: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    for ns in ["pnpm", "aube"] {
+    for ns in namespaces {
         if let Some(inner) = obj
             .get(ns)
             .and_then(serde_json::Value::as_object)
@@ -115,22 +117,31 @@ where
 
     f(&mut merged);
 
-    let chosen_ns = if obj.contains_key("pnpm") {
-        "pnpm"
-    } else {
-        "aube"
-    };
-    let other_ns = if chosen_ns == "pnpm" { "aube" } else { "pnpm" };
+    // First configured namespace already declared in the manifest, or
+    // the last one as the fresh default — with the stock `["pnpm",
+    // "aube"]` list that's the original rule: `pnpm` if a `pnpm`
+    // object exists, `aube` otherwise.
+    let chosen_ns = namespaces
+        .iter()
+        .find(|ns| obj.contains_key(ns.as_str()))
+        .unwrap_or_else(|| {
+            // Non-empty by construction: `set_manifest_config_namespaces`
+            // rejects empty lists and the default has two entries.
+            namespaces.last().expect("namespace list is never empty")
+        })
+        .as_str();
 
-    // Drop `<key>` from the other namespace so the post-write state
-    // has one source of truth.
-    let mut other_ns_empty_after = false;
-    if let Some(other_obj) = obj.get_mut(other_ns).and_then(|v| v.as_object_mut()) {
-        other_obj.remove(key);
-        other_ns_empty_after = other_obj.is_empty();
-    }
-    if other_ns_empty_after {
-        obj.remove(other_ns);
+    // Drop `<key>` from every other configured namespace so the
+    // post-write state has one source of truth.
+    for other_ns in namespaces.iter().filter(|ns| ns.as_str() != chosen_ns) {
+        let mut other_ns_empty_after = false;
+        if let Some(other_obj) = obj.get_mut(other_ns).and_then(|v| v.as_object_mut()) {
+            other_obj.remove(key);
+            other_ns_empty_after = other_obj.is_empty();
+        }
+        if other_ns_empty_after {
+            obj.remove(other_ns);
+        }
     }
 
     // Write merged into the chosen namespace, or scrub it if empty.

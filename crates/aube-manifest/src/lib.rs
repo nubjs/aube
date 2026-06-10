@@ -5,6 +5,46 @@ pub use workspace::{JailBuildPermission, WorkspaceConfig};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+const DEFAULT_MANIFEST_CONFIG_NAMESPACES: &[&str] = &["pnpm", "aube"];
+
+static MANIFEST_CONFIG_NAMESPACES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Override which top-level `package.json` objects aube reads (and
+/// writes) workspace-level config from, in precedence order —
+/// later entries win on key conflict for map-shaped settings.
+/// Defaults to `["pnpm", "aube"]`.
+///
+/// For embedders that present a different brand surface: a tool
+/// driving aube's command layer as a library can restrict the list to
+/// `["pnpm"]`, so an `aube` object some other tool left in a manifest
+/// is neither consulted nor mutated by the embedding product.
+/// Top-level compatibility keys (`overrides`, `resolutions`,
+/// `trustedDependencies`, `patchedDependencies`, `dependenciesMeta`)
+/// are independent of this list.
+///
+/// Idempotent — second calls and calls after the first read are
+/// silently ignored, matching the other process-global `set_*`
+/// helpers. Empty lists are ignored: at least one namespace must
+/// remain for config reads and writes to land somewhere.
+pub fn set_manifest_config_namespaces(names: &[&str]) {
+    if names.is_empty() {
+        return;
+    }
+    let _ = MANIFEST_CONFIG_NAMESPACES.set(names.iter().map(|s| s.to_string()).collect());
+}
+
+/// The `package.json` config namespaces currently in effect, lowest
+/// precedence first.
+pub fn manifest_config_namespaces() -> &'static [String] {
+    MANIFEST_CONFIG_NAMESPACES.get_or_init(|| {
+        DEFAULT_MANIFEST_CONFIG_NAMESPACES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    })
+}
 
 /// Deserialize `engines` tolerant to legacy non-map forms, e.g.
 /// `extsprintf@1.4.1` ships `"engines": ["node >=0.6.0"]` and some
@@ -383,13 +423,14 @@ impl PackageJson {
     /// key conflict; callers that union lists get both sources
     /// included. Aube mirrors every `pnpm.*` config key under an
     /// `aube.*` alias so projects can declare aube-native config
-    /// without piggy-backing on the pnpm namespace.
+    /// without piggy-backing on the pnpm namespace. The namespace set
+    /// follows [`set_manifest_config_namespaces`] overrides.
     fn pnpm_aube_objects(
         &self,
     ) -> impl Iterator<Item = &serde_json::Map<String, serde_json::Value>> {
-        ["pnpm", "aube"]
-            .into_iter()
-            .filter_map(|k| self.extra.get(k).and_then(|v| v.as_object()))
+        manifest_config_namespaces()
+            .iter()
+            .filter_map(|k| self.extra.get(k.as_str()).and_then(|v| v.as_object()))
     }
 
     /// Extract the `pnpm.allowBuilds` / `aube.allowBuilds` object from

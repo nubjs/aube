@@ -17,12 +17,20 @@ struct WriteNpmLockfile<'a> {
 
 // Field order mirrors npm's own package-lock.json output, so a
 // parse → write round-trip diffs cleanly against what `npm install`
-// would produce: `name`, `version`, `resolved`, `integrity`,
-// `license`, then the dep sections, then `bin`, `engines`, platform
-// fields, `funding`, then the dev/optional flags. Don't reorder — the JSON is
-// serialized as a `BTreeMap`-like structure but serde preserves
-// struct field order for us, which is what npm readers (and git
-// diffs) expect.
+// would produce. npm serializes the lockfile through
+// `json-stringify-nice` with arborist's `swKeyOrder` preference list
+// (`name`, `version`, `lockfileVersion`, `resolved`, `integrity`,
+// `requires`, `packages`, `dependencies`), and that comparator sorts
+// every object's keys as: all non-object values (scalars *and*
+// arrays) before all object values, preference-listed keys leading
+// each group, the rest alphabetical. Every field below has a fixed
+// JSON type, so the comparator collapses to one static declaration
+// order: `name`/`version`/`resolved`/`integrity`, the remaining
+// scalars and arrays alphabetically (`cpu` … `os`), then
+// `dependencies` (the only preference-listed object), then the
+// remaining objects alphabetically (`bin` … `peerDependenciesMeta`).
+// Don't reorder — serde preserves struct field order for us, which
+// is what `npm install` re-emits (and git diffs expect).
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct WriteNpmPackage<'a> {
@@ -34,12 +42,38 @@ struct WriteNpmPackage<'a> {
     resolved: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     integrity: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cpu: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    dev: bool,
+    /// npm v3 collapses the "reachable via dev *and* via optional,
+    /// but never via production" case into a single `devOptional`
+    /// flag. Emitting both `dev: true` and `optional: true` instead
+    /// would trip `npm install --omit=dev` into dropping a package
+    /// that should have stayed because it's still reachable via
+    /// the optional chain (or vice versa with `--omit=optional`).
+    #[serde(rename = "devOptional", skip_serializing_if = "std::ops::Not::not")]
+    dev_optional: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    libc: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     license: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    link: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    optional: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    os: Vec<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     dependencies: BTreeMap<&'a str, &'a str>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    bin: BTreeMap<&'a str, &'a str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     dev_dependencies: BTreeMap<&'a str, &'a str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    engines: BTreeMap<&'a str, &'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    funding: Option<WriteNpmFunding<'a>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     optional_dependencies: BTreeMap<&'a str, &'a str>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -52,32 +86,6 @@ struct WriteNpmPackage<'a> {
     /// meaningful; other fields npm may add elsewhere aren't modeled.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     peer_dependencies_meta: BTreeMap<&'a str, WriteNpmPeerDepMeta>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    bin: BTreeMap<&'a str, &'a str>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    engines: BTreeMap<&'a str, &'a str>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    os: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    cpu: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    libc: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    funding: Option<WriteNpmFunding<'a>>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    link: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    dev: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    optional: bool,
-    /// npm v3 collapses the "reachable via dev *and* via optional,
-    /// but never via production" case into a single `devOptional`
-    /// flag. Emitting both `dev: true` and `optional: true` instead
-    /// would trip `npm install --omit=dev` into dropping a package
-    /// that should have stayed because it's still reachable via
-    /// the optional chain (or vice versa with `--omit=optional`).
-    #[serde(rename = "devOptional", skip_serializing_if = "std::ops::Not::not")]
-    dev_optional: bool,
 }
 
 /// npm emits `funding: {"url": "…"}` verbatim, one key, on every

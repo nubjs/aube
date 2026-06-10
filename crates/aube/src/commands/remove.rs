@@ -266,9 +266,12 @@ fn prune_sidecar_entries_json(obj: &mut serde_json::Map<String, serde_json::Valu
     // shift_remove (not remove → swap_remove) keeps the surrounding
     // keys in their original on-disk position. Same rationale as the
     // dep-section pruning above: `aube remove` must not reshuffle the
-    // user's manifest as a side effect.
-    for ns_key in ["pnpm", "aube"] {
-        let remove_ns = if let Some(ns) = obj.get_mut(ns_key).and_then(|v| v.as_object_mut()) {
+    // user's manifest as a side effect. Only configured namespaces
+    // are mutated (see `set_manifest_config_namespaces`).
+    for ns_key in aube_manifest::manifest_config_namespaces() {
+        let remove_ns = if let Some(ns) =
+            obj.get_mut(ns_key.as_str()).and_then(|v| v.as_object_mut())
+        {
             for map_key in ["allowBuilds", "overrides", "peerDependencyRules"] {
                 if let Some(inner) = ns.get_mut(map_key).and_then(|v| v.as_object_mut()) {
                     inner.shift_remove(name);
@@ -322,8 +325,11 @@ fn prune_sidecar_entries_json(obj: &mut serde_json::Map<String, serde_json::Valu
 /// Safe no-op if the manifest has none of these fields.
 fn prune_sidecar_entries(manifest: &mut aube_manifest::PackageJson, name: &str) {
     // Namespaced (pnpm.* / aube.*) allowlists, overrides, denylists.
-    for ns_key in ["pnpm", "aube"] {
-        let Some(ns) = manifest.extra.get_mut(ns_key) else {
+    // Only the configured namespaces are mutated — one excluded via
+    // `set_manifest_config_namespaces` is foreign data we must not
+    // rewrite.
+    for ns_key in aube_manifest::manifest_config_namespaces() {
+        let Some(ns) = manifest.extra.get_mut(ns_key.as_str()) else {
             continue;
         };
         let Some(obj) = ns.as_object_mut() else {

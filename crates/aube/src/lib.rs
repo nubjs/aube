@@ -553,6 +553,14 @@ pub use aube_util::ua::set_user_agent_product;
 /// process before invoking any command.
 pub use aube_manifest::workspace::set_workspace_yaml_names;
 
+/// `package.json` config-namespace override for embedders,
+/// re-exported from `aube-manifest`: restrict (or reorder) which
+/// top-level manifest objects hold workspace-level config (defaults
+/// to `["pnpm", "aube"]`, later wins). Top-level compatibility keys
+/// (`overrides`, `resolutions`, `trustedDependencies`, …) are
+/// unaffected. Call once per process before invoking any command.
+pub use aube_manifest::set_manifest_config_namespaces;
+
 /// CLI entry point shared by the `aube`, `aubr`, and `aubx` binaries.
 ///
 /// Parses `std::env::args_os()`, dispatches the subcommand, and exits the
