@@ -64,6 +64,41 @@ pub fn env_families() -> EnvFamilies {
     ENV_FAMILIES.get().copied().unwrap_or(EnvFamilies::ALL)
 }
 
+/// Process-wide override for aube's per-user cache root — the
+/// directory that defaults to `<XDG_CACHE_HOME>/aube` (or its platform
+/// equivalent) and holds the packument caches, the git clone cache,
+/// the node-gyp tool cache, the resolver primer, and the adaptive
+/// state file. `None` (never set) keeps every consumer on its
+/// platform default, so standalone-CLI behavior is unchanged.
+static CACHE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Relocate aube's per-user cache root, once per process, before any
+/// command runs. An embedder that registers its own product identity
+/// typically pairs this with its own cache namespace (the cache is
+/// regenerable state, but it still lands in the user's home — it
+/// should carry the name of the tool the user actually installed).
+///
+/// The override replaces the *root* (`<XDG_CACHE_HOME>/aube`), not the
+/// XDG base: consumers append their own subpaths (`packuments-v1/`,
+/// `git/`, `primer/`, …) below it. An explicit `cacheDir` in `.npmrc`
+/// still wins for the settings-routed consumers, exactly as it does
+/// over the platform default.
+///
+/// Idempotent — second calls are silently ignored, matching the other
+/// process-global `set_*` helpers: consumers cache derived paths in
+/// `OnceLock`s, so flipping the root mid-process would produce
+/// split-brain layouts.
+pub fn set_cache_root(root: impl Into<PathBuf>) {
+    let _ = CACHE_ROOT.set(root.into());
+}
+
+/// The registered cache root, if an embedder set one. Consumers fall
+/// back to their platform default (`<XDG_CACHE_HOME>/aube` or
+/// equivalent) when this is `None`.
+pub fn cache_root() -> Option<&'static std::path::Path> {
+    CACHE_ROOT.get().map(PathBuf::as_path)
+}
+
 /// Classify a variable name into its [`EnvFamilies`] bit.
 pub fn env_family_of(name: &str) -> EnvFamilies {
     if name.starts_with("AUBE_") {

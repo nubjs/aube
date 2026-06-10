@@ -122,7 +122,15 @@ pub(crate) fn lazy_shim_bin_dir(project_bin_dir: &Path) -> miette::Result<Option
     Ok(Some(shim_dir))
 }
 
-pub(crate) async fn print_bootstrapped_binary(project_dir: &Path) -> miette::Result<()> {
+/// Resolve (bootstrapping if needed) the cached node-gyp and print the
+/// executable path — the body of the hidden `__node-gyp-bootstrap` verb.
+///
+/// Public because the lazy shims written by [`lazy_shim_bin_dir`] re-invoke
+/// `current_exe()` with this verb: a tool that embeds the command layer as a
+/// library *is* `current_exe()` for its installs, so it must dispatch the
+/// verb to this entry point itself or allowlisted node-gyp dependency
+/// builds die at the shim.
+pub async fn print_bootstrapped_binary(project_dir: &Path) -> miette::Result<()> {
     let bin_dir = ensure_cached(project_dir).await?;
     println!("{}", bin_dir.join(primary_binary_name()).display());
     Ok(())

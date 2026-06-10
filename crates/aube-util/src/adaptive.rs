@@ -994,6 +994,9 @@ fn read_snapshot(path: &Path) -> Option<PersistedSnapshot> {
  * `%LOCALAPPDATA%\aube\adaptive-state.json` on Windows.
  */
 pub fn default_persistent_state_path() -> Option<PathBuf> {
+    if let Some(root) = crate::env::cache_root() {
+        return Some(root.join("adaptive-state.json"));
+    }
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
         && !xdg.is_empty()
     {

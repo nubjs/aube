@@ -266,6 +266,9 @@ fn primer_cache_dir() -> Option<PathBuf> {
     if let Some(base) = aube_util::env::var_os("AUBE_CACHE_DIR") {
         return Some(PathBuf::from(base).join("primer"));
     }
+    if let Some(root) = aube_util::env::cache_root() {
+        return Some(root.join("primer"));
+    }
     cache_base_dir().map(|p| p.join("aube").join("primer"))
 }
 

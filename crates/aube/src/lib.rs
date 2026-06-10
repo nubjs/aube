@@ -545,6 +545,14 @@ pub use aube_util::env::{EnvFamilies, set_env_families};
 /// before invoking any command.
 pub use aube_util::ua::set_user_agent_product;
 
+/// Cache-root override for embedders, re-exported from `aube-util`:
+/// relocate the per-user cache root that defaults to
+/// `<XDG_CACHE_HOME>/aube` (packument caches, git clone cache,
+/// node-gyp tool cache, resolver primer, adaptive state). An explicit
+/// `cacheDir` in `.npmrc` still wins for settings-routed consumers.
+/// Call once per process before invoking any command.
+pub use aube_util::env::set_cache_root;
+
 /// Workspace-yaml filename override for embedders, re-exported from
 /// `aube-manifest`: restrict (or reorder) which workspace-yaml
 /// filenames are discovered, with the first entry doubling as the

@@ -20,7 +20,7 @@ mod lifecycle;
 mod link;
 mod lockfile_dir;
 mod materialize;
-pub(crate) mod node_gyp_bootstrap;
+pub mod node_gyp_bootstrap;
 mod resolve;
 mod settings;
 mod side_effects_cache;

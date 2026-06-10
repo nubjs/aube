@@ -2,7 +2,12 @@ use std::path::PathBuf;
 
 /// XDG-compliant cache directory for aube.
 /// Uses `$XDG_CACHE_HOME/aube`, `$HOME/.cache/aube`, or `%LOCALAPPDATA%\aube` on Windows.
+/// An embedder-registered root (`aube_util::env::set_cache_root`)
+/// replaces the whole default — consumers' subpaths land below it.
 pub fn cache_dir() -> Option<PathBuf> {
+    if let Some(root) = aube_util::env::cache_root() {
+        return Some(root.to_path_buf());
+    }
     if let Some(xdg) = aube_util::env::xdg_cache_home() {
         return Some(xdg.join("aube"));
     }
