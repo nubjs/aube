@@ -148,6 +148,15 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub lockfile: Option<bool>,
 
+    /// Lockfile format written when the project has no lockfile yet
+    /// (`aube` | `pnpm` | `npm` | `yarn` | `bun`, default `aube`).
+    /// Same semantics as the `defaultLockfileFormat` setting resolved
+    /// via `aube_settings::resolved`; declared here so the
+    /// `workspace_yaml_keys_deserialize_onto_workspace_config` parity
+    /// test sees a real field behind the workspaceYaml source.
+    #[serde(default)]
+    pub default_lockfile_format: Option<String>,
+
     /// Directory the lockfile is written to and read from. When unset
     /// or equal to the project root, behaves as before. When set to a
     /// different directory, the project becomes an importer keyed by

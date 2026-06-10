@@ -357,7 +357,7 @@ pub(crate) fn build_resolver(
     // wide aube default.
     let target_lockfile_kind = Some(
         aube_lockfile::detect_existing_lockfile_kind(cwd)
-            .unwrap_or(aube_lockfile::LockfileKind::Aube),
+            .unwrap_or_else(|| default_lockfile_kind(&ctx)),
     );
     install::configure_resolver(
         aube_resolver::Resolver::new(std::sync::Arc::new(make_client(cwd))),
@@ -447,6 +447,34 @@ pub(crate) fn resolve_virtual_store_dir_max_length(ctx: &aube_settings::ResolveC
 /// `ResolveCtx` for any other reason.
 pub(crate) fn resolve_virtual_store_dir_max_length_for_cwd(cwd: &std::path::Path) -> usize {
     with_settings_ctx(cwd, resolve_virtual_store_dir_max_length)
+}
+
+/// Lockfile format to write when the project has no lockfile yet —
+/// the `defaultLockfileFormat` setting mapped onto
+/// [`aube_lockfile::LockfileKind`]. Every fresh-project fallback that
+/// used to hard-code `LockfileKind::Aube` resolves through here, so
+/// the setting reaches the resolver's platform-widening target and the
+/// install/add/update write paths alike. Projects with an existing
+/// lockfile are unaffected: format detection still wins, this is only
+/// the fallback.
+pub(crate) fn default_lockfile_kind(
+    ctx: &aube_settings::ResolveCtx<'_>,
+) -> aube_lockfile::LockfileKind {
+    use aube_settings::resolved::DefaultLockfileFormat as Format;
+    match aube_settings::resolved::default_lockfile_format(ctx) {
+        Format::Aube => aube_lockfile::LockfileKind::Aube,
+        Format::Pnpm => aube_lockfile::LockfileKind::Pnpm,
+        Format::Npm => aube_lockfile::LockfileKind::Npm,
+        Format::Yarn => aube_lockfile::LockfileKind::Yarn,
+        Format::Bun => aube_lockfile::LockfileKind::Bun,
+    }
+}
+
+/// Load `.npmrc` + `pnpm-workspace.yaml` for `cwd` and resolve the
+/// effective fresh-project lockfile format in one call. Convenience
+/// for call sites that don't already hold a `ResolveCtx`.
+pub(crate) fn default_lockfile_kind_for_cwd(cwd: &std::path::Path) -> aube_lockfile::LockfileKind {
+    with_settings_ctx(cwd, default_lockfile_kind)
 }
 
 /// Project-level `node_modules` directory name (pnpm's `modulesDir`
@@ -621,5 +649,62 @@ mod package_manager_mismatch_tests {
     #[test]
     fn skip_auto_install_defaults_off() {
         assert!(!skip_auto_install_on_package_manager_mismatch());
+    }
+}
+
+#[cfg(test)]
+mod default_lockfile_kind_tests {
+    use super::default_lockfile_kind;
+    use aube_settings::ResolveCtx;
+    use std::collections::BTreeMap;
+
+    fn ctx<'a>(
+        npmrc: &'a [(String, String)],
+        ws: &'a BTreeMap<String, yaml_serde::Value>,
+    ) -> ResolveCtx<'a> {
+        ResolveCtx {
+            project_aube_config: &[],
+            project_npmrc: npmrc,
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: ws,
+            env: &[],
+            cli: &[],
+        }
+    }
+
+    #[test]
+    fn defaults_to_aube_lock_when_unset() {
+        let ws = BTreeMap::new();
+        assert_eq!(
+            default_lockfile_kind(&ctx(&[], &ws)),
+            aube_lockfile::LockfileKind::Aube
+        );
+    }
+
+    #[test]
+    fn npmrc_value_selects_foreign_format() {
+        let npmrc = vec![("defaultLockfileFormat".to_string(), "pnpm".to_string())];
+        let ws = BTreeMap::new();
+        assert_eq!(
+            default_lockfile_kind(&ctx(&npmrc, &ws)),
+            aube_lockfile::LockfileKind::Pnpm,
+            "defaultLockfileFormat=pnpm must map the fresh-project fallback to pnpm-lock.yaml"
+        );
+    }
+
+    #[test]
+    fn unknown_value_falls_back_to_aube() {
+        // The generated enum accessor turns an unrecognized value into
+        // the declared default rather than poisoning the install.
+        let npmrc = vec![(
+            "default-lockfile-format".to_string(),
+            "totally-fake".to_string(),
+        )];
+        let ws = BTreeMap::new();
+        assert_eq!(
+            default_lockfile_kind(&ctx(&npmrc, &ws)),
+            aube_lockfile::LockfileKind::Aube
+        );
     }
 }

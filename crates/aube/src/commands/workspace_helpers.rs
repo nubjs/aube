@@ -90,7 +90,12 @@ pub(crate) fn write_and_log_lockfile(
     graph: &aube_lockfile::LockfileGraph,
     manifest: &aube_manifest::PackageJson,
 ) -> miette::Result<PathBuf> {
-    let written_path = aube_lockfile::write_lockfile_preserving_existing(cwd, graph, manifest)
+    // Preserve the existing lockfile format; fall back to the
+    // configured `defaultLockfileFormat` (aube-lock.yaml unless
+    // overridden) when the project has no lockfile yet.
+    let kind = aube_lockfile::detect_existing_lockfile_kind(cwd)
+        .unwrap_or_else(|| super::default_lockfile_kind_for_cwd(cwd));
+    let written_path = aube_lockfile::write_lockfile_as(cwd, graph, manifest, kind)
         .into_diagnostic()
         .wrap_err("failed to write lockfile")?;
     eprintln!(

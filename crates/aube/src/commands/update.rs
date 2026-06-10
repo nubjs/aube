@@ -1335,7 +1335,10 @@ fn merge_filtered_update_lockfile(
 ) -> miette::Result<()> {
     let importer_path = super::workspace_importer_path(workspace_root, pkg_dir)?;
     let remove_pkg_lockfile = importer_path != ".";
-    let pkg_lockfile = pkg_dir.join(aube_lockfile::LockfileKind::Aube.filename());
+    // The nested per-package update wrote its transient lockfile in
+    // the fresh-project fallback format (`defaultLockfileFormat`;
+    // aube-lock.yaml unless overridden).
+    let pkg_lockfile = pkg_dir.join(super::default_lockfile_kind_for_cwd(pkg_dir).filename());
     if !pkg_lockfile.exists() {
         return Ok(());
     }

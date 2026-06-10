@@ -805,8 +805,10 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                     // `None` only when no lockfile will be written, so
                     // widening to every common platform doesn't happen
                     // just to be discarded.
-                    target_lockfile_kind: lockfile_enabled
-                        .then(|| source_kind_before.unwrap_or(aube_lockfile::LockfileKind::Aube)),
+                    target_lockfile_kind: lockfile_enabled.then(|| {
+                        source_kind_before
+                            .unwrap_or_else(|| super::default_lockfile_kind(&settings_ctx))
+                    }),
                     cache_full_packuments: true,
                     ignore_scripts: opts.ignore_scripts,
                 },
@@ -1474,7 +1476,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                         }
                     }
                 }
-                let write_kind = source_kind_before.unwrap_or(aube_lockfile::LockfileKind::Aube);
+                let write_kind = source_kind_before
+                    .unwrap_or_else(|| super::default_lockfile_kind(&settings_ctx));
                 if shared_workspace_lockfile || !has_workspace {
                     let written_path = write_lockfile_dir_remapped(
                         &lockfile_dir,
