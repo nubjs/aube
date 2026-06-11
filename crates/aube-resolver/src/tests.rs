@@ -862,6 +862,110 @@ async fn minimum_release_age_fetches_full_packument_directly() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Regression: a primer-seeded pick that satisfies the range must still
+/// record the package's publish time when `minimumReleaseAge` is active.
+/// The bundled primer's `time` data is sparse, so a primer hit could
+/// leave `graph.times` empty for an aged stable package — silently
+/// disabling every `time:` consumer (the `defaultTrust` build floor, the
+/// lockfile round-trip). The resolver must refetch the full packument to
+/// recover the time. Found via the brand-sweep gate (esbuild floored on
+/// the warm install only, ignored on the fresh one) 2026-06-10.
+#[tokio::test]
+async fn primer_seeded_pick_records_publish_time_for_the_age_floor() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Pick a real primer entry whose seed carries NO publish time for
+    // its latest version AND has no runtime deps for it — exactly the
+    // shape that strands the floor, while staying resolvable against a
+    // single-package mock registry. An empty primer or an
+    // all-times-present primer leaves nothing to regress, so skip
+    // honestly (matching `bundled_primer_loads`).
+    let Some((name, version)) = crate::primer::names().find_map(|name| {
+        let pkt = crate::primer::get(name)?.packument();
+        let latest = pkt.dist_tags.get("latest")?;
+        let meta = pkt.versions.get(latest)?;
+        (!pkt.time.contains_key(latest)
+            && meta.dependencies.is_empty()
+            && meta.optional_dependencies.is_empty()
+            && meta.peer_dependencies.is_empty())
+        .then(|| (name.to_string(), latest.clone()))
+    }) else {
+        return;
+    };
+
+    // The mock registry serves a full packument for that exact
+    // (name, version) WITH a time entry — the data the resolver must
+    // recover by refetching past the time-less primer seed.
+    let mut full = make_packument(&name, &[&version], &version);
+    full.modified = Some("2024-01-01T00:00:00.000Z".to_string());
+    full.time
+        .insert(version.clone(), "2024-01-01T00:00:00.000Z".to_string());
+    let full_body = serde_json::to_vec(&full).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let full_body = full_body.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    full_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.write_all(&full_body).await.unwrap();
+            });
+        }
+    });
+
+    let base = std::env::temp_dir().join(format!(
+        "aube-resolver-primer-time-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(base.join("packuments")).unwrap();
+    std::fs::create_dir_all(base.join("packuments-full")).unwrap();
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(&registry));
+    // `force_metadata_primer` routes the non-default mock registry
+    // through the primer; a long window keeps the cutoff old enough
+    // that the primer is eligible (covers_cutoff) so the primer seeds
+    // the pick — the exact path that strands the time.
+    let mut resolver = Resolver::new(client)
+        .with_packument_cache(base.join("packuments"))
+        .with_packument_full_cache(base.join("packuments-full"))
+        .with_force_metadata_primer(true)
+        .with_minimum_release_age(Some(MinimumReleaseAge {
+            minutes: 10 * 365 * 24 * 60,
+            ..Default::default()
+        }));
+    let mut manifest = PackageJson::default();
+    manifest.dependencies.insert(name.clone(), version.clone());
+
+    let graph = resolver.resolve(&manifest, None).await.expect("resolve");
+
+    assert!(
+        graph
+            .times
+            .values()
+            .any(|t| t.as_str() == "2024-01-01T00:00:00.000Z"),
+        "primer-seeded pick of {name}@{version} dropped its publish time \
+         from graph.times (the defaultTrust floor would fail closed): {:?}",
+        graph.times
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(base);
+}
+
 /// Regression: when both `minimumReleaseAge` and `trustPolicy=NoDowngrade`
 /// are active, the resolver must use a full packument with `time`;
 /// using an abbreviated corgi packument would make the trust check fail
