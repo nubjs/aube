@@ -23,11 +23,18 @@
 //!   git / file / link / tarball sources never qualify, so a malicious
 //!   manifest can't borrow a listed name's trust by pointing it at an
 //!   arbitrary source (the bun CVE-2026-24910 class).
-//! - **OSV coverage** — an OSV `MAL-*` advisory gate ran against this
-//!   install's graph (`run_post_resolve_osv_routing` returned true).
-//!   Advisory hits abort the install before scripts run, so surviving
-//!   packages passed; with every advisory backend off the floor turns
-//!   off with them.
+//! - **advisory vetting** — either an OSV `MAL-*` advisory gate ran
+//!   against this install's graph (`run_post_resolve_osv_routing`
+//!   returned true), *or* the graph was inherited from an unchanged
+//!   lockfile that was advisory-checked when it was written
+//!   (`lockfile_vetted`). Advisory hits abort the install before
+//!   scripts run, so surviving packages passed. The lockfile-inherited
+//!   branch is what makes a frozen install (`aube ci`,
+//!   `--frozen-lockfile`, a CI/teammate clone) run trusted build
+//!   scripts without a per-install OSV round-trip — they ran for
+//!   whoever locked the file, and the lockfile carries that vetting.
+//!   On a fresh resolve with every advisory backend off and no prior
+//!   lockfile to inherit from, the floor turns off with the gate.
 //! - **cooling window** — the resolved version's recorded publish time
 //!   (the lockfile-graph `time:` data the resolver records whenever
 //!   `minimumReleaseAge` is active) is older than the
@@ -54,6 +61,17 @@ use std::collections::BTreeMap;
 pub(crate) struct DefaultTrustFloor {
     enabled: bool,
     osv_gate_active: bool,
+    /// True when this install's graph came from an unchanged lockfile
+    /// (frozen install, `aube ci`, `--frozen-lockfile`, a CI/teammate
+    /// clone). The graph was advisory-checked when the lockfile was
+    /// written, so the floor inherits that resolution-time vetting and
+    /// does not require a per-install OSV run — see
+    /// `wiki/commands/pm/supply-chain-posture.md` Decision 2. The
+    /// cooling window (checked against the lockfile's recorded publish
+    /// times) and registry-provenance gates still apply, so the
+    /// inherited trust is bounded to what the lockfile actually
+    /// evidences.
+    lockfile_vetted: bool,
     /// ISO-8601 UTC cutoff derived from `minimumReleaseAge`: publish
     /// times lexicographically `<=` this string satisfy the window.
     /// `None` when the window is disabled — which disables the floor.
@@ -65,6 +83,7 @@ impl DefaultTrustFloor {
         Self {
             enabled: false,
             osv_gate_active: false,
+            lockfile_vetted: false,
             age_cutoff: None,
         }
     }
@@ -76,6 +95,7 @@ impl DefaultTrustFloor {
         ctx: &aube_settings::ResolveCtx<'_>,
         mra_cli_minutes: Option<u64>,
         osv_gate_active: bool,
+        lockfile_vetted: bool,
     ) -> Self {
         let enabled = aube_settings::resolved::default_trust(ctx);
         if !enabled {
@@ -92,6 +112,7 @@ impl DefaultTrustFloor {
         Self {
             enabled,
             osv_gate_active,
+            lockfile_vetted,
             age_cutoff,
         }
     }
@@ -100,7 +121,20 @@ impl DefaultTrustFloor {
     /// dep-script phase keep its "no allow rules → skip entirely"
     /// fast path when the floor can't fire anyway.
     pub(crate) fn may_allow_any(&self) -> bool {
-        self.enabled && self.osv_gate_active && self.age_cutoff.is_some()
+        self.enabled && self.has_advisory_vetting() && self.age_cutoff.is_some()
+    }
+
+    /// The advisory-vetting precondition for trusting the allowlist:
+    /// either an OSV `MAL-*` gate ran against this install's graph, or
+    /// the graph was inherited from an unchanged lockfile that was
+    /// advisory-checked when it was written. A frozen install
+    /// (`aube ci`, `--frozen-lockfile`, a CI/teammate clone) correctly
+    /// skips per-install OSV, so without the lockfile-vetting branch
+    /// its trusted packages' build scripts would silently not run even
+    /// though they ran for whoever locked the file
+    /// (`wiki/commands/pm/supply-chain-posture.md` Decision 2).
+    fn has_advisory_vetting(&self) -> bool {
+        self.osv_gate_active || self.lockfile_vetted
     }
 
     /// Whether the floor trusts this resolved package. `times` is the
@@ -113,7 +147,7 @@ impl DefaultTrustFloor {
         let Some(cutoff) = self.age_cutoff.as_deref() else {
             return false;
         };
-        if !self.enabled || !self.osv_gate_active {
+        if !self.enabled || !self.has_advisory_vetting() {
             return false;
         }
         // Registry-resolved only. `local_source` covers file / link /
@@ -169,12 +203,26 @@ mod tests {
         DefaultTrustFloor {
             enabled: true,
             osv_gate_active: true,
+            lockfile_vetted: false,
             age_cutoff: aube_resolver::MinimumReleaseAge {
                 minutes: 1440,
                 exclude: Default::default(),
                 strict: false,
             }
             .cutoff(),
+        }
+    }
+
+    /// A frozen-install floor: OSV was (correctly) skipped this
+    /// install — `osv_gate_active = false` — but the graph came from
+    /// an unchanged lockfile, so it carries resolution-time vetting
+    /// (`lockfile_vetted = true`). Models `aube ci`, `--frozen-lockfile`,
+    /// and a CI/teammate clone.
+    fn frozen_floor() -> DefaultTrustFloor {
+        DefaultTrustFloor {
+            osv_gate_active: false,
+            lockfile_vetted: true,
+            ..active_floor()
         }
     }
 
@@ -297,12 +345,62 @@ mod tests {
     fn floor_defers_to_the_osv_gate_and_the_off_switch() {
         let pkg = listed_pkg();
         let times = times_published_minutes_ago(&pkg, 10 * 1440);
-        let mut no_osv = active_floor();
-        no_osv.osv_gate_active = false;
-        assert!(!no_osv.trusts(&pkg, &times), "no OSV coverage → no floor");
+        // No OSV *and* no lockfile vetting (a fresh resolve where every
+        // advisory backend is off) → the floor has no resolution-time
+        // vetting to inherit, so it stays closed.
+        let mut no_vetting = active_floor();
+        no_vetting.osv_gate_active = false;
+        assert!(
+            !no_vetting.trusts(&pkg, &times),
+            "no OSV coverage and no lockfile vetting → no floor"
+        );
+        assert!(!no_vetting.may_allow_any());
         let off = DefaultTrustFloor::disabled();
         assert!(!off.trusts(&pkg, &times), "defaultTrust=false → no floor");
         assert!(!off.may_allow_any());
+    }
+
+    /// THE BUG FIX (supply-chain-posture.md Decision 2): a frozen
+    /// install correctly skips per-install OSV, so `osv_gate_active`
+    /// is false — yet a trusted package's build scripts must still run,
+    /// inheriting the resolution-time vetting baked into the lockfile
+    /// (registry provenance + the cooling window against the lockfile's
+    /// recorded publish time). Before the fix the floor hard-required
+    /// `osv_gate_active`, so CI/clones silently skipped esbuild /
+    /// better-sqlite3 / node-gyp builds that ran for whoever locked.
+    #[test]
+    fn frozen_install_trusts_the_allowlist_by_inheriting_lockfile_vetting() {
+        let pkg = listed_pkg();
+        let times = times_published_minutes_ago(&pkg, 10 * 1440);
+        let floor = frozen_floor();
+        assert!(
+            floor.may_allow_any(),
+            "a frozen install with lockfile vetting must keep the dep-script phase alive"
+        );
+        assert_eq!(
+            decide_with_floor(&policy_from(&[], false), &floor, &pkg, &times),
+            AllowDecision::Allow,
+            "a frozen install must run a trusted package's build script"
+        );
+    }
+
+    /// Lockfile vetting does not weaken the other gates: a frozen
+    /// install still fails closed on an unknown / too-young publish
+    /// time, because the cooling window is the vetting signal it
+    /// inherits — there's nothing to inherit without it.
+    #[test]
+    fn frozen_install_still_requires_the_cooling_window() {
+        let pkg = listed_pkg();
+        let floor = frozen_floor();
+        let young = times_published_minutes_ago(&pkg, 60);
+        assert!(
+            !floor.trusts(&pkg, &young),
+            "a too-young version must not floor even on a frozen install"
+        );
+        assert!(
+            !floor.trusts(&pkg, &BTreeMap::new()),
+            "unknown publish time must fail closed even on a frozen install"
+        );
     }
 
     #[test]
