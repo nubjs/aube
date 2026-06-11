@@ -507,6 +507,45 @@ fn test_parse_berry_patch_protocol() {
     assert_eq!(graph.importers["."][0].dep_path, "is-number@7.0.0");
 }
 
+/// Berry's builtin-compat patch protocol carries a `<qualifier>!` prefix
+/// before `builtin<...>` (e.g. `optional!builtin<compat/resolve>`) — the
+/// form yarn emits for resolve/typescript via eslint-plugin-import &c.
+/// The `!`-qualified target must be recognized as a builtin (not a real
+/// patch file path), so the package installs from its companion npm
+/// block instead of failing with "failed to read patch file".
+#[test]
+fn test_parse_berry_qualified_builtin_patch_resolves_from_npm_block() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"resolve@npm:1.22.8, resolve@npm:^1.22.0":
+  version: 1.22.8
+  resolution: "resolve@npm:1.22.8"
+  checksum: 10c0/realnpm
+  languageName: node
+  linkType: hard
+
+"resolve@patch:resolve@npm%3A1.22.8#optional!builtin<compat/resolve>, resolve@patch:resolve@npm%3A^1.22.0#optional!builtin<compat/resolve>":
+  version: 1.22.8
+  resolution: "resolve@patch:resolve@npm%3A1.22.8#optional!builtin<compat/resolve>::version=1.22.8&hash=c3c19d"
+  checksum: 10c0/patched
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("resolve", "^1.22.0")], &[]);
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    // The npm package is present; the builtin-compat patch produced no
+    // bogus patched_dependencies entry (which would make the install try
+    // to read `optional!builtin<compat/resolve>` as a file).
+    assert!(graph.packages.contains_key("resolve@1.22.8"));
+    assert!(graph.patched_dependencies.is_empty());
+    assert_eq!(graph.importers["."][0].dep_path, "resolve@1.22.8");
+}
+
 #[test]
 fn test_parse_berry_skips_builtin_patch_protocol() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
