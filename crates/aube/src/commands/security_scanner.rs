@@ -334,8 +334,8 @@ async fn invoke(
             trimmed.to_string()
         };
         return Err(format!(
-            "scanner exited with status {:?}; stderr: {snippet}",
-            output.status.code()
+            "scanner exited with status {}; stderr: {snippet}",
+            aube_scripts::exit_code_from_status(output.status)
         ));
     }
 

@@ -961,7 +961,11 @@ pub async fn run_script(
     if !status.success() {
         return Err(Error::NonZeroExit {
             script: script_name.to_string(),
-            code: status.code(),
+            // Resolve the child's status to a concrete exit code so the
+            // user sees a plain integer. On Unix a signal-killed child
+            // (status.code() == None) renders as the bash-convention
+            // 128 + signum rather than the misleading Rust `None`.
+            code: exit_code_from_status(status),
         });
     }
 
@@ -1137,9 +1141,9 @@ pub enum Error {
     #[error("failed to spawn script {0}: {1}")]
     #[diagnostic(code(ERR_AUBE_SCRIPT_SPAWN))]
     Spawn(String, String),
-    #[error("script `{script}` exited with code {code:?}")]
+    #[error("script `{script}` exited with code {code}")]
     #[diagnostic(code(ERR_AUBE_SCRIPT_NON_ZERO_EXIT))]
-    NonZeroExit { script: String, code: Option<i32> },
+    NonZeroExit { script: String, code: i32 },
 }
 
 #[cfg(test)]
@@ -1494,6 +1498,29 @@ mod windows_job_object_tests {
         assert!(
             reaped,
             "grandchild pid {pid} survived parent abort — job object did not kill the tree"
+        );
+    }
+}
+
+#[cfg(test)]
+mod non_zero_exit_display_tests {
+    use super::*;
+
+    // A failed lifecycle script's error message is surfaced verbatim to the
+    // user (e.g. "root postinstall script failed: <this>"). The exit code must
+    // read as a plain integer, not the Rust `Option<i32>` Debug form `Some(42)`,
+    // which leaks internal types into user-facing output.
+    #[test]
+    fn renders_plain_exit_code_not_option_debug() {
+        let err = Error::NonZeroExit {
+            script: "postinstall".to_string(),
+            code: 42,
+        };
+        let msg = err.to_string();
+        assert_eq!(msg, "script `postinstall` exited with code 42");
+        assert!(
+            !msg.contains("Some("),
+            "exit code leaked Option Debug form: {msg}"
         );
     }
 }
