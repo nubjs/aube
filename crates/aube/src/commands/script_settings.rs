@@ -16,6 +16,12 @@ pub(crate) fn configure_script_settings(ctx: &aube_settings::ResolveCtx<'_>) {
     // settings. When no context exists (or no switching is active)
     // these stay `None` and scripts inherit PATH untouched.
     let runtime = crate::runtime::current();
+    // Carry the embedder-owned overlay forward: an embedder (e.g. nub)
+    // installs its `env_overlay` / `path_prepends` once up front, and this
+    // settings pass — which runs later, inside the install command — must not
+    // wipe them. The `.npmrc`/workspace-derived fields above are the only ones
+    // this function owns.
+    let prior = aube_scripts::script_settings_snapshot();
     aube_scripts::set_script_settings(aube_scripts::ScriptSettings {
         node_options,
         script_shell,
@@ -23,6 +29,8 @@ pub(crate) fn configure_script_settings(ctx: &aube_settings::ResolveCtx<'_>) {
         shell_emulator,
         node_bin_dir: runtime.and_then(|r| r.bin_dir.clone()),
         node_exe: runtime.and_then(|r| r.node_bin.clone()),
+        env_overlay: prior.env_overlay,
+        path_prepends: prior.path_prepends,
     });
 }
 
