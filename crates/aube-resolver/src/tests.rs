@@ -966,6 +966,122 @@ async fn primer_seeded_pick_records_publish_time_for_the_age_floor() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Regression: a primer hit must not poison the full-packument cache with
+/// the registry's validators. The bundled primer is a *truncated* slice
+/// (newest `version_cap` versions) but carries the full document's real
+/// ETag/Last-Modified. If the primer seeds those into the full-packument
+/// cache, the driver's range-miss heal (a satisfying version lives outside
+/// the primer window) sends `If-None-Match`, the registry answers
+/// `304 Not Modified`, and the *truncated* body is resurrected as
+/// authoritative — so a range the registry can plainly satisfy fails with
+/// `ERR_AUBE_NO_MATCHING_VERSION`. Surfaced by the time-bearing primer,
+/// which sorts the kept window by publish time and so drops older stable
+/// lines for high-churn packages (e.g. `eslint-plugin-react-hooks`, whose
+/// `^5` stable sits 700+ publishes behind a flood of experimental builds).
+/// The seed must drop the validators so the heal is an unconditional GET.
+#[tokio::test]
+async fn primer_range_miss_heals_past_a_304_on_the_seeded_full_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Any real primer entry will do — we ask for a version the primer
+    // never carries (`99999.0.0`) so the pick is always a range miss that
+    // must heal against the registry. Skip honestly on an empty primer.
+    let Some(name) = crate::primer::names().next().map(str::to_string) else {
+        return;
+    };
+    let healed_version = "99999.0.0";
+    let mut full = make_packument(&name, &[healed_version], healed_version);
+    full.modified = Some("2024-01-01T00:00:00.000Z".to_string());
+    full.time.insert(
+        healed_version.to_string(),
+        "2024-01-01T00:00:00.000Z".to_string(),
+    );
+    let full_body = serde_json::to_vec(&full).unwrap();
+
+    // The registry 304s any *conditional* request (`If-None-Match` /
+    // `If-Modified-Since`) — i.e. it claims "unchanged since the primer
+    // built" — and serves the full body only to an unconditional GET.
+    // A heal that wrongly carries the primer's validators gets the 304
+    // and never sees `99999.0.0`.
+    let conditional_hits = Arc::new(AtomicUsize::new(0));
+    let conditional_seen = conditional_hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let full_body = full_body.clone();
+            let conditional_seen = conditional_seen.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                let conditional =
+                    req.contains("if-none-match:") || req.contains("if-modified-since:");
+                if conditional {
+                    conditional_seen.fetch_add(1, Ordering::Relaxed);
+                    let response = "HTTP/1.1 304 Not Modified\r\netag: \"primer\"\r\nconnection: close\r\n\r\n";
+                    let _ = socket.write_all(response.as_bytes()).await;
+                } else {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\netag: \"live\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        full_body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.write_all(&full_body).await;
+                }
+            });
+        }
+    });
+
+    let base = std::env::temp_dir().join(format!(
+        "aube-resolver-primer-304-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(base.join("packuments")).unwrap();
+    std::fs::create_dir_all(base.join("packuments-full")).unwrap();
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(&registry));
+    // `force_metadata_primer` routes the mock registry through the primer
+    // seed; a long window keeps the cutoff old enough that the primer is
+    // eligible, so the primer seeds the (truncated) full cache — the exact
+    // setup that strands the heal behind a 304.
+    let mut resolver = Resolver::new(client)
+        .with_packument_cache(base.join("packuments"))
+        .with_packument_full_cache(base.join("packuments-full"))
+        .with_force_metadata_primer(true)
+        .with_minimum_release_age(Some(MinimumReleaseAge {
+            minutes: 10 * 365 * 24 * 60,
+            ..Default::default()
+        }));
+    let mut manifest = PackageJson::default();
+    manifest
+        .dependencies
+        .insert(name.clone(), format!("={healed_version}"));
+
+    let graph = resolver
+        .resolve(&manifest, None)
+        .await
+        .unwrap_or_else(|e| panic!("range-miss heal failed for {name}@{healed_version}: {e}"));
+
+    assert!(
+        graph_has_package(&graph, &name, healed_version),
+        "heal did not resolve {name}@{healed_version}; the seeded full cache \
+         was resurrected behind a 304 ({} conditional requests seen)",
+        conditional_hits.load(Ordering::Relaxed)
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(base);
+}
+
 /// Regression: when both `minimumReleaseAge` and `trustPolicy=NoDowngrade`
 /// are active, the resolver must use a full packument with `time`;
 /// using an abbreviated corgi packument would make the trust check fail

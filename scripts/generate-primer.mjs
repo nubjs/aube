@@ -51,10 +51,21 @@ console.error(`wrote ${Object.keys(primer).length} packages to ${out}`)
 
 async function packumentSeed(name, keepVersions) {
   const url = `https://registry.npmjs.org/${encodePackageName(name)}`
+  // Request the *full* packument, NOT the abbreviated corgi
+  // (`application/vnd.npm.install-v1+json`). Corgi omits the `time`
+  // map, and the primer needs per-version publish times so the
+  // resolver can honor `minimumReleaseAge` / `trustPolicy` straight
+  // from the bundled seed instead of refetching the full packument
+  // live for every primed package (a serialized refetch in the BFS
+  // pick loop — the cold-install cliff this seed exists to avoid).
+  // The accept header must list *only* `application/json`: npm's
+  // content negotiation prefers corgi whenever it is named or a
+  // `*/*` wildcard is present, regardless of the q-values, so adding
+  // either silently drops us back to a time-less response.
   const { res, body: full } = await fetchBodyWithRetry(
     url,
     {
-      headers: { accept: 'application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*' },
+      headers: { accept: 'application/json' },
     },
     (res) => res.json(),
   )
