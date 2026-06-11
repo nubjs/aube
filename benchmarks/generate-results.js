@@ -27,14 +27,6 @@ const benchmarks = [
   ['gvs-warm', 'Fresh install (warm cache)'],
   ['gvs-cold', 'Fresh install (cold cache)'],
   ['install-test', 'npm install && npm run test'],
-  // S10: same on-disk state, the CI env var is the only delta between
-  // the two rows. Labeled as what it measures — an install
-  // short-circuit plus script dispatch — not as a generic "install".
-  ['ci-loop-noci', 'Warm CI loop, CI unset (install short-circuit + test)'],
-  ['ci-loop-ci', 'Warm CI loop, CI=true (install short-circuit + test)'],
-  // S11 / S12: the resolution-path and incremental-install cells.
-  ['add-dep', 'Add one dep (package.json edit + non-frozen install)'],
-  ['branch-switch', 'Branch switch (~15 lockfile deltas, warm node_modules)'],
 ]
 const SELECTED_BENCHMARKS = new Set(
   (process.env.BENCH_SCENARIOS || benchmarks.map(([name]) => name).join(','))
@@ -42,12 +34,6 @@ const SELECTED_BENCHMARKS = new Set(
     .map((s) => s.trim())
     .filter(Boolean),
 )
-// bench.sh spells S10 as one scenario key (`ci-loop`) but emits two
-// result rows; expand the selection so both land in the output.
-if (SELECTED_BENCHMARKS.has('ci-loop')) {
-  SELECTED_BENCHMARKS.add('ci-loop-noci')
-  SELECTED_BENCHMARKS.add('ci-loop-ci')
-}
 
 const TOOLS = (process.env.BENCH_TOOLS || 'aube,pnpm')
   .split(',')
@@ -62,13 +48,8 @@ function readResult (benchDir, name, tool) {
       throw new Error('missing benchmark mean')
     }
     const stddev = Number.isFinite(r.stddev) ? r.stddev : 0
-    // Median is the headline statistic: min overstates best-case (the
-    // pnpm.io approach), mean is noise-sensitive on small N. Mean/min/max
-    // stay in `stats` so the raw shape is never lost.
-    const median = Number.isFinite(r.median) ? r.median : r.mean
     return {
-      text: `${median.toFixed(3)}s ± ${stddev.toFixed(3)}s`,
-      median,
+      text: `${r.mean.toFixed(3)}s ± ${stddev.toFixed(3)}s`,
       mean: r.mean,
       stddev,
       min: r.min,
@@ -78,17 +59,16 @@ function readResult (benchDir, name, tool) {
     if (err && err.code !== 'ENOENT') {
       console.error(`Warning: failed to read ${name}-${tool}: ${err.message}`)
     }
-    return { text: 'n/a', median: null, mean: null, stddev: null, min: null, max: null }
+    return { text: 'n/a', mean: null, stddev: null, min: null, max: null }
   }
 }
 
-// Ratios are computed from medians (same statistic as the headline cells).
-function fmtSpeedup (baseMedian, heroMedian) {
-  if (baseMedian == null || heroMedian == null) return ''
-  if (heroMedian < baseMedian) {
-    return ` (${(baseMedian / heroMedian).toFixed(1)}x faster)`
-  } else if (heroMedian > baseMedian) {
-    return ` (${(heroMedian / baseMedian).toFixed(1)}x slower)`
+function fmtSpeedup (baseMean, aubeMean) {
+  if (baseMean == null || aubeMean == null) return ''
+  if (aubeMean < baseMean) {
+    return ` (${(baseMean / aubeMean).toFixed(1)}x faster)`
+  } else if (aubeMean > baseMean) {
+    return ` (${(aubeMean / baseMean).toFixed(1)}x slower)`
   }
   return ''
 }
@@ -97,20 +77,13 @@ function fmtSpeedup (baseMedian, heroMedian) {
 // Emits one row per scenario with a column per tool plus trailing
 // "vs pnpm" and "vs bun" speedup columns when those tools are present
 // in the run. pnpm is aube's drop-in-replacement target; bun is the
-// other "fast" package manager users compare against. When nub (the
-// Rust CLI embedding the aube engine) runs without aube, it takes the
-// hero seat; when both run, an extra "nub vs aube" column surfaces the
-// fork overhead (the two should be ~equal — divergence is a regression).
-const HERO = TOOLS.includes('aube') ? 'aube' : (TOOLS.includes('nub') ? 'nub' : null)
+// other "fast" package manager users compare against.
 const headerCells = ['#', 'Scenario', ...TOOLS]
-if (HERO && TOOLS.includes('pnpm')) {
+if (TOOLS.includes('pnpm') && TOOLS.includes('aube')) {
   headerCells.push('vs pnpm')
 }
-if (HERO && TOOLS.includes('bun')) {
+if (TOOLS.includes('bun') && TOOLS.includes('aube')) {
   headerCells.push('vs bun')
-}
-if (TOOLS.includes('nub') && TOOLS.includes('aube')) {
-  headerCells.push('nub vs aube')
 }
 
 const lines = [
@@ -132,36 +105,12 @@ if (versionsFile && fs.existsSync(versionsFile)) {
     if (name && version) versions[name] = version.trim()
   }
 }
-// `nub --version` prints only the nub version; the embedded aube engine
-// rev comes from the vendored submodule, which only the runner knows.
-if (process.env.BENCH_NUB_ENGINE_VERSION) {
-  versions['nub-aube-engine'] = process.env.BENCH_NUB_ENGINE_VERSION
-}
-
-// The environment block makes every results.json self-describing: which
-// config tier / GVS cell / advisory + release-age pins produced these
-// numbers. No number is publishable without its tier label, so the
-// label rides with the data. bench.sh exports the resolved knob values.
-const environment = {
-  tier: process.env.BENCH_TIER || null,
-  gvs: process.env.BENCH_GVS || 'pin-fast',
-  advisoryCheck: process.env.BENCH_ADVISORY_CHECK || 'default',
-  minimumReleaseAgeMinutes: process.env.BENCH_MIN_RELEASE_AGE_MINUTES || '1440',
-  ci: 'scrubbed (set only in the ci-loop-ci scenario)',
-  runs: process.env.RUNS || null,
-  warmup: process.env.WARMUP || null,
-  hermetic: process.env.BENCH_HERMETIC === '1',
-  bandwidth: process.env.BENCH_BANDWIDTH || null,
-  latency: process.env.BENCH_LATENCY || null,
-  fixture: process.env.BENCH_FIXTURE || 'default',
-}
 
 const json = {
   updated: new Date().toISOString(),
   unit: 'ms',
   managers: TOOLS,
   versions,
-  environment,
   rows: [],
 }
 
@@ -175,24 +124,19 @@ benchmarks.filter(([name]) => SELECTED_BENCHMARKS.has(name)).forEach(([name, lab
   for (const tool of TOOLS) {
     cells.push(results[tool].text)
   }
-  if (HERO && TOOLS.includes('pnpm')) {
-    cells.push(fmtSpeedup(results.pnpm.median, results[HERO].median).trim())
+  if (TOOLS.includes('pnpm') && TOOLS.includes('aube')) {
+    cells.push(fmtSpeedup(results.pnpm.mean, results.aube.mean).trim())
   }
-  if (HERO && TOOLS.includes('bun')) {
-    cells.push(fmtSpeedup(results.bun.median, results[HERO].median).trim())
-  }
-  if (TOOLS.includes('nub') && TOOLS.includes('aube')) {
-    cells.push(fmtSpeedup(results.aube.median, results.nub.median).trim())
+  if (TOOLS.includes('bun') && TOOLS.includes('aube')) {
+    cells.push(fmtSpeedup(results.bun.mean, results.aube.mean).trim())
   }
   lines.push(`| ${cells.join(' | ')} |`)
 
-  // `values` carries the headline statistic (median, ms); the full
-  // mean/median/stddev/min/max shape lives in `stats`.
   const values = {}
   const stats = {}
   for (const tool of TOOLS) {
-    values[tool] = results[tool].median == null ? null : Math.round(results[tool].median * 1000)
-    stats[tool] = results[tool].median == null ? null : results[tool]
+    values[tool] = results[tool].mean == null ? null : Math.round(results[tool].mean * 1000)
+    stats[tool] = results[tool].mean == null ? null : results[tool]
   }
 
   json.rows.push({ key: name, label, values, stats })
