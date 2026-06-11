@@ -552,6 +552,18 @@ pub use aube_util::ua::set_user_agent_product;
 /// before invoking any command.
 pub use aube_util::ua::set_lifecycle_user_agent_product;
 
+/// Lifecycle-script env overlay for embedders, re-exported from
+/// `aube-scripts`: [`ScriptSettings`] carries a generic `env_overlay`
+/// (extra environment pairs) and `path_prepends` (PATH entries placed
+/// first) applied to every lifecycle-script spawn, set via
+/// [`set_script_settings`]. aube assigns no meaning to the contents — an
+/// embedder fills them to route dep build scripts through a
+/// provisioned/augmented runtime (point `NODE` at a shim, pin
+/// `npm_node_execpath`, inject a preload via `NODE_OPTIONS`) without aube
+/// growing a runtime-specific field. Default-empty = stock behavior.
+/// Call before invoking any command that runs lifecycle scripts.
+pub use aube_scripts::{ScriptSettings, set_script_settings};
+
 /// Cache-root override for embedders, re-exported from `aube-util`:
 /// relocate the per-user cache root that defaults to
 /// `<XDG_CACHE_HOME>/aube` (packument caches, git clone cache,

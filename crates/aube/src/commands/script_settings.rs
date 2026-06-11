@@ -10,11 +10,19 @@ pub(crate) fn configure_script_settings(ctx: &aube_settings::ResolveCtx<'_>) {
         .and_then(|s| non_empty_string(s).map(Into::into));
     let unsafe_perm = aube_settings::resolved::unsafe_perm(ctx);
     let shell_emulator = aube_settings::resolved::shell_emulator(ctx);
+    // Carry the embedder-owned overlay forward: an embedder (e.g. nub)
+    // installs its `env_overlay` / `path_prepends` once up front, and this
+    // settings pass — which runs later, inside the install command — must not
+    // wipe them. The `.npmrc`/workspace-derived fields above are the only ones
+    // this function owns.
+    let prior = aube_scripts::script_settings_snapshot();
     aube_scripts::set_script_settings(aube_scripts::ScriptSettings {
         node_options,
         script_shell,
         unsafe_perm,
         shell_emulator,
+        env_overlay: prior.env_overlay,
+        path_prepends: prior.path_prepends,
     });
 }
 

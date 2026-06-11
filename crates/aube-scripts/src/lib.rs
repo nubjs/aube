@@ -38,6 +38,21 @@ pub struct ScriptSettings {
     pub script_shell: Option<PathBuf>,
     pub unsafe_perm: Option<bool>,
     pub shell_emulator: bool,
+    /// Embedder-supplied environment overlay applied verbatim to every
+    /// lifecycle spawn (`(key, value)` pairs, set last so they win over the
+    /// other `ScriptSettings`-derived keys). Generic by design — aube assigns
+    /// no meaning to the keys; an embedder fills it to route scripts through a
+    /// provisioned/augmented runtime (e.g. nub points `NODE` at its node shim,
+    /// pins `npm_node_execpath`, and injects its preload via `NODE_OPTIONS`)
+    /// without aube growing a runtime-specific field. Default-empty =
+    /// behavior-preserving: a stock aube spawns exactly as before.
+    pub env_overlay: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// Embedder-supplied PATH entries prepended (in order, ahead of the
+    /// existing PATH) to every lifecycle spawn. Counterpart to `env_overlay`
+    /// for the one variable whose composition aube already owns: an embedder
+    /// uses it to place a runtime shim dir first so a bare `node` in a build
+    /// script resolves to the augmented runtime. Default-empty = no-op.
+    pub path_prepends: Vec<PathBuf>,
 }
 
 /// Native build jail applied to dependency lifecycle scripts.
@@ -126,6 +141,15 @@ fn script_settings() -> ScriptSettings {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
+}
+
+/// Public snapshot of the process-wide [`ScriptSettings`]. Lets a caller
+/// read the current settings — in particular the embedder-owned
+/// `env_overlay` / `path_prepends` — so a later `set_script_settings`
+/// (e.g. aube's `.npmrc`/workspace settings pass) can carry the embedder
+/// fields forward instead of clobbering them.
+pub fn script_settings_snapshot() -> ScriptSettings {
+    script_settings()
 }
 
 /// Prepend `bin_dir` to the current `PATH` using the platform's path
@@ -504,6 +528,26 @@ fn apply_script_settings_env(cmd: &mut tokio::process::Command, settings: &Scrip
     if settings.shell_emulator {
         cmd.env("npm_config_shell_emulator", "true");
     }
+    // Embedder env overlay, applied LAST so it outranks the keys above (an
+    // embedder that, say, pins its own NODE_OPTIONS wins over the
+    // settings-derived one). Generic: aube assigns no meaning to the keys.
+    for (key, value) in &settings.env_overlay {
+        cmd.env(key, value);
+    }
+}
+
+/// Prepend `prepends` (in order) ahead of `existing`, joined with the
+/// platform PATH separator. Pure so it's unit-testable without a spawn;
+/// used to compose the embedder's `path_prepends` onto a lifecycle
+/// script's PATH (the shim dir lands first so a bare `node` in a build
+/// script resolves to the embedder's augmented runtime).
+fn compose_overlay_path(prepends: &[PathBuf], existing: &std::ffi::OsStr) -> std::ffi::OsString {
+    if prepends.is_empty() {
+        return existing.to_owned();
+    }
+    let mut entries: Vec<PathBuf> = prepends.to_vec();
+    entries.extend(std::env::split_paths(existing));
+    std::env::join_paths(entries).unwrap_or_else(|_| existing.to_owned())
 }
 
 fn safe_jail_env_key(key: &str) -> bool {
@@ -862,6 +906,12 @@ pub async fn run_script(
     let new_path = std::env::join_paths(entries).unwrap_or(path);
 
     let settings = script_settings();
+    // Embedder PATH prepends (e.g. nub's node-shim dir) lead the composed
+    // PATH so a bare `node` in a build script hits the augmented runtime
+    // before `extra_bin_dirs` / the project `.bin` / the system PATH. Flows
+    // through both the jailed and non-jailed branches: `apply_jail_env`
+    // re-applies this same `new_path` after its `env_clear()`.
+    let new_path = compose_overlay_path(&settings.path_prepends, &new_path);
     let jail_home = jail.map(|j| jail_home(&j.package_dir));
     if let Some(home) = &jail_home {
         std::fs::create_dir_all(home)
@@ -1132,6 +1182,81 @@ mod user_agent_tests {
             ),
             "arch `{arch}` should follow Node's `process.arch` vocabulary"
         );
+    }
+}
+
+#[cfg(test)]
+mod env_overlay_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn env_value<'a>(cmd: &'a tokio::process::Command, name: &str) -> Option<&'a OsString> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+            .and_then(|(_, val)| val)
+            .map(|v| v.to_owned())
+            .map(|v| Box::leak(Box::new(v)) as &OsString)
+    }
+
+    /// The embedder-supplied `env_overlay` is applied to every lifecycle
+    /// spawn so nub can route dep build scripts through its augmented Node
+    /// (NODE → shim, NODE_OPTIONS preload, npm_node_execpath pin) without a
+    /// nub-specific field in `ScriptSettings`. Default-empty = behavior
+    /// preserved when no embedder fills it.
+    #[test]
+    fn env_overlay_keys_are_applied() {
+        let mut cmd = tokio::process::Command::new("node");
+        let settings = ScriptSettings {
+            env_overlay: vec![
+                (OsString::from("NODE"), OsString::from("/shim/node")),
+                (
+                    OsString::from("npm_node_execpath"),
+                    OsString::from("/pinned/node"),
+                ),
+            ],
+            ..Default::default()
+        };
+        apply_script_settings_env(&mut cmd, &settings);
+
+        assert_eq!(
+            env_value(&cmd, "NODE").map(|v| v.to_string_lossy().into_owned()),
+            Some("/shim/node".to_string()),
+            "env_overlay must set $NODE so userland $NODE child.js re-enters the augmented Node"
+        );
+        assert_eq!(
+            env_value(&cmd, "npm_node_execpath").map(|v| v.to_string_lossy().into_owned()),
+            Some("/pinned/node".to_string()),
+            "env_overlay must pin npm_node_execpath to the provisioned Node (ABI fix)"
+        );
+    }
+
+    /// Empty overlay + prepends is a pure no-op: nothing about the spawn env
+    /// changes, so the upstream-default behavior is preserved bit-for-bit.
+    #[test]
+    fn empty_overlay_is_behavior_preserving() {
+        let mut cmd = tokio::process::Command::new("node");
+        let settings = ScriptSettings::default();
+        apply_script_settings_env(&mut cmd, &settings);
+        assert!(
+            env_value(&cmd, "NODE").is_none(),
+            "default ScriptSettings must not introduce a $NODE override"
+        );
+        assert!(settings.path_prepends.is_empty());
+    }
+
+    /// `path_prepends` lands ahead of the existing PATH in order, so the shim
+    /// dir wins over the system node — composed by [`compose_overlay_path`].
+    #[test]
+    fn path_prepends_lead_the_existing_path() {
+        let base = OsString::from("/usr/bin:/bin");
+        let prepends = vec![PathBuf::from("/shim"), PathBuf::from("/tools")];
+        let composed = compose_overlay_path(&prepends, &base);
+        let composed = composed.to_string_lossy();
+        #[cfg(unix)]
+        assert_eq!(composed, "/shim:/tools:/usr/bin:/bin");
+        #[cfg(windows)]
+        assert!(composed.starts_with("/shim;/tools;"));
     }
 }
 
