@@ -500,6 +500,54 @@ importers:
 }
 
 #[test]
+fn parse_semver_range_resolved_to_workspace_link_is_rebased_from_importer() {
+    // pnpm resolves a plain semver-range dep to a local workspace sibling
+    // when the range satisfies the sibling's version (default
+    // link-workspace-packages). The lockfile then records the importer-relative
+    // `version: link:../pkg-b` under a NON-`workspace:` specifier (`^1.0.0`).
+    // That importer-relative path must be rebased to root just like the
+    // `workspace:*` case — otherwise the linker materializes a symlink with one
+    // extra `..` per importer-depth segment and the package is unresolvable.
+    // Real-world repro: dub's `@dub/embed-react` -> `@dub/embed-core: ^0.0.18`.
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(
+        &lockfile_path,
+        r#"
+lockfileVersion: '9.0'
+
+importers:
+  .: {}
+
+  packages/embeds/react:
+    dependencies:
+      embed-core:
+        specifier: ^0.0.18
+        version: link:../core
+
+  packages/embeds/core: {}
+"#,
+    )
+    .unwrap();
+
+    let graph = parse(&lockfile_path).unwrap();
+    let core = graph
+        .packages
+        .values()
+        .find(|pkg| pkg.name == "embed-core")
+        .expect("embed-core");
+    assert_eq!(
+        core.local_source,
+        Some(LocalSource::Link("packages/embeds/core".into())),
+        "a semver range resolving to a workspace link must rebase the importer-relative path to root"
+    );
+    assert_eq!(
+        graph.importers["packages/embeds/react"][0].dep_path,
+        core.dep_path
+    );
+}
+
+#[test]
 fn parse_aube_written_workspace_local_paths_are_not_rebased_twice() {
     let dir = tempfile::tempdir().unwrap();
     let lockfile_path = dir.path().join("pnpm-lock.yaml");

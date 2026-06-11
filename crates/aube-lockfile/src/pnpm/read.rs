@@ -137,8 +137,22 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 other => other,
             };
             let snapshot_key = format!("{name}@{}", local.specifier());
+            // pnpm writes a non-root importer's local `version:` path relative to
+            // that importer, so it must be rebased to root. This covers a literal
+            // `link:`/`file:` spec (`specifier == version`), the `workspace:`
+            // protocol, AND a plain semver range pnpm resolved to a workspace
+            // sibling — that last case carries a NON-`workspace:` specifier (e.g.
+            // `^0.0.18`) but still an importer-relative `version: link:../sibling`
+            // (real-world: dub's `@dub/embed-react` -> `@dub/embed-core`). The
+            // common thread is an importer-relative path, which pnpm always spells
+            // with a leading `..`; aube's own format is already root-relative and
+            // never escapes upward, so this never double-rebases (the
+            // `not_rebased_twice` invariant).
+            let importer_relative = local.path().is_some_and(|p| p.starts_with(".."));
             let should_rebase = importer_path != "."
-                && (info.specifier == classify_version || info.specifier.starts_with("workspace:"));
+                && (info.specifier == classify_version
+                    || info.specifier.starts_with("workspace:")
+                    || importer_relative);
             let local = if should_rebase {
                 rebase_importer_local(local, importer_path)
             } else {
