@@ -591,6 +591,13 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // install (assigned by both branches below). Input to the
     // `defaultTrust` floor.
     let osv_gate_active;
+    // Whether this install's graph inherits resolution-time vetting
+    // from an unchanged lockfile (frozen install / `aube ci` /
+    // teammate clone, or a re-resolve that reproduced the locked
+    // picks). The `defaultTrust` floor uses this to trust its
+    // allowlist without a per-install OSV run — see
+    // `wiki/commands/pm/supply-chain-posture.md` Decision 2.
+    let lockfile_vetted;
     let (graph, package_indices, cached_count, fetch_count) = match lockfile_result {
         Ok((graph, kind)) => {
             let graph = resolve::apply_lockfile_graph_platform_rules(
@@ -646,6 +653,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 osv_settings.advisory_check_every_install,
             )
             .await?;
+            // Graph came straight from the lockfile (frozen reinstall /
+            // `aube ci` / clone) — it carries the advisory + cooling
+            // vetting performed when the lockfile was written, so the
+            // `defaultTrust` floor inherits it rather than requiring a
+            // (correctly skipped) per-install OSV run.
+            lockfile_vetted = true;
 
             // Check index cache, fetch missing tarballs. Tarball client
             // is lazy because eager construction costs ~20ms even when
@@ -1377,6 +1390,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 osv_settings.advisory_check_every_install,
             )
             .await?;
+            // The resolver ran, but when it reproduced the locked picks
+            // (`fresh_resolution == false`) the graph still matches what
+            // the lockfile vetted, so the floor may inherit that vetting.
+            // A graph with new picks is covered by this install's OSV
+            // gate (live path) instead, not by inheritance.
+            lockfile_vetted = !fresh_resolution;
 
             // Bun-compatible security scanner runs against the
             // *resolved* graph — full transitive set with concrete
@@ -1833,6 +1852,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         &settings_ctx,
         opts.minimum_release_age_override,
         osv_gate_active,
+        lockfile_vetted,
     );
     finalize::run_finalize_phase(finalize::FinalizePhaseInput {
         cwd: &cwd,
