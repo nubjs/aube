@@ -480,13 +480,29 @@ pub(super) fn file_protocol_source(body: &str) -> LocalSource {
 /// `name@patch:name@npm%3Aversion#./.yarn/patches/name.patch::version=...`.
 /// Aube applies the patch through its existing git-diff materializer, so
 /// the only part needed here is the project-relative path after `#`.
+///
+/// Returns `None` for builtin-compat patches — yarn's internal shims for
+/// packages like `resolve`/`typescript`, which carry no real patch file
+/// and resolve from the companion `npm:` block. These appear bare
+/// (`builtin<compat/resolve>`, `~builtin<...>`) or with a `<qualifier>!`
+/// prefix (`optional!builtin<compat/resolve>` — the common berry form via
+/// eslint-plugin-import/webpack/rollup). The qualifier is stripped before
+/// the builtin check so the `!`-qualified target isn't mistaken for a
+/// filesystem path.
 fn patch_protocol_path(body: &str) -> Option<String> {
     let (_, after_hash) = body.split_once('#')?;
     let path = after_hash
         .split_once("::")
         .map(|(p, _)| p)
         .unwrap_or(after_hash);
-    if path.is_empty() || path.starts_with("builtin<") || path.starts_with("~builtin<") {
+    // A `<qualifier>!builtin<...>` target carries one or more `!`-joined
+    // qualifiers (e.g. `optional!`) ahead of the selector. Strip up to and
+    // including the last `!` so the builtin check sees the bare selector.
+    let selector = path.rsplit_once('!').map(|(_, s)| s).unwrap_or(path);
+    if selector.is_empty()
+        || selector.starts_with("builtin<")
+        || selector.starts_with("~builtin<")
+    {
         return None;
     }
     Some(path.to_string())
