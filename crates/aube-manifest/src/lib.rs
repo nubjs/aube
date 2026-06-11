@@ -11,6 +11,83 @@ const DEFAULT_MANIFEST_CONFIG_NAMESPACES: &[&str] = &["pnpm", "aube"];
 
 static MANIFEST_CONFIG_NAMESPACES: OnceLock<Vec<String>> = OnceLock::new();
 
+static EMBEDDER_OVERRIDES: OnceLock<Option<BTreeMap<String, String>>> = OnceLock::new();
+
+static TRUSTED_DEPENDENCIES_HONORED: OnceLock<bool> = OnceLock::new();
+
+/// Replace the dependency-override source consulted by [`PackageJson::overrides_map`].
+///
+/// `Some(map)` makes the supplied map the *sole* override source —
+/// [`overrides_map`](PackageJson::overrides_map) returns it verbatim
+/// instead of folding the manifest's `resolutions` / `pnpm.overrides` /
+/// top-level `overrides` sources with the built-in precedence. `None`
+/// (the default) leaves upstream behavior untouched.
+///
+/// This is the embedder seam for tools that scope which override
+/// dialects apply per project (e.g. honoring only the active package
+/// manager's native field). aube assigns no policy here — it consumes
+/// whatever map the embedder computed, typically from
+/// [`PackageJson::tagged_overrides`]. Idempotent (`OnceLock`); call once
+/// per process before invoking any command. Workspace-level overrides
+/// from `pnpm-workspace.yaml` are still merged on top by the caller.
+pub fn set_embedder_overrides(overrides: Option<BTreeMap<String, String>>) {
+    let _ = EMBEDDER_OVERRIDES.set(overrides);
+}
+
+/// The embedder override source currently in effect, or `None` for the
+/// upstream default (fold every manifest source with built-in precedence).
+fn embedder_overrides() -> Option<&'static BTreeMap<String, String>> {
+    EMBEDDER_OVERRIDES.get().and_then(Option::as_ref)
+}
+
+/// Toggle whether Bun's top-level `trustedDependencies` array contributes
+/// to the lifecycle build allowlist (via [`PackageJson::trusted_dependencies`]).
+///
+/// `true` (the default) preserves upstream behavior — `trustedDependencies`
+/// unions into the allowlist. `false` makes
+/// [`trusted_dependencies`](PackageJson::trusted_dependencies) return an
+/// empty list, for embedders whose active package manager ignores the
+/// field (every PM except Bun, and Bun itself from the version that
+/// dropped it). Idempotent (`OnceLock`); call once per process before
+/// invoking any command that runs lifecycle scripts.
+pub fn set_trusted_dependencies_honored(honored: bool) {
+    let _ = TRUSTED_DEPENDENCIES_HONORED.set(honored);
+}
+
+/// Whether `trustedDependencies` currently contributes to the build
+/// allowlist. Defaults to `true` (upstream behavior).
+fn trusted_dependencies_honored() -> bool {
+    *TRUSTED_DEPENDENCIES_HONORED.get().unwrap_or(&true)
+}
+
+/// Which top-level / namespaced source a dependency-override entry was
+/// declared in, as yielded by [`PackageJson::tagged_overrides`]. The
+/// source is preserved un-merged so an embedder can apply per-dialect
+/// scoping policy (keep only the active package manager's native field)
+/// before folding with [`overrides_map`](PackageJson::overrides_map)'s
+/// precedence. aube itself attaches no policy to the tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideSource {
+    /// yarn-style top-level `resolutions`.
+    Resolutions,
+    /// Namespaced `pnpm.overrides` / `aube.overrides`.
+    NamespacedOverrides,
+    /// Top-level `overrides` (npm / pnpm / bun).
+    Overrides,
+}
+
+/// One override entry tagged with the manifest source it came from.
+/// `key` is the raw selector string, `value` the raw version/spec string.
+/// No merge, precedence, or `$name` resolution is applied — that lives in
+/// [`overrides_map`](PackageJson::overrides_map) (precedence) and
+/// [`resolve_override_refs`](PackageJson::resolve_override_refs) (refs).
+#[derive(Debug, Clone)]
+pub struct TaggedOverride {
+    pub source: OverrideSource,
+    pub key: String,
+    pub value: String,
+}
+
 /// Override which top-level `package.json` objects aube reads (and
 /// writes) workspace-level config from, in precedence order —
 /// later entries win on key conflict for map-shaped settings.
@@ -587,6 +664,13 @@ impl PackageJson {
     /// to get scripts running. Non-string entries are dropped; a denylist
     /// match in `neverBuiltDependencies` still wins at `decide()` time.
     pub fn trusted_dependencies(&self) -> Vec<String> {
+        // Embedder seam: a tool whose active package manager ignores
+        // `trustedDependencies` (everything but Bun, and Bun once it dropped
+        // the field) sets this off so the union contributes nothing. Default
+        // on ⇒ upstream behavior.
+        if !trusted_dependencies_honored() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         if let Some(arr) = self
             .extra
@@ -767,33 +851,87 @@ impl PackageJson {
     /// values. Workspace-level overrides from `pnpm-workspace.yaml`
     /// are merged on top of this map by the caller.
     pub fn overrides_map(&self) -> BTreeMap<String, String> {
+        // Embedder seam: when a tool has computed a scoped override source
+        // (e.g. only the active PM's native field), use it verbatim and skip
+        // the fold. Default `None` ⇒ upstream behavior below.
+        if let Some(scoped) = embedder_overrides() {
+            return scoped.clone();
+        }
+        Self::fold_tagged_overrides(self.tagged_overrides())
+    }
+
+    /// Fold a source-tagged override list into a single map using aube's
+    /// built-in precedence (low → high): `resolutions`, then
+    /// `pnpm.overrides`/`aube.overrides`, then top-level `overrides`. Shared
+    /// by [`overrides_map`](Self::overrides_map) (upstream path) and any
+    /// embedder that scopes [`tagged_overrides`](Self::tagged_overrides)
+    /// then wants the native precedence applied to the survivors. Folding a
+    /// list that preserves source order yields a byte-identical map to the
+    /// historical per-source walk.
+    pub fn fold_tagged_overrides(tagged: Vec<TaggedOverride>) -> BTreeMap<String, String> {
+        let rank = |s: OverrideSource| match s {
+            OverrideSource::Resolutions => 0u8,
+            OverrideSource::NamespacedOverrides => 1,
+            OverrideSource::Overrides => 2,
+        };
+        // Stable sort by precedence rank keeps within-rank insertion order
+        // (so `aube.overrides` still wins over `pnpm.overrides`, and later
+        // top-level entries follow declaration order), then later-wins on
+        // key collision reproduces the original sequential inserts.
+        let mut tagged = tagged;
+        tagged.sort_by_key(|t| rank(t.source));
         let mut out: BTreeMap<String, String> = BTreeMap::new();
-        let insert = |out: &mut BTreeMap<String, String>,
-                      obj: &serde_json::Map<String, serde_json::Value>| {
+        for t in tagged {
+            out.insert(t.key, t.value);
+        }
+        out
+    }
+
+    /// Collect dependency overrides from every supported manifest source as
+    /// a flat, source-tagged list — no merge, no precedence, no `$name`
+    /// resolution. Entries appear in the order they are declared within each
+    /// source; the order across sources is `resolutions`, then
+    /// `pnpm.overrides`/`aube.overrides` (namespace order), then top-level
+    /// `overrides`. The same malformed-key / non-string-value filtering as
+    /// [`overrides_map`](Self::overrides_map) applies (structural selector
+    /// validation lives in `aube_resolver::override_rule`).
+    ///
+    /// This is the neutral seam embedders use to apply per-dialect scoping
+    /// (keep only the active package manager's native field) before folding
+    /// back to a precedence map via [`fold_tagged_overrides`](Self::fold_tagged_overrides).
+    pub fn tagged_overrides(&self) -> Vec<TaggedOverride> {
+        let mut out: Vec<TaggedOverride> = Vec::new();
+        let push = |out: &mut Vec<TaggedOverride>,
+                    source: OverrideSource,
+                    obj: &serde_json::Map<String, serde_json::Value>| {
             for (k, v) in obj {
                 if let Some(s) = v.as_str()
                     && is_valid_selector_key(k)
                 {
-                    out.insert(k.clone(), s.to_string());
+                    out.push(TaggedOverride {
+                        source,
+                        key: k.clone(),
+                        value: s.to_string(),
+                    });
                 }
             }
         };
 
         // yarn `resolutions` (lowest priority)
         if let Some(obj) = self.extra.get("resolutions").and_then(|v| v.as_object()) {
-            insert(&mut out, obj);
+            push(&mut out, OverrideSource::Resolutions, obj);
         }
 
         // `pnpm.overrides` then `aube.overrides` (later wins)
         for ns in self.pnpm_aube_objects() {
             if let Some(obj) = ns.get("overrides").and_then(|v| v.as_object()) {
-                insert(&mut out, obj);
+                push(&mut out, OverrideSource::NamespacedOverrides, obj);
             }
         }
 
-        // Top-level `overrides` (npm / pnpm) — highest priority
+        // Top-level `overrides` (npm / pnpm / bun) — highest priority
         if let Some(obj) = self.extra.get("overrides").and_then(|v| v.as_object()) {
-            insert(&mut out, obj);
+            push(&mut out, OverrideSource::Overrides, obj);
         }
 
         out
@@ -1580,6 +1718,62 @@ mod tests {
         assert_eq!(m.get("a").unwrap(), "1");
         assert_eq!(m.get("b").unwrap(), "2");
         assert_eq!(m.get("c").unwrap(), "3");
+    }
+
+    #[test]
+    fn tagged_overrides_tags_each_source_and_preserves_declaration_order() {
+        let p = parse(
+            r#"{
+                "resolutions": {"a": "1"},
+                "pnpm": {"overrides": {"b": "2"}},
+                "overrides": {"c": "3", "d": "4"}
+            }"#,
+        );
+        let tagged = p.tagged_overrides();
+        let by_key: std::collections::BTreeMap<_, _> = tagged
+            .iter()
+            .map(|t| (t.key.as_str(), (t.source, t.value.as_str())))
+            .collect();
+        assert_eq!(by_key["a"], (OverrideSource::Resolutions, "1"));
+        assert_eq!(by_key["b"], (OverrideSource::NamespacedOverrides, "2"));
+        assert_eq!(by_key["c"], (OverrideSource::Overrides, "3"));
+        assert_eq!(by_key["d"], (OverrideSource::Overrides, "4"));
+    }
+
+    #[test]
+    fn fold_tagged_overrides_reproduces_overrides_map_precedence() {
+        // Folding the full tagged list must be byte-identical to the legacy
+        // per-source walk: top-level `overrides` > namespaced > resolutions.
+        let p = parse(
+            r#"{
+                "resolutions": {"lodash": "1.0.0"},
+                "pnpm": {"overrides": {"lodash": "2.0.0"}},
+                "overrides": {"lodash": "3.0.0"}
+            }"#,
+        );
+        let folded = PackageJson::fold_tagged_overrides(p.tagged_overrides());
+        assert_eq!(folded, p.overrides_map());
+        assert_eq!(folded.get("lodash").unwrap(), "3.0.0");
+    }
+
+    #[test]
+    fn fold_tagged_overrides_scoped_to_one_source_keeps_only_that_field() {
+        // The scoping use case: drop every source but `resolutions`, then
+        // fold. The top-level `overrides` pin must NOT leak through.
+        let p = parse(
+            r#"{
+                "resolutions": {"lodash": "1.0.0"},
+                "overrides": {"lodash": "3.0.0", "extra": "9.9.9"}
+            }"#,
+        );
+        let scoped: Vec<_> = p
+            .tagged_overrides()
+            .into_iter()
+            .filter(|t| t.source == OverrideSource::Resolutions)
+            .collect();
+        let folded = PackageJson::fold_tagged_overrides(scoped);
+        assert_eq!(folded.get("lodash").unwrap(), "1.0.0");
+        assert!(!folded.contains_key("extra"));
     }
 
     #[test]

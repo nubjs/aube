@@ -588,6 +588,25 @@ pub use aube_manifest::workspace::set_workspace_yaml_names;
 /// unaffected. Call once per process before invoking any command.
 pub use aube_manifest::set_manifest_config_namespaces;
 
+/// Dependency-override source override for embedders, re-exported from
+/// `aube-manifest`: `Some(map)` makes the supplied map the sole source
+/// consumed by override resolution (replacing the manifest's
+/// `resolutions`/`pnpm.overrides`/top-level `overrides` fold); `None`
+/// (default) leaves upstream behavior. Pairs with
+/// [`aube_manifest::PackageJson::tagged_overrides`] +
+/// [`aube_manifest::PackageJson::fold_tagged_overrides`] for tools that
+/// scope which override dialects apply per project. Call once per process
+/// before invoking any command.
+pub use aube_manifest::set_embedder_overrides;
+
+/// `trustedDependencies` honor toggle for embedders, re-exported from
+/// `aube-manifest`: `false` drops Bun's top-level `trustedDependencies`
+/// from the lifecycle build allowlist (for tools whose active package
+/// manager ignores the field); `true` (default) keeps upstream behavior.
+/// Call once per process before invoking any command that runs lifecycle
+/// scripts.
+pub use aube_manifest::set_trusted_dependencies_honored;
+
 /// Canonical-lockfile filename override for embedders, re-exported
 /// from `aube-lockfile`: rename the file backing
 /// [`aube_lockfile::LockfileKind::Aube`] (default `aube-lock.yaml`).
