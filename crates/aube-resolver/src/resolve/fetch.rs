@@ -203,14 +203,25 @@ async fn fetch_one_packument(inputs: FetchInputs) -> Result<(String, Packument, 
         }
         if needs_time {
             if let Some(dir) = full_cache_dir.as_ref() {
-                client.seed_full_packument_cache(
-                    &name,
-                    dir,
-                    &packument,
-                    seed.etag.as_deref(),
-                    seed.last_modified.as_deref(),
-                    false,
-                );
+                // Deliberately seed WITHOUT the primer's ETag /
+                // Last-Modified. The bundled primer is a *truncated*
+                // slice (newest `version_cap` versions) of the full
+                // packument, but it carries the registry's real
+                // validators for the complete document. Writing them
+                // into the full-packument cache would let a later
+                // range-miss refetch (driver's `NoMatch` heal under
+                // `minimumReleaseAge`) send `If-None-Match`, get a
+                // `304 Not Modified`, and resurrect the *truncated*
+                // body as if it were authoritative — so a range like
+                // `^5.1.0` against a high-churn package whose newest
+                // `version_cap` publishes are all newer (e.g.
+                // `eslint-plugin-react-hooks`, 2600+ versions) would
+                // fail to resolve a version that plainly exists.
+                // Dropping the validators forces that heal to be an
+                // honest unconditional full GET. The common
+                // primer-is-sufficient path never refetches, so it is
+                // unaffected.
+                client.seed_full_packument_cache(&name, dir, &packument, None, None, false);
             }
         } else if let Some(dir) = cache_dir.as_ref() {
             client.seed_packument_cache(
