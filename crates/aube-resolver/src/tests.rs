@@ -3710,6 +3710,42 @@ fn cve_audit_protocol_dist_tag_hijack_blocked() {
     assert_protocol_hijack_blocked("GIT+FILE:/local");
 }
 
+// The enumerated-prefix guard above only blocks the ~18 known
+// protocols. An attacker can pick a scheme aube never enumerated —
+// `evil:steal`, `patch:foo`, `tarball:x` — register a dist-tag of that
+// literal name on a package they control, and aube would resolve the
+// colon-scheme spec straight to it (dependency-confusion: npm forbids
+// colons in dist-tag names, but the registry does not enforce that).
+// npm rejects with EUNSUPPORTEDPROTOCOL, pnpm with
+// ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER, bun rejects too — none
+// resolve a colon-scheme spec to a dist-tag. Any URL-scheme-shaped
+// prefix must be blocked, not just the enumerated allowlist.
+#[test]
+fn cve_audit_unenumerated_scheme_dist_tag_hijack_blocked() {
+    assert_protocol_hijack_blocked("evil:steal");
+    assert_protocol_hijack_blocked("patch:foo");
+    assert_protocol_hijack_blocked("tarball:x");
+    assert_protocol_hijack_blocked("x+y.z-1:payload");
+}
+
+// The guard must reject scheme-shaped specs WITHOUT swallowing
+// legitimate colon-less dist-tags. A real custom tag (`nightly`) still
+// resolves through the dist-tag fallback, and so does the `latest`
+// special case — npm forbids colons in tag names, so a colon-less name
+// is unambiguously a tag, never a protocol selector.
+#[test]
+fn colonless_dist_tag_still_resolves_after_scheme_guard() {
+    let mut packument = make_packument("foo", &["1.0.0", "2.0.0"], "2.0.0");
+    packument
+        .dist_tags
+        .insert("nightly".to_string(), "1.0.0".to_string());
+    let result = pick_version(&packument, "nightly", None, false, None, false).unwrap();
+    assert_eq!(result.version, "1.0.0");
+
+    let result = pick_version(&packument, "latest", None, false, None, false).unwrap();
+    assert_eq!(result.version, "2.0.0");
+}
+
 // pnpm-parity: a non-peer-declaring package between an importer and a
 // peer-declaring descendant must carry the descendant's
 // `(peer@version)` suffix on its own dep_path, AND on the importer

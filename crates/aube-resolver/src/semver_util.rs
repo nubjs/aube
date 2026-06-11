@@ -193,36 +193,33 @@ pub(crate) fn pick_version<'a>(
 /// and returning NoMatch there would break `aube install foo` for
 /// no real reason. npm and pnpm both fall back to highest stable.
 #[inline]
-/// True when `range_str` looks like a non-registry protocol selector
-/// that should never reach the dist-tag fallback (workspace / catalog
-/// / file / link / npm-alias / jsr-alias / git / http(s)). Lowercased
-/// so an attacker dist-tag named `Workspace:*` cannot bypass the gate.
+/// True when `range_str` carries a URL-scheme-shaped prefix and so must
+/// never reach the dist-tag fallback — workspace / catalog / file / link
+/// / npm-alias / jsr-alias / git / http(s), but also any scheme aube
+/// does not enumerate.
+///
+/// This is a *denylist by shape*, not an allowlist of known protocols.
+/// The earlier allowlist (workspace/catalog/npm/.../gist) only blocked
+/// the ~18 enumerated prefixes, so an attacker could pick a scheme aube
+/// never listed (`evil:steal`, `patch:foo`), register a dist-tag of that
+/// literal name on a package they control, and have the colon-scheme
+/// spec resolve straight to it (dependency-confusion). npm forbids colons
+/// in dist-tag names — and npm / pnpm / bun all reject a colon-scheme
+/// spec rather than treating it as a tag — so a colon-after-a-scheme is
+/// unambiguously a protocol selector, never a registry tag. We match the
+/// RFC-3986 scheme grammar `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
+/// followed by `:`. A bare dist-tag (`latest`, `next`, `beta-1`) has no
+/// colon and so is never blocked; this strengthens the existing guard
+/// without rejecting anything that legitimately resolved before.
 fn looks_like_protocol_range(range_str: &str) -> bool {
     let Some(idx) = range_str.find(':') else {
         return false;
     };
-    let prefix = range_str[..idx].to_ascii_lowercase();
-    matches!(
-        prefix.as_str(),
-        "workspace"
-            | "catalog"
-            | "npm"
-            | "jsr"
-            | "file"
-            | "link"
-            | "git"
-            | "git+ssh"
-            | "git+http"
-            | "git+https"
-            | "git+file"
-            | "ssh"
-            | "http"
-            | "https"
-            | "github"
-            | "gitlab"
-            | "bitbucket"
-            | "gist"
-    )
+    let scheme = &range_str[..idx];
+    let mut chars = scheme.chars();
+    // Scheme must start with a letter, then letters/digits/`+`/`-`/`.`.
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 #[inline]
