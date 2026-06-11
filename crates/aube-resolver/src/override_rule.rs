@@ -245,10 +245,9 @@ pub struct AncestorFrame<'a> {
 
 /// Test a rule against a target task plus its ancestor chain. The
 /// target's version constraint (if any) is matched against
-/// `task_range` via a pragmatic "does the lower-bound version of the
-/// range satisfy the req" probe — good enough for the common pnpm
-/// `foo@<2` / `^1.2.0` shape without pulling in a full range
-/// intersection engine.
+/// `task_range` via true range intersection (`range_could_satisfy`),
+/// mirroring pnpm's `semver.intersects` — the override fires whenever
+/// the declared range could resolve to a version the selector covers.
 pub fn matches(
     rule: &OverrideRule,
     task_name: &str,
@@ -320,65 +319,34 @@ fn version_in_req(version: &str, req: &str) -> bool {
     v.satisfies(&r)
 }
 
-/// Pragmatic "does the task range overlap the selector req" test.
-/// Checks two representative points: the range string itself
-/// interpreted as a concrete version, and the range's lower bound
-/// (if extractable). Works for the practical cases `^1.2.3` /
-/// `~1.2.3` / `1.2.3` paired with selectors like `<2` or `^1`.
+/// Does the task's declared range overlap the selector req? This is a
+/// true range intersection — "is there any version satisfying both the
+/// declared range and the selector range" — matching pnpm's
+/// `isIntersectingRange` (`semver.intersects`) in
+/// `createVersionsOverrider`. A range-selector override fires whenever
+/// the declared range *could resolve* to a version the selector covers,
+/// even when the declared range's lower bound sits below the selector
+/// (e.g. declared `^7.0.0` vs selector `>=7.5.0`: 7.8.4 satisfies both,
+/// so the override applies — a security/compat downgrade keyed on the
+/// range no longer silently drops).
 ///
-/// Known limitation: this is a lower-bound probe, not a true range
-/// intersection. A task range whose lower bound is *below* the
-/// selector req but which still overlaps it (e.g. task `^1.0.0` vs
-/// selector `>=1.5.0`) will incorrectly return `false` and skip the
-/// override. When that happens we emit a `tracing::debug!` so the
-/// trade-off is observable — users chasing a missing override hit
-/// can see why the selector didn't fire and reach for a broader
-/// range or an exact version override.
-///
-/// For oddball ranges we can't extract a lower bound from, we
-/// return `true` (overridden too aggressively beats silently
-/// ignoring) so users at least see the override take effect.
+/// For a selector req we can't parse as a range we return `true`
+/// (overriding too aggressively beats silently ignoring); for a task
+/// range we can't parse we also don't block the override.
 fn range_could_satisfy(task_range: &str, req: &str) -> bool {
-    let Ok(r) = node_semver::Range::parse(req) else {
+    let Ok(selector) = node_semver::Range::parse(req) else {
         return true;
     };
-    if let Ok(v) = node_semver::Version::parse(task_range)
-        && v.satisfies(&r)
-    {
+    // A concrete pinned version as the task range: membership in the
+    // selector is the intersection question.
+    if let Ok(v) = node_semver::Version::parse(task_range) {
+        return v.satisfies(&selector);
+    }
+    let Ok(declared) = node_semver::Range::parse(task_range) else {
+        // Couldn't make sense of task_range. Don't block the override.
         return true;
-    }
-    if let Some(candidate) = lower_bound_version(task_range)
-        && let Ok(v) = node_semver::Version::parse(&candidate)
-    {
-        let hit = v.satisfies(&r);
-        if !hit {
-            tracing::debug!(
-                "override selector req {req:?} skipped for task range \
-                 {task_range:?}: lower bound {candidate} does not satisfy \
-                 req (ranges may still overlap above the lower bound — \
-                 consider a broader selector or an exact version override)"
-            );
-        }
-        return hit;
-    }
-    // We couldn't make sense of task_range. Don't block the override.
-    true
-}
-
-/// Best-effort extraction of a concrete lower-bound version from a
-/// range string. Handles the shapes we care about in practice:
-/// `^1.2.3`, `~1.2.3`, `>=1.2.3`, plain `1.2.3`, with optional
-/// leading `v`. Returns `None` when we can't pull a clean version
-/// out — the caller falls back to "probably matches".
-fn lower_bound_version(range: &str) -> Option<String> {
-    let s = range.trim();
-    let s = s.trim_start_matches(['^', '~', '=', '>', 'v', ' ']);
-    let end = s.find([' ', ',', '<', '|', '>']).unwrap_or(s.len());
-    let v = &s[..end];
-    if v.is_empty() || !v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(v.to_string())
+    };
+    declared.allows_any(&selector)
 }
 
 #[cfg(test)]
@@ -547,6 +515,28 @@ mod tests {
     }
 
     #[test]
+    fn target_version_req_matches_when_range_overlaps_above_lower_bound() {
+        // A range-selector override whose lower bound is *above* the
+        // declared range's lower bound, but whose range still overlaps
+        // it, must apply — matching pnpm's `semver.intersects`. Declared
+        // `^7.0.0` (>=7.0.0 <8.0.0) overlaps selector `>=7.5.0` (a real
+        // version like 7.8.4 satisfies both), so a security/compat
+        // downgrade keyed on the range fires instead of silently
+        // dropping. Regression for the lower-bound-probe limitation.
+        let r = rule("semver@>=7.5.0", "7.3.8");
+        assert!(matches(&r, "semver", "^7.0.0", &[]));
+    }
+
+    #[test]
+    fn target_version_req_does_not_match_disjoint_range() {
+        // Guardrail: a selector that genuinely cannot share any version
+        // with the declared range must still be skipped. `^6.0.0`
+        // (>=6.0.0 <7.0.0) does not intersect `>=8`.
+        let r = rule("is-number@>=8", "7.0.0");
+        assert!(!matches(&r, "is-number", "^6.0.0", &[]));
+    }
+
+    #[test]
     fn parent_version_req_filters_ancestors() {
         let r = rule("parent@^1>foo", "1.0.0");
         assert!(matches(&r, "foo", "^1", &[anc("parent", "1.5.0")]));
@@ -583,12 +573,14 @@ mod tests {
     }
 
     #[test]
-    fn lower_bound_extraction() {
-        assert_eq!(lower_bound_version("^1.2.3").as_deref(), Some("1.2.3"));
-        assert_eq!(lower_bound_version("~1.2.3").as_deref(), Some("1.2.3"));
-        assert_eq!(lower_bound_version(">=1.2.3").as_deref(), Some("1.2.3"));
-        assert_eq!(lower_bound_version("1.2.3").as_deref(), Some("1.2.3"));
-        assert_eq!(lower_bound_version("v1.2.3").as_deref(), Some("1.2.3"));
-        assert_eq!(lower_bound_version("<2").as_deref(), None);
+    fn range_intersection_overlap_and_disjoint() {
+        // Overlapping ranges intersect; disjoint ones don't — the core
+        // of pnpm-compatible range-selector matching.
+        assert!(range_could_satisfy("^7.0.0", ">=7.5.0")); // overlap above lower bound
+        assert!(range_could_satisfy("^1.0.0", "<2")); // classic
+        assert!(range_could_satisfy("1.2.3", ">=1.2.0")); // concrete version in range
+        assert!(!range_could_satisfy("^6.0.0", ">=8")); // disjoint
+        assert!(!range_could_satisfy("^3.0.0", "<2")); // disjoint
+        assert!(!range_could_satisfy("1.2.3", ">=2.0.0")); // concrete version outside
     }
 }
