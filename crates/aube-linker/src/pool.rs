@@ -1,7 +1,17 @@
 use tracing::warn;
 
 pub fn default_linker_parallelism() -> usize {
-    let default_limit = if cfg!(target_os = "macos") { 4 } else { 16 };
+    // The macOS cap was 4 because the old `auto` strategy hardlinked
+    // every file, and concurrent `hard_link` into the same directory
+    // serializes on HFS+/APFS directory-mutation locks past ~4 threads.
+    // `auto` now reflinks (clonefile), which writes a fresh inode per
+    // file and doesn't take that lock, so the link pass scales with
+    // cores. A sweep-line over the per-file diag spans showed the
+    // 4-thread cap pinning a 10-core machine at ~3.9 effective
+    // concurrency with ~6 idle cores; lifting the cap lets the
+    // clonefile pass use them. 16 matches the non-macOS default and is
+    // itself bounded by `available_parallelism` below.
+    let default_limit = 16;
 
     std::thread::available_parallelism()
         .map(|n| n.get())

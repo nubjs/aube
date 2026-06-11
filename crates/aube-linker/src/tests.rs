@@ -83,12 +83,16 @@ fn make_graph() -> LockfileGraph {
 fn test_detect_strategy() {
     let dir = tempfile::tempdir().unwrap();
     let strategy = Linker::detect_strategy(dir.path());
-    // Probe returns `Hardlink` or `Copy`; `Reflink` is only
-    // reachable through explicit `packageImportMethod =
-    // clone`/`clone-or-copy`, so the match guards that contract.
+    // The probe returns whichever low-cost strategy the filesystem
+    // supports: `Reflink` on CoW filesystems (APFS/btrfs/xfs — the
+    // common dev-machine case), `Hardlink` on same-mount non-CoW
+    // filesystems (ext4/NTFS), or `Copy` as the last resort. All three
+    // are valid verdicts; the test just pins that probing succeeds and
+    // returns a real strategy rather than panicking. On Windows the
+    // probe never returns `Reflink` (hardlink-first there), but that's
+    // a tighter assertion than this cross-platform test needs.
     match strategy {
-        LinkStrategy::Hardlink | LinkStrategy::Copy => {}
-        LinkStrategy::Reflink => panic!("detect_strategy must not return Reflink"),
+        LinkStrategy::Reflink | LinkStrategy::Hardlink | LinkStrategy::Copy => {}
     }
 }
 
