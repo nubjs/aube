@@ -1,5 +1,8 @@
-use super::{ListLocation, read_merged, read_single, resolve_aliases, user_npmrc_path};
+use super::{
+    ListLocation, is_protected_key, read_merged, read_single, resolve_aliases, user_npmrc_path,
+};
 use clap::Args;
+use miette::miette;
 
 #[derive(Debug, Args)]
 pub struct GetArgs {
@@ -40,6 +43,16 @@ impl GetArgs {
 }
 
 pub fn run(args: GetArgs) -> miette::Result<()> {
+    // Refuse to echo auth-bearing keys, matching `npm config get`'s
+    // protected-key guard. Without this, `config get
+    // //registry.npmjs.org/:_authToken` would print the registry token.
+    if is_protected_key(&args.key) {
+        return Err(miette!(
+            "The {} option is protected, and cannot be retrieved in this way",
+            args.key
+        ));
+    }
+
     let aliases = resolve_aliases(&args.key);
     let cwd = crate::dirs::project_root_or_cwd()?;
     let entries: Vec<(String, String)> = match args.effective_location() {

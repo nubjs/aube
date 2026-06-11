@@ -244,6 +244,46 @@ pub(super) fn is_npm_shared_key(key: &str) -> bool {
     setting_for_key(key).is_some_and(|meta| meta.npm_shared)
 }
 
+/// The auth-bearing config names npm refuses to print, mirroring the
+/// `protected` array in npm's `lib/commands/config.js`. A `config get`
+/// of any protected key errors instead of leaking the value, and
+/// `config list` renders it as `(protected)`.
+const PROTECTED_NAMES: &[&str] = &[
+    "auth",
+    "authToken",
+    "certfile",
+    "email",
+    "keyfile",
+    "password",
+    "username",
+];
+
+/// True when `key` names a secret npm declines to reveal. Ported from
+/// npm's `isProtected` (npm `lib/commands/config.js`):
+///   * any `_`-prefixed key (`_auth`, `_authToken`, `_password`, …),
+///   * a bare protected name (`username`, `email`, `certfile`, …),
+///   * a nerf-darted per-host form (`//host/:_authToken`,
+///     `//host/:username`, `//host/:_auth`, …) — matched when the
+///     `//`-prefixed key contains `:_` or ends with `:<name>` /
+///     `:_<name>` for a protected name.
+///
+/// This is the security floor that keeps `config get`/`config list`
+/// from echoing registry tokens, in parity with `npm config get`.
+pub(super) fn is_protected_key(key: &str) -> bool {
+    if let Some(stripped) = key.strip_prefix("//") {
+        if stripped.contains(":_") {
+            return true;
+        }
+        return PROTECTED_NAMES.iter().any(|name| {
+            stripped.ends_with(&format!(":{name}")) || stripped.ends_with(&format!(":_{name}"))
+        });
+    }
+    if key.starts_with('_') {
+        return true;
+    }
+    PROTECTED_NAMES.contains(&key)
+}
+
 pub(super) fn setting_for_key(key: &str) -> Option<&'static settings_meta::SettingMeta> {
     settings_meta::find(key).or_else(|| {
         settings_meta::all().iter().find(|meta| {
@@ -355,6 +395,44 @@ pub(super) fn read_single(path: &std::path::Path) -> miette::Result<Vec<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_key_matches_npm_auth_surface() {
+        // Mirrors npm's `isProtected` (lib/commands/config.js): bare
+        // auth-bearing names, any `_`-prefixed key, and the nerf-darted
+        // per-host forms `//host/:_authToken`, `//host/:username`, etc.
+        for key in [
+            "_auth",
+            "_authToken",
+            "_password",
+            "username",
+            "email",
+            "authToken",
+            "certfile",
+            "keyfile",
+            "//registry.npmjs.org/:_authToken",
+            "//registry.npmjs.org/:_password",
+            "//registry.npmjs.org/:_auth",
+            "//registry.npmjs.org/:username",
+            "//registry.npmjs.org/:email",
+            "//registry.npmjs.org/:authToken",
+        ] {
+            assert!(is_protected_key(key), "{key} should be protected");
+        }
+    }
+
+    #[test]
+    fn protected_key_leaves_ordinary_settings_readable() {
+        for key in [
+            "registry",
+            "save-exact",
+            "auto-install-peers",
+            "//registry.npmjs.org/:always-auth",
+            "@scope:registry",
+        ] {
+            assert!(!is_protected_key(key), "{key} should not be protected");
+        }
+    }
 
     #[test]
     fn canonical_list_key_collapses_alias_to_primary() {

@@ -418,20 +418,48 @@ EOF
 	# Resolving ${NPM_TOKEN} here would both surprise users and risk
 	# leaking secrets into shell history or logs. The single quotes
 	# below are intentional: we want the literal `${...}` text written
-	# to the file, not the expansion.
-	export AUBE_TEST_TOKEN=super-secret
+	# to the file, not the expansion. Uses a non-protected key so the
+	# value is actually printed (protected keys error — see below).
+	export AUBE_TEST_PROXY=http://proxy.example.com
 	# shellcheck disable=SC2016
-	echo '//registry.example.com/:_authToken=${AUBE_TEST_TOKEN}' >"$HOME/.npmrc"
-	run aube config get "//registry.example.com/:_authToken"
+	echo 'https-proxy=${AUBE_TEST_PROXY}' >"$HOME/.npmrc"
+	run aube config get https-proxy
 	assert_success
 	# shellcheck disable=SC2016
-	assert_output '${AUBE_TEST_TOKEN}'
+	assert_output '${AUBE_TEST_PROXY}'
 	# Same answer via --location user.
-	run aube config get "//registry.example.com/:_authToken" --location user
+	run aube config get https-proxy --location user
 	assert_success
 	# shellcheck disable=SC2016
-	assert_output '${AUBE_TEST_TOKEN}'
-	unset AUBE_TEST_TOKEN
+	assert_output '${AUBE_TEST_PROXY}'
+	unset AUBE_TEST_PROXY
+}
+
+@test "config get refuses to print protected auth keys, matching npm" {
+	# Security/npm parity: `config get` of a registry auth token must
+	# error like `npm config get`, never echo the secret. npm:
+	# "The <key> option is protected, and cannot be retrieved in this way".
+	echo '//registry.example.com/:_authToken=npm_supersecrettoken' >"$HOME/.npmrc"
+	run aube config get "//registry.example.com/:_authToken"
+	assert_failure
+	# miette wraps the diagnostic across lines with box-drawing prefixes,
+	# so match a fragment that stays on one rendered line.
+	assert_output --partial "option is protected"
+	refute_output --partial "npm_supersecrettoken"
+	# A non-auth key in the same file still reads back fine.
+	echo 'registry=https://registry.example.com/' >>"$HOME/.npmrc"
+	run aube config get registry
+	assert_success
+	assert_output "https://registry.example.com/"
+}
+
+@test "config list renders protected auth keys as (protected), matching npm" {
+	echo '//registry.example.com/:_authToken=npm_supersecrettoken' >"$HOME/.npmrc"
+	echo 'registry=https://registry.example.com/' >>"$HOME/.npmrc"
+	run aube config list
+	assert_success
+	assert_output --partial "//registry.example.com/:_authToken=(protected)"
+	refute_output --partial "npm_supersecrettoken"
 }
 
 @test "config set routes unknown keys to user config.toml, not .npmrc" {
