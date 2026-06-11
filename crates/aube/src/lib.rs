@@ -562,7 +562,7 @@ pub use aube_util::ua::set_lifecycle_user_agent_product;
 /// `npm_node_execpath`, inject a preload via `NODE_OPTIONS`) without aube
 /// growing a runtime-specific field. Default-empty = stock behavior.
 /// Call before invoking any command that runs lifecycle scripts.
-pub use aube_scripts::{ScriptSettings, set_script_settings};
+pub use aube_scripts::{ScriptSettings, script_settings_snapshot, set_script_settings};
 
 /// Cache-root override for embedders, re-exported from `aube-util`:
 /// relocate the per-user cache root that defaults to
