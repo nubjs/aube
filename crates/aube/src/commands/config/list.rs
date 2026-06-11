@@ -116,6 +116,9 @@ pub fn run(args: ListArgs) -> miette::Result<()> {
     if args.json {
         let obj: serde_json::Map<String, serde_json::Value> = seen
             .into_iter()
+            // npm's `config list --json` omits protected keys entirely;
+            // mirror that so tokens never reach a JSON consumer.
+            .filter(|(k, _)| !super::is_protected_key(k))
             .map(|(k, v)| {
                 let value = if args.all {
                     serde_json::json!({
@@ -133,7 +136,11 @@ pub fn run(args: ListArgs) -> miette::Result<()> {
         println!("{out}");
     } else {
         for (k, v) in &seen {
-            if defaults.contains(k) {
+            if super::is_protected_key(k) {
+                // Render auth-bearing keys as `(protected)` rather than
+                // echoing the secret, matching `npm config list`.
+                println!("{k}=(protected)");
+            } else if defaults.contains(k) {
                 println!("{k}={v} (default)");
             } else {
                 println!("{k}={v}");
