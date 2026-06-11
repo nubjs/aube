@@ -230,9 +230,9 @@ fn bootstrap_blocking(
         .wrap_err("failed to spawn recursive aube install for node-gyp bootstrap")?;
     if !status.success() {
         return Err(miette!(
-            "recursive aube install failed while bootstrapping node-gyp (exit {:?}) — \
+            "recursive aube install failed while bootstrapping node-gyp (exit {}) — \
              pre-populate {} or run `aube install` once while online",
-            status.code(),
+            aube_scripts::exit_code_from_status(status),
             tool_dir.display()
         ));
     }
