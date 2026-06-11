@@ -165,6 +165,13 @@ pub(crate) fn covers_cutoff(cutoff: &str) -> bool {
     generated_at().is_some_and(|generated_at| generated_at.as_str() >= cutoff)
 }
 
+/// The names carried by the bundled primer, in index order. Used by the
+/// resolver's tests to drive the primer code paths against real seeds.
+#[cfg(test)]
+pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    PRIMER_INDEX.iter().map(|(name, _, _)| *name)
+}
+
 fn generated_at() -> Option<&'static String> {
     GENERATED_AT
         .get_or_init(|| {

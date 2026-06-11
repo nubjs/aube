@@ -566,6 +566,36 @@ impl<'a> ResolveDriver<'a> {
                 strict,
             );
             match pick {
+                // A primer-seeded pick that satisfies the range still
+                // needs a live full-packument fetch when `needs_time`
+                // is on and the seed carries no publish time for the
+                // picked version: the bundled primer's `time` data is
+                // sparse, and without it the graph's `time:` map (and
+                // every consumer of it — the `defaultTrust` floor, the
+                // lockfile round-trip) silently drops the entry. The
+                // refetch only fires once per package (it consumes the
+                // primer-seeded flag), so a registry whose full
+                // packument also lacks the time is not retried.
+                PickResult::Found(meta)
+                    if self.needs_time
+                        && !packument.time.contains_key(&meta.version)
+                        && self.fetcher.take_primer_seeded(&registry_name) =>
+                {
+                    let fetch_start = std::time::Instant::now();
+                    let live = match self.resolver.packument_full_cache_dir.as_ref() {
+                        Some(dir) => {
+                            self.resolver
+                                .client
+                                .fetch_packument_with_time_cached(&registry_name, dir)
+                                .await
+                        }
+                        None => self.resolver.client.fetch_packument(&registry_name).await,
+                    }
+                    .map_err(|e| Error::Registry(registry_name.clone(), e.to_string()))?;
+                    self.packument_fetch_time += fetch_start.elapsed();
+                    self.packument_fetch_count += 1;
+                    self.resolver.cache.insert(registry_name.clone(), live);
+                }
                 PickResult::Found(meta) => break meta.clone(),
                 PickResult::AgeGated | PickResult::NoMatch
                     if self.fetcher.take_primer_seeded(&registry_name) =>
