@@ -406,6 +406,39 @@ fn note_local_range<'a>(name: &'a str, range: &'a str, map: &mut BTreeMap<&'a st
     }
 }
 
+/// Record the consumer-declared range for a `name` whose value is a git
+/// specifier (`user/repo#ref`, `github:…`, `git+https://…`, …). Used to
+/// recover the ORIGINAL git descriptor a yarn v1 block header must carry
+/// (see [`write_classic`]). `parse_git_spec` returns `None` for plain
+/// semver / `file:` / `link:` / tarball ranges, so this only fires on a
+/// genuine git range — never shadowing the local-source path above.
+fn note_git_range<'a>(name: &'a str, range: &'a str, map: &mut BTreeMap<&'a str, &'a str>) {
+    if crate::parse_git_spec(range).is_some() {
+        map.entry(name).or_insert(range);
+    }
+}
+
+/// The `resolved "<url>"` value yarn v1 writes for a git dependency.
+/// For a hosted provider (github/gitlab/bitbucket) with a 40-char commit
+/// SHA, that's the flat codeload-style HTTPS tarball
+/// (`https://codeload.github.com/<owner>/<repo>/tar.gz/<sha>`) — exactly
+/// what real yarn records. For a self-hosted / non-codeload git source we
+/// fall back to the `<url>#<commit>` clone form, which yarn also accepts.
+/// `None` only when there is no resolved commit to pin (the source never
+/// got an ls-remote pass) — the caller then omits the `resolved` line.
+fn yarn_git_resolved(git: &crate::GitSource) -> Option<String> {
+    if git.resolved.is_empty() {
+        return None;
+    }
+    if let Some(hosted) = crate::parse_hosted_git(&git.url)
+        && let Some(tarball) = hosted.tarball_url(&git.resolved)
+    {
+        return Some(tarball);
+    }
+    let base = git.url.strip_prefix("git+").unwrap_or(&git.url);
+    Some(format!("{base}#{}", git.resolved))
+}
+
 fn push_classic_dep_key(out: &mut String, key: &str) {
     if key.starts_with('@') {
         out.push('"');
@@ -492,6 +525,19 @@ pub fn write_classic(
     // transitive ones — and prefer it over the source's reconstructed
     // specifier.
     let mut declared_local_range: BTreeMap<&str, &str> = BTreeMap::new();
+    // Map each git-source package name to the ORIGINAL git specifier its
+    // consumer declared (`vercel/ms#4ff48cec`, `github:user/repo#tag`,
+    // `git+https://…`). Yarn v1 keys a git block by the descriptor the
+    // manifest wrote and its `--frozen-lockfile` check matches that
+    // descriptor against the manifest — so emitting the *expanded* resolved
+    // URL (`ssh://git@github.com/vercel/ms.git#<40-char-sha>`, what an npm
+    // lockfile's `resolved` carries) makes yarn reject the file with "Your
+    // lockfile needs to be updated". We recover the user-written range from
+    // the root manifest (direct deps) or a parent's `declared_dependencies`
+    // (transitive) and key the block by it, mirroring the `file:`/`link:`
+    // recovery above. A git source whose range we CAN'T recover is refused
+    // outright (below) rather than written in the unmatchable expanded form.
+    let mut declared_git_range: BTreeMap<&str, &str> = BTreeMap::new();
     for (name, range) in manifest
         .dependencies
         .iter()
@@ -499,10 +545,12 @@ pub fn write_classic(
         .chain(manifest.optional_dependencies.iter())
     {
         note_local_range(name, range, &mut declared_local_range);
+        note_git_range(name, range, &mut declared_git_range);
     }
     for pkg in canonical.values() {
         for (name, range) in &pkg.declared_dependencies {
             note_local_range(name, range, &mut declared_local_range);
+            note_git_range(name, range, &mut declared_git_range);
         }
     }
 
@@ -520,19 +568,50 @@ pub fn write_classic(
         // lockfile needs to be updated", because yarn can't reconcile
         // the `file:` range in package.json against a `name@version`
         // header. We reproduce yarn's local-source header exactly.
-        let local_header = pkg.local_source.as_ref().map(|src| {
+        // A git source is keyed by the ORIGINAL git descriptor the
+        // consumer declared (`ms@vercel/ms#4ff48cec`) and carries a
+        // `resolved "<codeload tarball URL>"` line — exactly what yarn v1
+        // writes for a hosted git dep. We must recover the user-written
+        // range: keying the block by the expanded resolved URL (the npm
+        // lockfile's `resolved`) leaves yarn unable to match it against the
+        // manifest's range, so `--frozen-lockfile` rejects the file. If the
+        // range can't be recovered, refuse rather than emit the broken
+        // expanded form (the never-silently-write-a-yarn-rejected-lockfile
+        // bar). `git_resolved` is the `resolved` URL when we can derive one.
+        let mut git_resolved: Option<String> = None;
+        let header = if let Some(LocalSource::Git(git)) = &pkg.local_source {
+            let range = declared_git_range.get(pkg.name.as_str()).ok_or_else(|| {
+                Error::parse(
+                    path,
+                    format!(
+                        "dependency `{}` is a git dependency whose original \
+                         specifier could not be recovered from package.json, so it \
+                         can't be written to a yarn v1 lockfile that yarn would \
+                         accept. Declare it in package.json (e.g. \
+                         `\"{}\": \"<owner>/<repo>#<ref>\"`) before migrating to yarn.",
+                        pkg.name, pkg.name
+                    ),
+                )
+            })?;
+            git_resolved = yarn_git_resolved(git);
+            format!("{}@{}", pkg.name, range)
+        } else if let Some(src) = &pkg.local_source {
+            // `file:`/`link:`/`portal:` — keyed by the declared protocol
+            // descriptor (recovered, else the source's reconstructed spec).
             let range = declared_local_range
                 .get(pkg.name.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| src.specifier());
             format!("{}@{}", pkg.name, range)
-        });
+        } else {
+            canonical_key.clone()
+        };
 
         // Header: `"name@version"[, "name@range"]*:` — always start
         // with the exact spec so transitive reparse works, then
         // append any manifest range specs pointing at this entry.
         out.push('"');
-        out.push_str(local_header.as_deref().unwrap_or(canonical_key));
+        out.push_str(&header);
         out.push('"');
         if let Some(extras) = extra_specs.get(canonical_key) {
             for spec in extras {
@@ -548,9 +627,15 @@ pub fn write_classic(
         out.push_str(&pkg.version);
         out.push_str("\"\n");
 
-        // Local-source packages (`file:`/`link:`/`portal:`) carry no
-        // registry integrity — yarn v1 emits only `version` for them.
-        if pkg.local_source.is_none()
+        // A git source carries `resolved "<codeload tarball URL>"`; a
+        // `file:`/`link:`/`portal:` source carries no `resolved`/`integrity`
+        // (yarn v1 emits only `version` for those); a registry source
+        // carries its integrity.
+        if let Some(resolved) = &git_resolved {
+            out.push_str("  resolved \"");
+            out.push_str(resolved);
+            out.push_str("\"\n");
+        } else if pkg.local_source.is_none()
             && let Some(integ) = &pkg.integrity
         {
             out.push_str("  integrity ");
