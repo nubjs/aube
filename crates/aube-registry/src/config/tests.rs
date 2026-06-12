@@ -4,6 +4,14 @@ use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Serializes the auth.ini tests that touch the process-global
+/// `set_pnpm_auth_ini_enabled` gate, so the toggle test's
+/// disabled-window can't race a concurrent auth.ini read that assumes the
+/// upstream default (enabled). Restored to `true` by the toggle test
+/// inside the same critical section. Poison is ignored — these tests don't
+/// share mutable state beyond the gate.
+static AUTH_INI_GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct ScopedEnvVars(&'static [&'static str]);
 
 impl Drop for ScopedEnvVars {
@@ -1262,6 +1270,7 @@ fn pnpm_global_auth_ini_loads_and_overrides_user_rc() {
     // on a fresh clone. It should beat `~/.npmrc` for the same
     // key, since the entire reason to use it is to override
     // whatever npm-side tooling writes to `.npmrc`.
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home_dir = tempfile::tempdir().unwrap();
     let proj_dir = tempfile::tempdir().unwrap();
 
@@ -1302,6 +1311,7 @@ fn pnpm_global_auth_ini_honors_xdg_config_home_override() {
     // with a custom XDG layout will see pnpm and aube disagree on
     // where credentials live. The injected override here is the
     // same value `load_npmrc_entries` reads from the real env var.
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
     let proj_dir = tempfile::tempdir().unwrap();
@@ -1335,6 +1345,7 @@ fn pnpm_global_auth_ini_loses_to_project_npmrc() {
     // Project `.npmrc` pins still win — per-repo configuration is
     // the most specific layer, and a user's global auth.ini
     // must not clobber a token a project explicitly set.
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home_dir = tempfile::tempdir().unwrap();
     let proj_dir = tempfile::tempdir().unwrap();
 
@@ -1357,6 +1368,56 @@ fn pnpm_global_auth_ini_loses_to_project_npmrc() {
     assert_eq!(
         cfg.auth_token_for("https://registry.example.com/"),
         Some("project-pin"),
+    );
+}
+
+#[test]
+fn pnpm_global_auth_ini_not_read_when_gate_disabled() {
+    // Brand-boundary gate (Colin 2026-06-11): under a non-pnpm incumbent the
+    // embedder calls `set_pnpm_auth_ini_enabled(false)`, and the pnpm-NAMED
+    // `~/.config/pnpm/auth.ini` must then not be read at all — its token is
+    // never applied. The `~/.npmrc` user source is untouched, so the stale
+    // npmrc token (not the auth.ini one) is what survives. Restores the gate
+    // to the upstream default (`true`) inside the lock so other auth.ini
+    // tests see the normal behavior.
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home_dir = tempfile::tempdir().unwrap();
+    let proj_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        home_dir.path().join(".npmrc"),
+        "//registry.example.com/:_authToken=npmrc-token\n",
+    )
+    .unwrap();
+    let auth_ini = home_dir.path().join(".config/pnpm/auth.ini");
+    std::fs::create_dir_all(auth_ini.parent().unwrap()).unwrap();
+    std::fs::write(
+        &auth_ini,
+        "//registry.example.com/:_authToken=auth-ini-token\n",
+    )
+    .unwrap();
+
+    set_pnpm_auth_ini_enabled(false);
+    let disabled = load_npmrc_entries_with_home(Some(home_dir.path()), None, proj_dir.path(), None);
+    set_pnpm_auth_ini_enabled(true);
+
+    let mut cfg = NpmConfig::default();
+    cfg.apply(disabled);
+    assert_eq!(
+        cfg.auth_token_for("https://registry.example.com/"),
+        Some("npmrc-token"),
+        "auth.ini token must not be applied when the pnpm auth.ini gate is off",
+    );
+
+    // Sanity check the other direction in the same fixture: with the gate
+    // back on (the upstream default), the auth.ini token wins over ~/.npmrc.
+    let enabled = load_npmrc_entries_with_home(Some(home_dir.path()), None, proj_dir.path(), None);
+    let mut cfg = NpmConfig::default();
+    cfg.apply(enabled);
+    assert_eq!(
+        cfg.auth_token_for("https://registry.example.com/"),
+        Some("auth-ini-token"),
+        "with the gate on, pnpm auth.ini is read and overrides ~/.npmrc",
     );
 }
 

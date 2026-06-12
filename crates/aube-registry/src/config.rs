@@ -12,7 +12,9 @@ mod util;
 mod tests;
 
 pub use fetch::FetchPolicy;
-pub use load::{SplitNpmrcEntries, load_npmrc_entries, load_npmrc_entries_split};
+pub use load::{
+    SplitNpmrcEntries, load_npmrc_entries, load_npmrc_entries_split, set_pnpm_auth_ini_enabled,
+};
 pub use types::{AuthConfig, NpmConfig, TlsConfig};
 pub use url::{normalize_registry_url_pub, registry_uri_key_pub};
 
