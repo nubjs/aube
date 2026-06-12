@@ -15,6 +15,11 @@ pub(crate) struct StartupSettings {
     pub loglevel: Option<String>,
     package_manager_strict: PackageManagerStrictMode,
     package_manager_strict_version: bool,
+    /// `managePackageManagerVersions` — when on, a `packageManager` /
+    /// `devEngines.packageManager` aube pin is *switched to* (see
+    /// `self_version`), so the guard's version mismatch error is
+    /// superseded.
+    pub manage_package_manager_versions: bool,
 }
 
 /// Tri-state for the `packageManagerStrict` setting.
@@ -127,6 +132,9 @@ pub(crate) fn load_startup_settings() -> miette::Result<StartupSettings> {
             })
             .or_else(|| aube_settings::values::string_from_npmrc("loglevel", &files.user_npmrc)),
         package_manager_strict: resolve_package_manager_strict(&ctx),
+        manage_package_manager_versions: aube_settings::resolved::manage_package_manager_versions(
+            &ctx,
+        ),
         package_manager_strict_version: aube_settings::resolved::package_manager_strict_version(
             &ctx,
         ),
@@ -435,9 +443,19 @@ fn apply_package_manager_policy(
 ) -> miette::Result<PackageManagerGuard> {
     let normalized = version.strip_suffix("-DEBUG").unwrap_or(version);
     if names.self_names.iter().any(|n| n == name) {
-        if settings.package_manager_strict_version && normalized != names.self_version {
+        // With managePackageManagerVersions on, a version mismatch is
+        // handled *before* this guard by the self-switch
+        // (crate::self_version) — reaching here mismatched means
+        // switching failed soft (onFail warn/ignore) or the switched
+        // binary still reports another version; either way the switcher
+        // already surfaced it, so we don't double-error.
+        if !settings.manage_package_manager_versions
+            && settings.package_manager_strict_version
+            && normalized != names.self_version
+        {
             return Err(miette!(
-                "packageManager requires {name}@{version}, but this is {name}@{}",
+                "packageManager requires {name}@{version}, but this is {name}@{} \
+                 (managePackageManagerVersions=false; re-enable it to switch automatically)",
                 names.self_version
             ));
         }
@@ -546,6 +564,10 @@ mod package_manager_names_tests {
             loglevel: None,
             package_manager_strict: strict,
             package_manager_strict_version: strict_version,
+            // Default off in these tests so the self-name strict-version
+            // arm is exercised directly (with switching on, the guard
+            // defers to self_version and never errors).
+            manage_package_manager_versions: false,
         }
     }
 

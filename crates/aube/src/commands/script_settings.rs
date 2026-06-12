@@ -16,6 +16,14 @@ pub(crate) fn configure_script_settings(ctx: &aube_settings::ResolveCtx<'_>) {
     // wipe them. The `.npmrc`/workspace-derived fields above are the only ones
     // this function owns.
     let prior = aube_scripts::script_settings_snapshot();
+    // Runtime switching: `crate::runtime::ensure` must have run before
+    // this for lifecycle scripts to see the pinned node — the install
+    // driver resolves the runtime early, then configures script
+    // settings. When no context exists (or no switching is active)
+    // these stay `None` and scripts inherit PATH untouched. Under nub the
+    // runtime resolver is gated off (see `runtime::set_runtime_switching_enabled`),
+    // so `current()` yields the PATH-fallback context and both fields are `None`.
+    let runtime = crate::runtime::current();
     aube_scripts::set_script_settings(aube_scripts::ScriptSettings {
         node_options,
         script_shell,
@@ -23,6 +31,8 @@ pub(crate) fn configure_script_settings(ctx: &aube_settings::ResolveCtx<'_>) {
         shell_emulator,
         env_overlay: prior.env_overlay,
         path_prepends: prior.path_prepends,
+        node_bin_dir: runtime.and_then(|r| r.bin_dir.clone()),
+        node_exe: runtime.and_then(|r| r.node_bin.clone()),
     });
 }
 

@@ -188,7 +188,11 @@ pub(crate) fn decide_with_floor(
     pkg: &aube_lockfile::LockedPackage,
     times: &BTreeMap<String, String>,
 ) -> AllowDecision {
-    match policy.decide(pkg.registry_name(), &pkg.version) {
+    // #860: thread the per-package source key so source-backed packages
+    // (`file:`, `git:`, tarball) are matched by exact source identity, not
+    // by bare name. The floor only fires on a true `Unspecified`.
+    let source_key = pkg.source_approval_key();
+    match policy.decide_package(pkg.registry_name(), &pkg.version, source_key.as_deref()) {
         AllowDecision::Unspecified if floor.trusts(pkg, times) => AllowDecision::Allow,
         decision => decision,
     }

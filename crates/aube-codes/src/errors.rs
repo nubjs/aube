@@ -18,6 +18,7 @@ pub const ERR_AUBE_LOCKFILE_UNSUPPORTED_FORMAT: &str = "ERR_AUBE_LOCKFILE_UNSUPP
 pub const ERR_AUBE_OUTDATED_LOCKFILE: &str = "ERR_AUBE_OUTDATED_LOCKFILE";
 #[rustfmt::skip] pub const ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH: &str = "ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH";
 pub const ERR_AUBE_LOCKFILE_AMBIGUOUS: &str = "ERR_AUBE_LOCKFILE_AMBIGUOUS";
+pub const ERR_AUBE_RESOLUTION_SHAPE_MISMATCH: &str = "ERR_AUBE_RESOLUTION_SHAPE_MISMATCH";
 
 // ── resolver ─────────────────────────────────────────────────────────
 pub const ERR_AUBE_NO_MATCHING_VERSION: &str = "ERR_AUBE_NO_MATCHING_VERSION";
@@ -91,6 +92,16 @@ pub const ERR_AUBE_REMOVE_PRIOR_INSTALL_DIR: &str = "ERR_AUBE_REMOVE_PRIOR_INSTA
 pub const ERR_AUBE_CONFIG_NESTED_AUBE_KEY: &str = "ERR_AUBE_CONFIG_NESTED_AUBE_KEY";
 pub const ERR_AUBE_CONFLICTING_BUILD_FLAGS: &str = "ERR_AUBE_CONFLICTING_BUILD_FLAGS";
 
+// ── node runtime (devEngines.runtime / .node-version / .nvmrc) ──────
+#[rustfmt::skip] pub const ERR_AUBE_RUNTIME_VERSION_UNSATISFIED: &str = "ERR_AUBE_RUNTIME_VERSION_UNSATISFIED";
+#[rustfmt::skip] pub const ERR_AUBE_RUNTIME_NO_MATCHING_VERSION: &str = "ERR_AUBE_RUNTIME_NO_MATCHING_VERSION";
+pub const ERR_AUBE_RUNTIME_DOWNLOAD_FAILED: &str = "ERR_AUBE_RUNTIME_DOWNLOAD_FAILED";
+#[rustfmt::skip] pub const ERR_AUBE_RUNTIME_CHECKSUM_MISMATCH: &str = "ERR_AUBE_RUNTIME_CHECKSUM_MISMATCH";
+pub const ERR_AUBE_RUNTIME_EXTRACT_FAILED: &str = "ERR_AUBE_RUNTIME_EXTRACT_FAILED";
+#[rustfmt::skip] pub const ERR_AUBE_RUNTIME_MISE_INSTALL_FAILED: &str = "ERR_AUBE_RUNTIME_MISE_INSTALL_FAILED";
+#[rustfmt::skip] pub const ERR_AUBE_RUNTIME_UNSUPPORTED_PLATFORM: &str = "ERR_AUBE_RUNTIME_UNSUPPORTED_PLATFORM";
+pub const ERR_AUBE_RUNTIME_IO: &str = "ERR_AUBE_RUNTIME_IO";
+
 // ── misc tracing::error! sites (non-fatal but high-severity) ────────
 pub const ERR_AUBE_PATCHES_TRACKING_WRITE: &str = "ERR_AUBE_PATCHES_TRACKING_WRITE";
 pub const ERR_AUBE_UNSAFE_SHEBANG_INTERPRETER: &str = "ERR_AUBE_UNSAFE_SHEBANG_INTERPRETER";
@@ -154,6 +165,12 @@ pub const ALL: &[CodeMeta] = &[
         category: category::LOCKFILE,
         description: "Lockfiles from two or more package managers coexist and `package.json` doesn't declare which tool owns the project. Remove the stale lockfile(s) or add a `packageManager` declaration.",
         exit_code: Some(15),
+    },
+    CodeMeta {
+        name: ERR_AUBE_RESOLUTION_SHAPE_MISMATCH,
+        category: category::LOCKFILE,
+        description: "A registry-style lockfile dependency path is backed by a git, local directory, or direct tarball resolution.",
+        exit_code: Some(16),
     },
     // Resolver
     CodeMeta {
@@ -466,6 +483,55 @@ pub const ALL: &[CodeMeta] = &[
         name: ERR_AUBE_CONFLICTING_BUILD_FLAGS,
         category: category::ENGINE_CLI,
         description: "`aube add` was passed the same package name in both `--allow-build` and `--deny-build`.",
+        exit_code: None,
+    },
+    // Node runtime (devEngines.runtime / .node-version / .nvmrc)
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_VERSION_UNSATISFIED,
+        category: category::ENGINE_CLI,
+        description: "The project requires a Node.js version that isn't available and policy forbids fetching it (`devEngines.runtime` with `onFail: \"error\"`, `runtimeOnFail=error`, or offline mode with nothing installed).",
+        exit_code: Some(83),
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_NO_MATCHING_VERSION,
+        category: category::ENGINE_CLI,
+        description: "No Node.js release in the dist index satisfies the requested version (bad range, unknown LTS codename, or no build for this platform).",
+        exit_code: Some(84),
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_DOWNLOAD_FAILED,
+        category: category::ENGINE_CLI,
+        description: "Fetching the Node.js dist index, checksum file, or release archive failed after retries.",
+        exit_code: Some(85),
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_CHECKSUM_MISMATCH,
+        category: category::ENGINE_CLI,
+        description: "A downloaded Node.js archive's SHA-256 didn't match the lockfile pin or `SHASUMS256.txt`. The archive is discarded and never retried automatically.",
+        exit_code: Some(86),
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_EXTRACT_FAILED,
+        category: category::ENGINE_CLI,
+        description: "A Node.js release archive was corrupt or contained unsafe entry paths.",
+        exit_code: Some(87),
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_MISE_INSTALL_FAILED,
+        category: category::ENGINE_CLI,
+        description: "Delegating a Node.js install to mise failed — `mise install node@<version>` exited non-zero or the install wasn't discoverable afterwards. Fatal only under `runtimeInstaller=mise`; `auto` falls back to aube's own download.",
+        exit_code: Some(88),
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_UNSUPPORTED_PLATFORM,
+        category: category::ENGINE_CLI,
+        description: "No official Node.js build exists for this OS/architecture/libc. Set `nodeDownloadMirrors` to a mirror that carries one, or install Node via mise/system.",
+        exit_code: Some(89),
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_IO,
+        category: category::ENGINE_CLI,
+        description: "A filesystem operation in the runtime store failed (lock acquisition, staging, or publishing an install). Not a download failure — the message names the failing path.",
         exit_code: None,
     },
     // Misc / safety

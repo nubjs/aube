@@ -126,6 +126,7 @@ impl Resolver {
             patched_dependencies: BTreeMap::new(),
             patched_dependency_hashes: BTreeMap::new(),
             trusted_dependencies: Vec::new(),
+            runtimes: BTreeMap::new(),
             extra_fields: BTreeMap::new(),
             workspace_extra_fields: BTreeMap::new(),
         };

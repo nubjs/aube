@@ -3117,6 +3117,7 @@ async fn resolve_handles_lockfile_reused_name_with_incompatible_transitive_range
         patched_dependencies: BTreeMap::new(),
         patched_dependency_hashes: BTreeMap::new(),
         trusted_dependencies: Vec::new(),
+        runtimes: BTreeMap::new(),
         extra_fields: BTreeMap::new(),
         workspace_extra_fields: BTreeMap::new(),
     };
@@ -3191,6 +3192,7 @@ async fn lockfile_reuse_preserves_transitive_optional_edges() {
         patched_dependencies: BTreeMap::new(),
         patched_dependency_hashes: BTreeMap::new(),
         trusted_dependencies: Vec::new(),
+        runtimes: BTreeMap::new(),
         extra_fields: BTreeMap::new(),
         workspace_extra_fields: BTreeMap::new(),
     };

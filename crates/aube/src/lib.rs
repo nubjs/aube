@@ -25,6 +25,8 @@ pub mod engines;
 mod patches;
 mod pnpmfile;
 mod progress;
+mod runtime;
+mod self_version;
 mod startup;
 mod state;
 mod update_check;
@@ -460,6 +462,9 @@ enum Commands {
     /// Run a script defined in package.json
     #[command(alias = "run-script")]
     Run(commands::run::RunArgs),
+    /// Manage the project's Node.js runtime (pin, install, inspect)
+    #[command(visible_alias = "rt")]
+    Runtime(commands::runtime::RuntimeArgs),
     /// Generate a Software Bill of Materials (CycloneDX or SPDX)
     Sbom(commands::sbom::SbomArgs),
     /// Search the registry for packages (not implemented — use `npm search`)
@@ -621,6 +626,15 @@ pub use aube_lockfile::set_aube_lock_base_filename;
 /// `engines.node` validation is unaffected. Call once per process
 /// before invoking any command.
 pub use engines::set_aube_engine_check;
+
+/// Node version-switching toggle for embedders — see
+/// [`runtime::set_runtime_switching_enabled`]. Defaults to enabled
+/// (upstream #861 behavior: resolve `.nvmrc`/`.node-version`/
+/// `devEngines.runtime` and provision/switch Node). An embedder that
+/// owns Node provisioning itself (nub) passes `false` to keep aube's
+/// runtime resolver compiled-but-inert, leaving PATH untouched. Call
+/// once per process before invoking any command.
+pub use runtime::set_runtime_switching_enabled;
 
 /// `packageManager`-field acceptance override for embedders: which
 /// names count as the running tool (strict-version checked against
@@ -864,6 +878,14 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
 
     commands::set_skip_auto_install_on_package_manager_mismatch(false);
     if command_needs_package_manager_guard(cli.command.as_ref()) {
+        // Self-version switching (corepack semantics for the aube binary
+        // itself): if the project pins aube and this binary doesn't
+        // satisfy it, re-exec the pinned version. Guarded by
+        // `manage_package_manager_versions`. Only reached on the
+        // standalone `aube`/`aubr`/`aubx` binary path — nub embeds aube as
+        // a library and dispatches `commands::*::run` directly, never
+        // through this entry point, so it is inert under nub.
+        self_version::maybe_switch(&settings).await?;
         let guard = enforce_package_manager_guardrails(&settings, cli.command.as_ref())?;
         commands::set_skip_auto_install_on_package_manager_mismatch(
             guard == PackageManagerGuard::WarnRunOnly,
@@ -1036,6 +1058,7 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
         }
         Some(Commands::Root(args)) => commands::root::run(args).await?,
         Some(Commands::Run(args)) => commands::run::run(args, effective_filter.clone()).await?,
+        Some(Commands::Runtime(args)) => commands::runtime::run(args).await?,
         Some(Commands::Sbom(args)) => commands::sbom::run(args).await?,
         Some(Commands::Search(args)) => {
             return Ok(Some(commands::npm_fallback::run("search", &args)?));

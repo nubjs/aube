@@ -155,10 +155,10 @@ impl JailBuildPolicy {
         )
     }
 
-    fn should_jail(&self, name: &str, version: &str) -> bool {
+    fn should_jail(&self, name: &str, version: &str, source_key: Option<&str>) -> bool {
         self.enabled
             && !matches!(
-                self.denylist.decide(name, version),
+                self.denylist.decide_package(name, version, source_key),
                 aube_scripts::AllowDecision::Deny
             )
     }
@@ -167,10 +167,11 @@ impl JailBuildPolicy {
         &self,
         name: &str,
         version: &str,
+        source_key: Option<&str>,
         package_dir: &std::path::Path,
         project_dir: &std::path::Path,
     ) -> Option<aube_scripts::ScriptJail> {
-        if !self.should_jail(name, version) {
+        if !self.should_jail(name, version, source_key) {
             return None;
         }
         let mut env = Vec::new();
@@ -394,6 +395,7 @@ pub(crate) async fn run_dep_lifecycle_scripts(
         name: String,
         registry_name: String,
         version: String,
+        source_key: Option<String>,
         package_dir: std::path::PathBuf,
         /// Directory containing the dep package and its sibling
         /// symlinks — i.e. `package_dir`'s enclosing `node_modules/`.
@@ -427,9 +429,13 @@ pub(crate) async fn run_dep_lifecycle_scripts(
             // `h3` would miss if we checked against the alias. Attacker
             // writes `"h3-safe": "npm:h3@0.19.0"` to sneak a denied pkg
             // through the allowlist. registry_name() strips alias back to
-            // real name. `decide_with_floor` consults the `defaultTrust`
-            // floor only on `Unspecified`, so explicit entries always win.
-            match policy.decide(pkg.registry_name(), &pkg.version) {
+            // real name. #860 added a per-package source key
+            // (`Option<String>`); `decide_package` consults the explicit
+            // allowlist/denylist by name+version+source. We keep nub's
+            // `defaultTrust` floor as a belt-and-suspenders arm that only
+            // fires on `Unspecified`, so explicit entries always win.
+            let source_key = pkg.source_approval_key();
+            match policy.decide_package(pkg.registry_name(), &pkg.version, source_key.as_deref()) {
                 aube_scripts::AllowDecision::Allow => {}
                 aube_scripts::AllowDecision::Unspecified if floor.trusts(pkg, &graph.times) => {
                     via_floor = true;
@@ -513,6 +519,7 @@ pub(crate) async fn run_dep_lifecycle_scripts(
             name: pkg.name.clone(),
             registry_name: pkg.registry_name().to_string(),
             version: pkg.version.clone(),
+            source_key: pkg.source_approval_key(),
             package_dir,
             dep_modules_dir,
             manifest: dep_manifest,
@@ -611,6 +618,7 @@ pub(crate) async fn run_dep_lifecycle_scripts(
             let jail = jail_policy.jail_for(
                 &job.registry_name,
                 &job.version,
+                job.source_key.as_deref(),
                 &job.package_dir,
                 &project_dir,
             );
@@ -1140,8 +1148,9 @@ pub(super) fn unreviewed_dep_builds(
     for (dep_path, pkg) in &graph.packages {
         // A package the `defaultTrust` floor vouches for is not
         // unreviewed — its scripts ran. Same decision seam as
-        // `run_dep_lifecycle_scripts` so the warning and the runner
-        // can never disagree about a package's status.
+        // `run_dep_lifecycle_scripts` (now `decide_with_floor` threads the
+        // #860 source key internally) so the warning and the runner can
+        // never disagree about a package's status.
         if !matches!(
             super::default_trust::decide_with_floor(policy, floor, pkg, &graph.times),
             aube_scripts::AllowDecision::Unspecified
@@ -1182,7 +1191,7 @@ pub(super) fn unreviewed_dep_builds(
             })?;
         if aube_scripts::has_dep_lifecycle_work(&package_dir, &dep_manifest) {
             unreviewed.push(UnreviewedBuild {
-                spec_key: pkg.spec_key(),
+                spec_key: pkg.source_approval_key().unwrap_or_else(|| pkg.spec_key()),
                 suspicions: aube_scripts::sniff_lifecycle(&dep_manifest),
             });
         }

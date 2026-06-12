@@ -2,10 +2,12 @@ use super::dep_path::{
     dep_path_tail, parse_dep_path, peerless_alias_target, rewrite_snapshot_alias_deps,
     version_to_dep_path,
 };
-use super::raw::{RawDepSpec, local_source_from_resolution, parse_raw_lockfile};
+use super::raw::{
+    RawBinSpec, RawDepSpec, RawRuntimeVariant, local_source_from_resolution, parse_raw_lockfile,
+};
 use crate::{
     CatalogEntry, DepType, DirectDep, Error, LocalSource, LockedPackage, LockfileGraph,
-    PeerDepMeta, git_commits_match,
+    PeerDepMeta, RuntimePin, RuntimeTarget, RuntimeVariant, git_commits_match,
 };
 use aube_util::path::normalize_lexical;
 use std::collections::BTreeMap;
@@ -57,6 +59,34 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // resolver-fresh path emits so the linker stays single-shape.
     // Tuple: (alias_dep_path, real_dep_path, alias_name, real_name).
     let mut alias_remaps: Vec<(String, String, String, String)> = Vec::new();
+
+    // pnpm 10.14+ records `devEngines.runtime` pins as synthetic
+    // importer deps whose specifier/version carry a `runtime:` prefix
+    // (`node: {specifier: runtime:^24.4.0, version: runtime:24.4.1}`).
+    // Those are not packages — route them into `graph.runtimes`
+    // instead of `DirectDep`s so the resolver/linker never tries to
+    // fetch `node` from the npm registry. Map: runtime name →
+    // (specifier, exact version, came from devDependencies). First
+    // importer to declare a runtime wins (pnpm only writes it on the
+    // importer whose manifest declares devEngines — the root).
+    let mut runtime_imports: BTreeMap<String, (String, String, bool)> = BTreeMap::new();
+    let mut record_runtime = |name: &str, info: &RawDepSpec, dep_type: DepType| -> bool {
+        let Some(version) = info.version.strip_prefix("runtime:") else {
+            return false;
+        };
+        let specifier = info
+            .specifier
+            .strip_prefix("runtime:")
+            .unwrap_or(&info.specifier);
+        runtime_imports.entry(name.to_string()).or_insert_with(|| {
+            (
+                specifier.to_string(),
+                version.to_string(),
+                matches!(dep_type, DepType::Dev),
+            )
+        });
+        true
+    };
 
     let mut push_direct = |deps: &mut Vec<DirectDep>,
                            alias_remaps: &mut Vec<(String, String, String, String)>,
@@ -231,6 +261,9 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
 
         if let Some(ref d) = importer.dependencies {
             for (name, info) in d {
+                if record_runtime(name, info, DepType::Production) {
+                    continue;
+                }
                 push_direct(
                     &mut deps,
                     &mut alias_remaps,
@@ -243,6 +276,9 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         }
         if let Some(ref d) = importer.dev_dependencies {
             for (name, info) in d {
+                if record_runtime(name, info, DepType::Dev) {
+                    continue;
+                }
                 push_direct(
                     &mut deps,
                     &mut alias_remaps,
@@ -255,6 +291,9 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         }
         if let Some(ref d) = importer.optional_dependencies {
             for (name, info) in d {
+                if record_runtime(name, info, DepType::Optional) {
+                    continue;
+                }
                 push_direct(
                     &mut deps,
                     &mut alias_remaps,
@@ -457,6 +496,13 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         }
         let (name, version) = parse_dep_path(&dep_path)
             .ok_or_else(|| Error::parse(path, format!("invalid dep path: {dep_path}")))?;
+        // Runtime pin entries (`node@runtime:24.4.1`) are not packages
+        // — they're absorbed into `graph.runtimes` below. Skipping them
+        // here keeps them out of the package table so the fetch/link
+        // pipeline never sees them.
+        if version.starts_with("runtime:") {
+            continue;
+        }
         // URL-based direct deps are absorbed into `local_packages`
         // under the peer-stripped URL form (see `push_direct`), but the
         // snapshot key still carries any `(peer@ver)` suffix pnpm
@@ -818,6 +864,37 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         patched_dependencies.insert(k, path);
     }
 
+    // Lift the synthetic runtime importer deps recorded above into
+    // typed pins, pulling the per-platform artifact list out of the
+    // matching `<name>@runtime:<version>` packages entry. A missing or
+    // variant-less packages entry still yields a pin (version intent
+    // survives); installs on platforms not covered by the variant list
+    // re-resolve against live SHASUMS.
+    let mut runtimes = BTreeMap::new();
+    for (name, (specifier, version, dev)) in runtime_imports {
+        let pkg_info = raw.packages.get(&format!("{name}@runtime:{version}"));
+        let variants = pkg_info
+            .and_then(|p| p.resolution.as_ref())
+            .and_then(|r| r.variants.as_ref())
+            .map(|vs| {
+                vs.iter()
+                    .map(|v| convert_runtime_variant(&name, v))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let has_bin = pkg_info.map(|p| p.has_bin).unwrap_or(true);
+        runtimes.insert(
+            name,
+            RuntimePin {
+                specifier,
+                version,
+                dev,
+                has_bin,
+                variants,
+            },
+        );
+    }
+
     Ok(LockfileGraph {
         importers,
         packages,
@@ -835,9 +912,46 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         patched_dependencies,
         patched_dependency_hashes,
         trusted_dependencies: Vec::new(),
+        runtimes,
         extra_fields: BTreeMap::new(),
         workspace_extra_fields: BTreeMap::new(),
     })
+}
+
+/// Convert a raw `variations` variant into the typed graph shape.
+/// pnpm's bare-string `bin:` form names a single executable after the
+/// runtime itself (`bin: bin/node` on the `node` entry).
+fn convert_runtime_variant(runtime_name: &str, raw: &RawRuntimeVariant) -> RuntimeVariant {
+    let (bin, bin_is_bare_string) = match &raw.resolution.bin {
+        Some(RawBinSpec::Single(path)) => {
+            let mut m = BTreeMap::new();
+            m.insert(runtime_name.to_string(), path.clone());
+            (m, true)
+        }
+        Some(RawBinSpec::Map(m)) => (m.clone(), false),
+        None => (BTreeMap::new(), false),
+    };
+    RuntimeVariant {
+        targets: raw
+            .targets
+            .iter()
+            .map(|t| RuntimeTarget {
+                os: t.os.clone(),
+                cpu: t.cpu.clone(),
+                libc: t.libc.clone(),
+            })
+            .collect(),
+        archive: raw
+            .resolution
+            .archive
+            .clone()
+            .unwrap_or_else(|| "tarball".to_string()),
+        url: raw.resolution.url.clone(),
+        integrity: raw.resolution.integrity.clone().unwrap_or_default(),
+        bin,
+        bin_is_bare_string,
+        prefix: raw.resolution.prefix.clone(),
+    }
 }
 
 fn resolution_requires_integrity(
