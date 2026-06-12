@@ -202,6 +202,17 @@ pub fn write(
         },
     );
 
+    // `file:` local directory/tarball deps (`npm install file:../foo`)
+    // surface in npm's lockfile as a pair, exactly like workspace links:
+    // a `<path>: { name, version }` package entry keyed by the on-disk
+    // path, plus a `node_modules/<name>: { resolved: "<path>", link: true }`
+    // record. The hoist-tree pass below never places these — its roots key
+    // off `name@version` while a local dep's dep_path is `name@file+<hash>`,
+    // so the canonical-map lookup misses and the package would otherwise be
+    // dropped entirely. `npm ci` then rejects the lockfile with
+    // `Missing: <name>@<version> from lock file`. Emit the pair here.
+    emit_file_dep_links(graph, &roots, ".", &mut packages);
+
     for (importer_path, importer_roots) in graph.importers.iter().filter(|(path, _)| *path != ".") {
         let Some(workspace_pkg) = workspace_package_for_importer(graph, importer_path) else {
             continue;
@@ -232,6 +243,8 @@ pub fn write(
                 ..Default::default()
             },
         );
+
+        emit_file_dep_links(graph, importer_roots, importer_path, &mut packages);
 
         let workspace_tree_roots = non_link_roots(graph, importer_roots);
         let workspace_tree = super::build_hoist_tree(&canonical, &workspace_tree_roots);
@@ -452,13 +465,85 @@ fn non_link_roots(graph: &LockfileGraph, roots: &[DirectDep]) -> Vec<DirectDep> 
     roots
         .iter()
         .filter(|dep| {
-            !graph
-                .packages
-                .get(&dep.dep_path)
-                .is_some_and(|pkg| matches!(pkg.local_source, Some(LocalSource::Link(_))))
+            // `Link` deps are pure symlinks (no virtual-store node), and
+            // `Directory`/`Tarball` `file:` deps are emitted out of band by
+            // `emit_file_dep_links` as npm's `link: true` pair — neither
+            // belongs in the hoisted `name@version` tree.
+            !graph.packages.get(&dep.dep_path).is_some_and(|pkg| {
+                matches!(
+                    pkg.local_source,
+                    Some(LocalSource::Link(_) | LocalSource::Directory(_) | LocalSource::Tarball(_))
+                )
+            })
         })
         .cloned()
         .collect()
+}
+
+/// npm emits each `file:` local directory/tarball dependency as a pair
+/// of `packages` entries:
+///
+/// ```json
+/// "local-pkg":              { "name": "local-utils", "version": "1.0.0" },
+/// "node_modules/local-utils": { "resolved": "local-pkg", "link": true }
+/// ```
+///
+/// The first is keyed by the dep's on-disk path (npm strips the `file:`
+/// prefix and a leading `./`, but keeps `../` parent climbs), carries
+/// only `name`/`version`, and is what `npm ci` validates the root
+/// `dependencies` entry against. The second is the `node_modules/<name>`
+/// symlink record pointing back at that path. `LocalSource::Link`
+/// (`link:` deps and workspace members) is handled separately — npm
+/// links those too but the importer/workspace machinery already emits
+/// their pair, so this only covers `file:` directory and tarball deps.
+fn emit_file_dep_links<'a>(
+    graph: &'a LockfileGraph,
+    roots: &[DirectDep],
+    importer_path: &str,
+    packages: &mut BTreeMap<String, WriteNpmPackage<'a>>,
+) {
+    for dep in roots {
+        let Some(pkg) = graph.packages.get(&dep.dep_path) else {
+            continue;
+        };
+        let resolved = match &pkg.local_source {
+            Some(local @ (LocalSource::Directory(_) | LocalSource::Tarball(_))) => {
+                npm_file_dep_path(importer_path, &local.path_posix())
+            }
+            _ => continue,
+        };
+        packages.insert(
+            resolved.clone(),
+            WriteNpmPackage {
+                name: Some(pkg.name.as_str()),
+                version: Some(pkg.version.as_str()),
+                ..Default::default()
+            },
+        );
+        packages.insert(
+            format!("node_modules/{}", dep.name),
+            WriteNpmPackage {
+                resolved: Some(resolved),
+                link: true,
+                ..Default::default()
+            },
+        );
+    }
+}
+
+/// Render the lockfile path key for a `file:` dep's package entry the
+/// way npm does: drop a leading `./` (npm normalizes `file:./local-pkg`
+/// to `local-pkg`) but preserve `../` climbs verbatim
+/// (`file:../sib` → `../sib`). For a non-root importer the stored path is
+/// importer-relative, so re-anchor it to the project root the way npm's
+/// keys are project-relative.
+fn npm_file_dep_path(importer_path: &str, path_posix: &str) -> String {
+    let normalized = path_posix.strip_prefix("./").unwrap_or(path_posix);
+    if importer_path == "." || importer_path.is_empty() {
+        normalized.to_string()
+    } else {
+        format!("{importer_path}/{normalized}")
+    }
 }
 
 type DepSections<'a> = (
