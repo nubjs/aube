@@ -76,14 +76,86 @@ fn test_parse_simple() {
 
     let root = graph.importers.get(".").unwrap();
     assert_eq!(root.len(), 2);
-    assert!(
-        root.iter()
-            .any(|d| d.name == "foo" && d.dep_type == DepType::Production)
+    let foo_dep = root.iter().find(|d| d.name == "foo").unwrap();
+    assert_eq!(foo_dep.dep_type, DepType::Production);
+    // The declared range from the root entry's `dependencies` value
+    // must survive as the importer specifier — the pnpm writer needs it
+    // to emit a non-empty `specifiers:` map, or pnpm frozen-install
+    // rejects the converted lockfile.
+    assert_eq!(foo_dep.specifier.as_deref(), Some("^1.0.0"));
+    let bar_dep = root.iter().find(|d| d.name == "bar").unwrap();
+    assert_eq!(bar_dep.dep_type, DepType::Dev);
+    assert_eq!(bar_dep.specifier.as_deref(), Some("^2.0.0"));
+}
+
+/// `npm install --prefix <proj>` invoked from a different cwd writes
+/// every `packages` key as a climb back to the project
+/// (`../../../abs/proj/node_modules/foo`) instead of the canonical
+/// `node_modules/foo`. The reader must normalize those so root direct
+/// deps still resolve — otherwise importers come out empty, which
+/// produced a pnpm-lock with an empty `specifiers:` map (pnpm frozen
+/// install rejects it) and a bun.lock with `"packages": {}` (bun
+/// `InvalidPackageInfo`). Regression guard for the cross-format
+/// conversion harness (`tests/conversion/run.sh`, npm→pnpm + npm→bun).
+#[test]
+fn prefix_install_climb_paths_still_populate_importers_and_packages() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "test",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "test",
+                    "version": "1.0.0",
+                    "dependencies": { "foo": "^1.0.0" },
+                    "devDependencies": { "bar": "^2.0.0" }
+                },
+                "../../../abs/path/proj/node_modules/foo": {
+                    "version": "1.2.3",
+                    "integrity": "sha512-aaa",
+                    "dependencies": { "nested": "^3.0.0" }
+                },
+                "../../../abs/path/proj/node_modules/nested": {
+                    "version": "3.1.0",
+                    "integrity": "sha512-bbb"
+                },
+                "../../../abs/path/proj/node_modules/bar": {
+                    "version": "2.5.0",
+                    "integrity": "sha512-ccc"
+                }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+
+    // Package resolution (version + integrity) lands under the
+    // canonical name@version key — what the bun writer needs.
+    assert_eq!(graph.packages.len(), 3);
+    assert_eq!(
+        graph.packages["foo@1.2.3"].integrity.as_deref(),
+        Some("sha512-aaa")
     );
-    assert!(
-        root.iter()
-            .any(|d| d.name == "bar" && d.dep_type == DepType::Dev)
+    // Transitive resolution survives the climb-prefix walk too.
+    assert_eq!(
+        graph.packages["foo@1.2.3"]
+            .dependencies
+            .get("nested")
+            .map(String::as_str),
+        Some("3.1.0")
     );
+
+    // Root importer direct deps resolve, carrying their dep_path and
+    // declared specifier — what the pnpm writer needs.
+    let root = graph.importers.get(".").unwrap();
+    assert_eq!(root.len(), 2);
+    let foo_dep = root.iter().find(|d| d.name == "foo").unwrap();
+    assert_eq!(foo_dep.dep_path, "foo@1.2.3");
+    assert_eq!(foo_dep.specifier.as_deref(), Some("^1.0.0"));
+    let bar_dep = root.iter().find(|d| d.name == "bar").unwrap();
+    assert_eq!(bar_dep.dep_type, DepType::Dev);
+    assert_eq!(bar_dep.specifier.as_deref(), Some("^2.0.0"));
 }
 
 #[test]
@@ -1861,7 +1933,10 @@ fn test_parse_workspace_links() {
     assert_eq!(importer[0].name, "@scope/app");
     assert_eq!(importer[0].dep_path, dep_path);
     assert!(matches!(importer[0].dep_type, DepType::Production));
-    assert!(importer[0].specifier.is_none());
+    // The declared range from the root entry's `dependencies` value is
+    // now carried through as the importer specifier (a `file:` workspace
+    // link declares `file:packages/app`).
+    assert_eq!(importer[0].specifier.as_deref(), Some("file:packages/app"));
 
     let app = &graph.packages[&importer[0].dep_path];
     assert_eq!(app.version, "0.68.1");
