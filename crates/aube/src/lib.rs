@@ -649,6 +649,29 @@ pub use commands::install::set_warm_store_verify;
 /// once per process before invoking any command.
 pub use runtime::set_runtime_switching_enabled;
 
+/// cwd-default `.pnpmfile` detection toggle for embedders — see
+/// [`pnpmfile::set_pnpmfile_default_enabled`]. Defaults to `true`
+/// (upstream behavior: a `.pnpmfile.cjs`/`.mjs` in the project root is
+/// auto-detected and its `readPackage` / `afterAllResolved` hooks shape
+/// resolution). An embedder whose active package manager isn't pnpm
+/// passes `false` so a stray cwd `.pnpmfile` — another tool's
+/// resolution-shaping config — is not honored; explicit `--pnpmfile` /
+/// `--global-pnpmfile` / workspace-yaml `pnpmfilePath` overrides still
+/// load. [`pnpmfile::default_path`] reports a present-but-suppressed file
+/// so the embedder can warn. Call once per process before any command.
+pub use pnpmfile::{default_path as pnpmfile_default_path, set_pnpmfile_default_enabled};
+
+/// pnpm global `auth.ini` read toggle for embedders — see
+/// [`aube_registry::config::set_pnpm_auth_ini_enabled`]. Defaults to
+/// `true` (upstream behavior: `~/.config/pnpm/auth.ini` —
+/// `<XDG_CONFIG_HOME>/pnpm/auth.ini` — is read on every config load and
+/// its auth tokens merged into the user-scope config). An embedder whose
+/// active package manager isn't pnpm passes `false` so that pnpm-named
+/// global file — another tool's state under a non-pnpm incumbent — is not
+/// read at all. The `.npmrc` / `npmrcAuthFile` auth sources are untouched.
+/// Call once per process before invoking any command.
+pub use aube_registry::config::set_pnpm_auth_ini_enabled;
+
 /// `packageManager`-field acceptance override for embedders: which
 /// names count as the running tool (strict-version checked against
 /// the registered version) and which as compatible drop-ins. Defaults

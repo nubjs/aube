@@ -39,6 +39,45 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 pub const PNPMFILE_MJS_NAME: &str = ".pnpmfile.mjs";
 pub const PNPMFILE_CJS_NAME: &str = ".pnpmfile.cjs";
 
+/// Whether [`detect`] probes the cwd-default `.pnpmfile.mjs` /
+/// `.pnpmfile.cjs` when no explicit `--pnpmfile` / `pnpm-workspace.yaml`
+/// `pnpmfilePath` override is given. Defaults to `true` (upstream
+/// behavior). An embedder whose active package manager isn't pnpm — and
+/// for whom a stray cwd `.pnpmfile` is another tool's resolution-shaping
+/// config, not theirs to honor — passes `false` to gate the default arm
+/// off. The explicit `--pnpmfile` / `--global-pnpmfile` / workspace-yaml
+/// `pnpmfilePath` overrides are untouched: a path a user named on purpose
+/// still loads. See the brand-boundary note in nub's `engine_brand_preflight`.
+static PNPMFILE_DEFAULT_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Embedder seam: toggle whether the cwd-default `.pnpmfile` is detected
+/// by [`detect`]. Defaults to `true` (upstream). Idempotent in spirit —
+/// matching the other process-global `set_*` seams, call once per process
+/// before invoking any command. Returns the previous value so a caller
+/// can detect a present-but-suppressed pnpmfile (see [`default_path`]).
+pub fn set_pnpmfile_default_enabled(on: bool) {
+    PNPMFILE_DEFAULT_ENABLED.store(on, Ordering::Relaxed);
+}
+
+fn pnpmfile_default_enabled() -> bool {
+    PNPMFILE_DEFAULT_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The cwd-default pnpmfile path if one exists, ignoring the
+/// [`set_pnpmfile_default_enabled`] gate. Lets an embedder discover that a
+/// default `.pnpmfile` is present *before* it suppresses detection, so it
+/// can emit a one-line "ignored" warning naming the file. Mirrors the
+/// `.mjs`-over-`.cjs` precedence [`detect`] uses.
+pub fn default_path(cwd: &Path) -> Option<PathBuf> {
+    for name in [PNPMFILE_MJS_NAME, PNPMFILE_CJS_NAME] {
+        let p = cwd.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Flipped on by `main` when `--reporter=ndjson` is in effect. Read by
 /// the per-hook stderr forwarder to decide whether `ctx.log` records get
 /// re-emitted as `pnpm:hook` ndjson on stdout (machine-readable mode) or
@@ -68,9 +107,12 @@ const HOOK_LOG_SENTINEL: &str = "__AUBE_HOOK_LOG__ ";
 /// * `workspace_pnpmfile_path` is the `pnpmfilePath` override from
 ///   `pnpm-workspace.yaml` (pnpm v10 lets users keep the hook file
 ///   outside the project root). Same hard-miss semantics on a typo.
-/// * Otherwise: `cwd/.pnpmfile.mjs` (preferred) or `cwd/.pnpmfile.cjs`.
-///   The missing-default case stays silent because "no pnpmfile" is
-///   the common case, not a misconfiguration.
+/// * Otherwise: `cwd/.pnpmfile.mjs` (preferred) or `cwd/.pnpmfile.cjs`,
+///   *unless* the cwd-default is gated off via
+///   [`set_pnpmfile_default_enabled`] (a non-pnpm embedder treating a
+///   stray `.pnpmfile` as another tool's config). The missing-default
+///   case stays silent because "no pnpmfile" is the common case, not a
+///   misconfiguration.
 pub fn detect(
     cwd: &Path,
     cli_pnpmfile: Option<&Path>,
@@ -104,13 +146,14 @@ pub fn detect(
         }
         return Some(p);
     }
-    for name in [PNPMFILE_MJS_NAME, PNPMFILE_CJS_NAME] {
-        let p = cwd.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
+    // The cwd-default arm is gated by the embedder seam: under a
+    // non-pnpm incumbent a stray `.pnpmfile` is another tool's
+    // resolution-shaping config and is not honored. Explicit overrides
+    // above are unaffected.
+    if !pnpmfile_default_enabled() {
+        return None;
     }
-    None
+    default_path(cwd)
 }
 
 /// Resolve `--global-pnpmfile <path>`. Unlike [`detect`], there is no
@@ -1066,5 +1109,41 @@ mod tests {
         let local = PathBuf::from("/l.cjs");
         assert_eq!(ordered_paths(None, Some(&local)), vec![local.clone()]);
         assert!(ordered_paths(None, None).is_empty());
+    }
+
+    #[test]
+    fn default_gate_off_suppresses_cwd_default_but_default_path_still_sees_it() {
+        // The embedder seam is a process-global; flip it for the body of
+        // this test and restore it so sibling tests keep upstream-default
+        // behavior regardless of run order.
+        let prev = pnpmfile_default_enabled();
+        set_pnpmfile_default_enabled(false);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(PNPMFILE_CJS_NAME);
+        std::fs::write(&f, "").unwrap();
+        // detect() honors the gate: the cwd default is not loaded.
+        assert!(
+            detect(dir.path(), None, None).is_none(),
+            "gated-off default must not load"
+        );
+        // default_path() ignores the gate so an embedder can warn about
+        // the file it just suppressed.
+        assert_eq!(default_path(dir.path()).as_deref(), Some(f.as_path()));
+        set_pnpmfile_default_enabled(prev);
+    }
+
+    #[test]
+    fn explicit_override_loads_even_when_default_gate_off() {
+        // Gating the cwd default off must NOT suppress an explicitly named
+        // `--pnpmfile` path — a path the user pointed at on purpose still
+        // loads regardless of the incumbent.
+        let prev = pnpmfile_default_enabled();
+        set_pnpmfile_default_enabled(false);
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("hooks.cjs");
+        std::fs::write(&custom, "").unwrap();
+        let found = detect(dir.path(), Some(custom.as_path()), None);
+        assert_eq!(found.as_deref(), Some(custom.as_path()));
+        set_pnpmfile_default_enabled(prev);
     }
 }
