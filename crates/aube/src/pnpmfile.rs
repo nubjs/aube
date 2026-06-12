@@ -55,6 +55,13 @@ static PNPMFILE_DEFAULT_ENABLED: AtomicBool = AtomicBool::new(true);
 /// matching the other process-global `set_*` seams, call once per process
 /// before invoking any command. Returns the previous value so a caller
 /// can detect a present-but-suppressed pnpmfile (see [`default_path`]).
+///
+/// Not covered by an [`Embedder`](aube_util::Embedder) field: it's a
+/// per-process embedder override (gate the cwd `.pnpmfile` off when the
+/// active package manager isn't pnpm), not embedder-fixed identity. Retained
+/// for an embedding host to call directly; `#[allow(dead_code)]` because
+/// standalone aube never flips it (its default `true` is the upstream path).
+#[allow(dead_code)]
 pub fn set_pnpmfile_default_enabled(on: bool) {
     PNPMFILE_DEFAULT_ENABLED.store(on, Ordering::Relaxed);
 }

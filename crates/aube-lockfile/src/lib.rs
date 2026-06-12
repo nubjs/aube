@@ -13,7 +13,7 @@ pub mod yarn;
 
 pub use detect::{
     DeclarationSource, DeclaredPackageManager, ResolvedLockfileKind, declared_package_manager,
-    resolve_project_lockfile_kind, set_canonical_lockfile_always_wins, set_detection_self_names,
+    resolve_project_lockfile_kind,
 };
 pub use drift::DriftStatus;
 pub use io::{

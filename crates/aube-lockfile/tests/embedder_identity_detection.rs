@@ -2,12 +2,40 @@
 //! custom self-names + strict canonical-lockfile coexistence.
 //!
 //! Lives in its own integration-test binary — i.e. its own process —
-//! because the three registrations (`set_aube_lock_base_filename`,
-//! `set_detection_self_names`, `set_canonical_lockfile_always_wins`) are
-//! once-per-process and would poison the unit tests asserting the
-//! defaults.
+//! because the active embedder identity is once-per-process: registering a
+//! custom profile here would poison the in-crate unit tests that assert the
+//! default (`aube`) identity. The profile is selected the way every embedder
+//! selects one — a single `aube_util::set_embedder(&PROFILE)` — rather than
+//! the old per-seam runtime setters, which the compile-time `Embedder` model
+//! replaced.
 
 use aube_lockfile::{Error, LockfileKind, ResolvedLockfileKind, resolve_project_lockfile_kind};
+use aube_util::Embedder;
+
+/// A strict-identity embedder: its canonical lockfile is `lock.yaml`, it
+/// answers to the self-name `mytool`, and — unlike standalone aube — it does
+/// *not* let its canonical lockfile silently win beside a foreign one
+/// (`canonical_lockfile_always_wins: false`). The remaining fields are
+/// irrelevant to detection and just reproduce a plausible profile.
+static MYTOOL: Embedder = Embedder {
+    name: "mytool",
+    display_name: "mytool",
+    vendor: None,
+    version: "1.0.0",
+    user_agent: "mytool/1.0.0",
+    self_names: &["mytool"],
+    compatible_names: &["pnpm"],
+    lockfile_basename: "lock.yaml",
+    workspace_yaml: Some("mytool-workspace.yaml"),
+    manifest_namespace: "mytool",
+    env_prefix: Some("MYTOOL"),
+    cache_namespace: "mytool",
+    data_namespace: "mytool",
+    canonical_lockfile_always_wins: false,
+    runtime_switching: true,
+    self_engines_check: true,
+    self_update_enabled: true,
+};
 
 fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -19,11 +47,11 @@ fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
 
 #[test]
 fn strict_embedder_identity_decision_rows() {
-    aube_lockfile::set_aube_lock_base_filename("lock.yaml");
-    aube_lockfile::set_detection_self_names(&["mytool"]);
-    aube_lockfile::set_canonical_lockfile_always_wins(false);
+    aube_util::set_embedder(&MYTOOL);
 
-    // lock.yaml + no declaration → the canonical kind (embedder identity).
+    // The canonical lockfile (the profile's `lock.yaml`) + no declaration →
+    // the canonical kind (embedder identity), even with always-wins off:
+    // nothing foreign sits beside it to trigger the ambiguity rule.
     let d = project(&[
         ("package.json", r#"{"name":"t"}"#),
         ("lock.yaml", "lockfileVersion: '9.0'\n"),

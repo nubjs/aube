@@ -499,9 +499,7 @@ fn patch_protocol_path(body: &str) -> Option<String> {
     // qualifiers (e.g. `optional!`) ahead of the selector. Strip up to and
     // including the last `!` so the builtin check sees the bare selector.
     let selector = path.rsplit_once('!').map(|(_, s)| s).unwrap_or(path);
-    if selector.is_empty()
-        || selector.starts_with("builtin<")
-        || selector.starts_with("~builtin<")
+    if selector.is_empty() || selector.starts_with("builtin<") || selector.starts_with("~builtin<")
     {
         return None;
     }

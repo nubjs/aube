@@ -685,6 +685,7 @@ mod default_lockfile_kind_tests {
             workspace_yaml: ws,
             env: &[],
             cli: &[],
+            embedder_defaults: &[],
         }
     }
 
