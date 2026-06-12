@@ -1,8 +1,33 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::env::npm_config_env_entries_from;
 use super::npmrc::{parse_npmrc, parse_npmrc_untrusted};
 use super::types::{NpmConfig, NpmrcSource};
+
+/// Whether the loader reads pnpm's global `~/.config/pnpm/auth.ini`
+/// (`<XDG_CONFIG_HOME>/pnpm/auth.ini`). Defaults to `true` (upstream
+/// behavior: the file is read on every load and its auth tokens merged
+/// into the user-scope config). An embedder whose active package manager
+/// isn't pnpm passes `false` — under a non-pnpm incumbent that
+/// pnpm-named global file is another tool's state and must not be read at
+/// all (a name-based policy: anything with "pnpm" in the path is off
+/// unless pnpm is the incumbent). The `.npmrc` / `npmrcAuthFile` sources
+/// are unaffected; only the pnpm-named `auth.ini` is gated.
+static PNPM_AUTH_INI_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Embedder seam: toggle whether pnpm's global `auth.ini` is read by the
+/// config loader. Defaults to `true` (upstream). Mirrors the other
+/// process-global `set_*` seams — call once per process before invoking
+/// any command. See [`pnpm_auth_ini_enabled`] and the brand-boundary note
+/// in nub's `engine_brand_preflight`.
+pub fn set_pnpm_auth_ini_enabled(on: bool) {
+    PNPM_AUTH_INI_ENABLED.store(on, Ordering::Relaxed);
+}
+
+fn pnpm_auth_ini_enabled() -> bool {
+    PNPM_AUTH_INI_ENABLED.load(Ordering::Relaxed)
+}
 
 impl NpmConfig {
     /// Load config by reading .npmrc files in priority order:
@@ -228,7 +253,9 @@ pub(super) fn load_npmrc_entries_tagged_with_home(
     {
         out.extend(entries.into_iter().map(|(k, v)| (NpmrcSource::User, k, v)));
     }
-    if let Some(home) = home {
+    if let Some(home) = home
+        && pnpm_auth_ini_enabled()
+    {
         let auth_ini = pnpm_global_auth_ini_path(home, xdg_config_home);
         if auth_ini.exists()
             && let Ok(entries) = parse_npmrc(&auth_ini)
