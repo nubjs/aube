@@ -41,37 +41,21 @@ pub const PNPMFILE_CJS_NAME: &str = ".pnpmfile.cjs";
 
 /// Whether [`detect`] probes the cwd-default `.pnpmfile.mjs` /
 /// `.pnpmfile.cjs` when no explicit `--pnpmfile` / `pnpm-workspace.yaml`
-/// `pnpmfilePath` override is given. Defaults to `true` (upstream
-/// behavior). An embedder whose active package manager isn't pnpm — and
-/// for whom a stray cwd `.pnpmfile` is another tool's resolution-shaping
-/// config, not theirs to honor — passes `false` to gate the default arm
-/// off. The explicit `--pnpmfile` / `--global-pnpmfile` / workspace-yaml
-/// `pnpmfilePath` overrides are untouched: a path a user named on purpose
-/// still loads. See the brand-boundary note in nub's `engine_brand_preflight`.
-static PNPMFILE_DEFAULT_ENABLED: AtomicBool = AtomicBool::new(true);
-
-/// Embedder seam: toggle whether the cwd-default `.pnpmfile` is detected
-/// by [`detect`]. Defaults to `true` (upstream). Idempotent in spirit —
-/// matching the other process-global `set_*` seams, call once per process
-/// before invoking any command. Returns the previous value so a caller
-/// can detect a present-but-suppressed pnpmfile (see [`default_path`]).
-///
-/// Not covered by an [`Embedder`](aube_util::Embedder) field: it's a
-/// per-process embedder override (gate the cwd `.pnpmfile` off when the
-/// active package manager isn't pnpm), not embedder-fixed identity. Retained
-/// for an embedding host to call directly; `#[allow(dead_code)]` because
-/// standalone aube never flips it (its default `true` is the upstream path).
-#[allow(dead_code)]
-pub fn set_pnpmfile_default_enabled(on: bool) {
-    PNPMFILE_DEFAULT_ENABLED.store(on, Ordering::Relaxed);
-}
-
+/// `pnpmfilePath` override is given. Sourced from the engine context;
+/// defaults to `true` (upstream behavior). An embedder whose active
+/// package manager isn't pnpm — and for whom a stray cwd `.pnpmfile` is
+/// another tool's resolution-shaping config, not theirs to honor — sets
+/// `pnpmfile_default_enabled = false` on the context to gate the default
+/// arm off. The explicit `--pnpmfile` / `--global-pnpmfile` /
+/// workspace-yaml `pnpmfilePath` overrides are untouched: a path a user
+/// named on purpose still loads. See the brand-boundary note in nub's
+/// `engine_brand_preflight`.
 fn pnpmfile_default_enabled() -> bool {
-    PNPMFILE_DEFAULT_ENABLED.load(Ordering::Relaxed)
+    aube_util::engine_context().pnpmfile_default_enabled
 }
 
 /// The cwd-default pnpmfile path if one exists, ignoring the
-/// [`set_pnpmfile_default_enabled`] gate. Lets an embedder discover that a
+/// [`pnpmfile_default_enabled`] gate. Lets an embedder discover that a
 /// default `.pnpmfile` is present *before* it suppresses detection, so it
 /// can emit a one-line "ignored" warning naming the file. Mirrors the
 /// `.mjs`-over-`.cjs` precedence [`detect`] uses.
@@ -115,8 +99,8 @@ const HOOK_LOG_SENTINEL: &str = "__AUBE_HOOK_LOG__ ";
 ///   `pnpm-workspace.yaml` (pnpm v10 lets users keep the hook file
 ///   outside the project root). Same hard-miss semantics on a typo.
 /// * Otherwise: `cwd/.pnpmfile.mjs` (preferred) or `cwd/.pnpmfile.cjs`,
-///   *unless* the cwd-default is gated off via
-///   [`set_pnpmfile_default_enabled`] (a non-pnpm embedder treating a
+///   *unless* the cwd-default is gated off via the engine context's
+///   `pnpmfile_default_enabled` (a non-pnpm embedder treating a
 ///   stray `.pnpmfile` as another tool's config). The missing-default
 ///   case stays silent because "no pnpmfile" is the common case, not a
 ///   misconfiguration.
@@ -1124,7 +1108,7 @@ mod tests {
         // this test and restore it so sibling tests keep upstream-default
         // behavior regardless of run order.
         let prev = pnpmfile_default_enabled();
-        set_pnpmfile_default_enabled(false);
+        aube_util::update_engine_context(|ctx| ctx.pnpmfile_default_enabled = false);
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join(PNPMFILE_CJS_NAME);
         std::fs::write(&f, "").unwrap();
@@ -1136,7 +1120,7 @@ mod tests {
         // default_path() ignores the gate so an embedder can warn about
         // the file it just suppressed.
         assert_eq!(default_path(dir.path()).as_deref(), Some(f.as_path()));
-        set_pnpmfile_default_enabled(prev);
+        aube_util::update_engine_context(|ctx| ctx.pnpmfile_default_enabled = prev);
     }
 
     #[test]
@@ -1145,12 +1129,12 @@ mod tests {
         // `--pnpmfile` path — a path the user pointed at on purpose still
         // loads regardless of the incumbent.
         let prev = pnpmfile_default_enabled();
-        set_pnpmfile_default_enabled(false);
+        aube_util::update_engine_context(|ctx| ctx.pnpmfile_default_enabled = false);
         let dir = tempfile::tempdir().unwrap();
         let custom = dir.path().join("hooks.cjs");
         std::fs::write(&custom, "").unwrap();
         let found = detect(dir.path(), Some(custom.as_path()), None);
         assert_eq!(found.as_deref(), Some(custom.as_path()));
-        set_pnpmfile_default_enabled(prev);
+        aube_util::update_engine_context(|ctx| ctx.pnpmfile_default_enabled = prev);
     }
 }

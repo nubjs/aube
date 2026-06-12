@@ -1,32 +1,21 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::env::npm_config_env_entries_from;
 use super::npmrc::{parse_npmrc, parse_npmrc_untrusted};
 use super::types::{NpmConfig, NpmrcSource};
 
 /// Whether the loader reads pnpm's global `~/.config/pnpm/auth.ini`
-/// (`<XDG_CONFIG_HOME>/pnpm/auth.ini`). Defaults to `true` (upstream
-/// behavior: the file is read on every load and its auth tokens merged
-/// into the user-scope config). An embedder whose active package manager
-/// isn't pnpm passes `false` — under a non-pnpm incumbent that
-/// pnpm-named global file is another tool's state and must not be read at
-/// all (a name-based policy: anything with "pnpm" in the path is off
-/// unless pnpm is the incumbent). The `.npmrc` / `npmrcAuthFile` sources
-/// are unaffected; only the pnpm-named `auth.ini` is gated.
-static PNPM_AUTH_INI_ENABLED: AtomicBool = AtomicBool::new(true);
-
-/// Embedder seam: toggle whether pnpm's global `auth.ini` is read by the
-/// config loader. Defaults to `true` (upstream). Mirrors the other
-/// process-global `set_*` seams — call once per process before invoking
-/// any command. See [`pnpm_auth_ini_enabled`] and the brand-boundary note
-/// in nub's `engine_brand_preflight`.
-pub fn set_pnpm_auth_ini_enabled(on: bool) {
-    PNPM_AUTH_INI_ENABLED.store(on, Ordering::Relaxed);
-}
-
+/// (`<XDG_CONFIG_HOME>/pnpm/auth.ini`). Sourced from the engine context;
+/// defaults to `true` (upstream behavior: the file is read on every load
+/// and its auth tokens merged into the user-scope config). An embedder
+/// whose active package manager isn't pnpm sets `pnpm_auth_ini_enabled`
+/// `false` on the context — under a non-pnpm incumbent that pnpm-named
+/// global file is another tool's state and must not be read at all (a
+/// name-based policy: anything with "pnpm" in the path is off unless pnpm
+/// is the incumbent). The `.npmrc` / `npmrcAuthFile` sources are
+/// unaffected; only the pnpm-named `auth.ini` is gated.
 fn pnpm_auth_ini_enabled() -> bool {
-    PNPM_AUTH_INI_ENABLED.load(Ordering::Relaxed)
+    aube_util::engine_context().pnpm_auth_ini_enabled
 }
 
 impl NpmConfig {

@@ -477,6 +477,13 @@ impl PackageJson {
     /// to get scripts running. Non-string entries are dropped; a denylist
     /// match in `neverBuiltDependencies` still wins at `decide()` time.
     pub fn trusted_dependencies(&self) -> Vec<String> {
+        // Embedder seam: a tool whose active package manager ignores
+        // `trustedDependencies` (everything but Bun, and Bun once it dropped
+        // the field) flips this off in the engine context so the union
+        // contributes nothing. Default on ⇒ upstream behavior.
+        if !aube_util::engine_context().trusted_dependencies_honored {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         if let Some(arr) = self
             .extra
@@ -657,6 +664,12 @@ impl PackageJson {
     /// values. Workspace-level overrides from `pnpm-workspace.yaml`
     /// are merged on top of this map by the caller.
     pub fn overrides_map(&self) -> BTreeMap<String, String> {
+        // Embedder seam: when a tool has computed a scoped override source
+        // (e.g. only the active PM's native field), use it verbatim and skip
+        // the per-source walk below. Default `None` ⇒ upstream behavior.
+        if let Some(scoped) = aube_util::engine_context().embedder_overrides {
+            return scoped;
+        }
         let mut out: BTreeMap<String, String> = BTreeMap::new();
         let insert = |out: &mut BTreeMap<String, String>,
                       obj: &serde_json::Map<String, serde_json::Value>| {
