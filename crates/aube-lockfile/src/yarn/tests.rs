@@ -1246,6 +1246,61 @@ fn test_write_berry_escapes_resolution_and_header() {
         .unwrap_or_else(|e| panic!("berry writer produced malformed YAML: {e}\n{written}"));
 }
 
+/// The berry writer emits the package's `bin:` map (yarn 4 carries it from
+/// the manifest into the lockfile). It's modeled on `LockedPackage.bin` but
+/// the berry reader never populates it, so a graph built from the registry —
+/// where bins are real — must round-trip them through the writer. Empty-key
+/// placeholders are skipped so they don't render as `"": …`.
+#[test]
+fn test_write_berry_emits_bin_map() {
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "cli-tool@1.0.0".to_string(),
+        LockedPackage {
+            name: "cli-tool".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: "cli-tool@1.0.0".to_string(),
+            bin: [
+                ("cli-tool".to_string(), "./bin/cli.js".to_string()),
+                // Empty-key placeholder (pnpm's hasBin collapse) — must not
+                // render as `"": …`.
+                (String::new(), "ignored".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+    );
+    let graph = LockfileGraph {
+        importers: {
+            let mut m = BTreeMap::new();
+            m.insert(".".to_string(), vec![]);
+            m
+        },
+        packages,
+        ..Default::default()
+    };
+    let manifest = make_manifest(&[], &[]);
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write_berry(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    // `bin:` nested map with the executable, indented like the dep maps.
+    assert!(
+        written.contains("  bin:\n    cli-tool: ./bin/cli.js\n"),
+        "berry writer must emit the bin map, got:\n{written}"
+    );
+    // Empty-key placeholder is dropped, not rendered as `"": …`.
+    assert!(
+        !written.contains("\"\":"),
+        "empty-key bin placeholder must be skipped, got:\n{written}"
+    );
+    // Output stays valid YAML.
+    let _doc: yaml_serde::Value = yaml_serde::from_str(&written)
+        .unwrap_or_else(|e| panic!("berry writer produced malformed YAML: {e}\n{written}"));
+}
+
 /// Yarn v1's lockfile parser reads a leading `@` as the start of a
 /// scoped-package token and requires the dependency-map key to be a
 /// double-quoted string; a bare `@scope/name` key throws `Unknown

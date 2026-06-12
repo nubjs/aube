@@ -767,6 +767,13 @@ pub fn write_berry(
         );
         write_berry_peer_deps(&mut out, &pkg.peer_dependencies);
         write_berry_peer_meta(&mut out, &pkg.peer_dependencies_meta);
+        // `bin:` map — binary name → relative executable path. Yarn 4 emits
+        // this (from the package manifest's `bin`) ahead of `checksum`. It's
+        // modeled on `LockedPackage.bin`; the berry reader doesn't populate it
+        // (so a pure berry→berry round-trip is unaffected), but a graph
+        // resolved from the registry carries real bins and must round-trip
+        // them through the berry writer like yarn does.
+        write_berry_bin(&mut out, &pkg.bin);
 
         if let Some(checksum) = &pkg.yarn_checksum {
             // Yarn writes the checksum unquoted (`checksum: 10c0/…`).
@@ -905,6 +912,25 @@ fn write_berry_peer_deps(out: &mut String, peer: &BTreeMap<String, String>) {
         // Peer ranges are bare semver (`^18.3.1`) with no protocol `:`, which
         // yarn writes unquoted; only quote when the value would misparse.
         out.push_str(&quote_yaml_value(range));
+        out.push('\n');
+    }
+}
+
+/// Emit yarn 4's `bin:` mapping (binary name → relative executable path).
+/// Empty-key placeholder entries (synthesized by pnpm's `hasBin: true`
+/// collapse) are skipped so they don't render as `"": …`. Same nested-map
+/// indentation and key/value quoting as the dep maps.
+fn write_berry_bin(out: &mut String, bin: &BTreeMap<String, String>) {
+    let real: Vec<(&String, &String)> = bin.iter().filter(|(k, _)| !k.is_empty()).collect();
+    if real.is_empty() {
+        return;
+    }
+    out.push_str("  bin:\n");
+    for (name, path) in real {
+        out.push_str("    ");
+        out.push_str(&quote_yaml_key(name));
+        out.push_str(": ");
+        out.push_str(&quote_yaml_value(path));
         out.push('\n');
     }
 }

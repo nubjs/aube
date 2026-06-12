@@ -984,18 +984,15 @@ fn hash_settings(project_dir: &Path, cli_flags: &[(String, String)]) -> String {
     // catalog edits, overrides bumps, packageExtensions, allowBuilds list.
     // any of those mean re-resolve is needed, yaml bytes are the source.
     hasher.update(b"workspace_yaml=");
-    // The shared `pnpm-workspace.yaml` compatibility surface first (only when
-    // the `read_branded_pnpm_config` posture has aube reading it), then this
-    // tool's own branded YAML (if it has one). Standalone aube:
-    // `["pnpm-workspace.yaml", "aube-workspace.yaml"]`. Under a non-pnpm
-    // incumbent the pnpm entry drops out, matching what aube actually reads.
-    let read_pnpm = aube_util::engine_context().read_branded_pnpm_config;
-    let workspace_yaml_files: Vec<&str> = read_pnpm
-        .then_some("pnpm-workspace.yaml")
-        .into_iter()
-        .chain(aube_util::embedder().workspace_yaml)
-        .collect();
-    for name in workspace_yaml_files {
+    // Iterate the *same* candidate set, in the *same* order, that aube actually
+    // probes/reads (`workspace_yaml_names()`): this tool's branded YAML first,
+    // then — when the `read_branded_pnpm_config` posture is set — the shared
+    // `pnpm-workspace.yaml` compatibility surface. Standalone aube:
+    // `["aube-workspace.yaml", "pnpm-workspace.yaml"]`. Under a non-pnpm
+    // incumbent the pnpm entry drops out. Routing through the shared helper
+    // keeps the hash order aligned with the read order (no divergent local
+    // list to drift) and matches the standalone oracle.
+    for name in aube_manifest::workspace::workspace_yaml_names() {
         let path = project_dir.join(name);
         hasher.update(name.as_bytes());
         hasher.update(b"\x1f");
