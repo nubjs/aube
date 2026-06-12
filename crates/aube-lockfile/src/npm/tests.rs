@@ -401,7 +401,10 @@ fn test_write_emits_file_dir_dep_as_link_pair() {
     );
 
     // The link node points back at that path.
-    assert_eq!(packages["node_modules/local-utils"]["resolved"], "local-pkg");
+    assert_eq!(
+        packages["node_modules/local-utils"]["resolved"],
+        "local-pkg"
+    );
     assert_eq!(packages["node_modules/local-utils"]["link"], true);
 }
 

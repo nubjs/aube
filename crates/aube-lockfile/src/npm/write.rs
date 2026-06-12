@@ -472,7 +472,9 @@ fn non_link_roots(graph: &LockfileGraph, roots: &[DirectDep]) -> Vec<DirectDep> 
             !graph.packages.get(&dep.dep_path).is_some_and(|pkg| {
                 matches!(
                     pkg.local_source,
-                    Some(LocalSource::Link(_) | LocalSource::Directory(_) | LocalSource::Tarball(_))
+                    Some(
+                        LocalSource::Link(_) | LocalSource::Directory(_) | LocalSource::Tarball(_)
+                    )
                 )
             })
         })

@@ -1245,3 +1245,128 @@ fn test_write_berry_escapes_resolution_and_header() {
     let _doc: yaml_serde::Value = yaml_serde::from_str(&written)
         .unwrap_or_else(|e| panic!("berry writer produced malformed YAML: {e}\n{written}"));
 }
+
+/// Yarn v1's lockfile parser reads a leading `@` as the start of a
+/// scoped-package token and requires the dependency-map key to be a
+/// double-quoted string; a bare `@scope/name` key throws `Unknown
+/// token … INVALID`. The classic writer must quote scoped keys inside
+/// `dependencies:` (matching real yarn, which writes
+/// `"@babel/helper-validator-identifier" "^7.x"`) while leaving plain
+/// names unquoted. Regression test for the 0.0.34 conformance gate.
+#[test]
+fn test_write_classic_quotes_scoped_dependency_keys() {
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "parent@1.0.0".to_string(),
+        LockedPackage {
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: "parent@1.0.0".to_string(),
+            dependencies: BTreeMap::from([
+                (
+                    "@babel/helper".to_string(),
+                    "@babel/helper@7.0.0".to_string(),
+                ),
+                ("js-tokens".to_string(), "js-tokens@4.0.0".to_string()),
+            ]),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "@babel/helper@7.0.0".to_string(),
+        LockedPackage {
+            name: "@babel/helper".to_string(),
+            version: "7.0.0".to_string(),
+            dep_path: "@babel/helper@7.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "js-tokens@4.0.0".to_string(),
+        LockedPackage {
+            name: "js-tokens".to_string(),
+            version: "4.0.0".to_string(),
+            dep_path: "js-tokens@4.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    let graph = LockfileGraph {
+        importers: BTreeMap::from([(".".to_string(), vec![])]),
+        packages,
+        ..Default::default()
+    };
+    let manifest = make_manifest(&[], &[]);
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write_classic(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    // Scoped key quoted, bare key not — exactly as yarn v1 emits them.
+    assert!(
+        written.contains("    \"@babel/helper\" \"7.0.0\"\n"),
+        "scoped dep key must be quoted:\n{written}"
+    );
+    assert!(
+        written.contains("    js-tokens \"4.0.0\"\n"),
+        "bare dep key must stay unquoted:\n{written}"
+    );
+    // The unquoted `@…` form that yarn v1 rejects must not appear.
+    assert!(
+        !written.contains("    @babel/helper "),
+        "unquoted scoped dep key would break yarn v1:\n{written}"
+    );
+}
+
+/// A `file:` local-source package is keyed by the protocol descriptor
+/// its consumer declared (`local-utils@file:./local-pkg`), carries a
+/// `version` but no `resolved`/`integrity`, and the header uses the
+/// manifest's literal range (preserving the `./`) so yarn v1's
+/// `--frozen-lockfile` reconciliation against package.json matches.
+/// Keying it `name@version` or dropping the `./` makes yarn demand a
+/// rewrite. Regression test for the 0.0.34 conformance gate.
+#[test]
+fn test_write_classic_file_dep_header_and_no_resolved() {
+    let source = LocalSource::Directory(PathBuf::from("local-pkg"));
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        source.dep_path("local-utils"),
+        LockedPackage {
+            name: "local-utils".to_string(),
+            version: "1.0.0".to_string(),
+            // A stray integrity must be suppressed for local sources.
+            integrity: Some("sha512-should-not-appear".to_string()),
+            dep_path: source.dep_path("local-utils"),
+            local_source: Some(source),
+            ..Default::default()
+        },
+    );
+    let graph = LockfileGraph {
+        importers: BTreeMap::from([(".".to_string(), vec![])]),
+        packages,
+        ..Default::default()
+    };
+    // Manifest declares the canonical `file:./local-pkg` range; the
+    // header must reproduce it verbatim, leading `./` and all.
+    let manifest = make_manifest(&[("local-utils", "file:./local-pkg")], &[]);
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write_classic(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    assert!(
+        written.contains("\"local-utils@file:./local-pkg\":\n"),
+        "file: block must be keyed by the declared protocol range:\n{written}"
+    );
+    assert!(
+        written.contains("  version \"1.0.0\"\n"),
+        "file: block must carry its version:\n{written}"
+    );
+    assert!(
+        !written.contains("integrity"),
+        "file: block must not carry a registry integrity:\n{written}"
+    );
+    assert!(
+        !written.contains("\"local-utils@1.0.0\""),
+        "file: block must not be keyed name@version:\n{written}"
+    );
+}
