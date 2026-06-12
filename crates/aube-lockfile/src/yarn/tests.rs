@@ -1370,3 +1370,103 @@ fn test_write_classic_file_dep_header_and_no_resolved() {
         "file: block must not be keyed name@version:\n{written}"
     );
 }
+
+// A hosted git dep (npm `resolved: git+ssh://…#<40-char-sha>`) must be
+// keyed by the ORIGINAL git descriptor the manifest declared
+// (`ms@vercel/ms#4ff48cec`), with a codeload `resolved` line — exactly
+// what real yarn v1 writes. Keying it by the expanded resolved URL makes
+// `yarn install --frozen-lockfile` reject the file (it can't match the
+// manifest's range), so the recovered descriptor is load-bearing.
+#[test]
+fn test_write_classic_git_dep_uses_declared_descriptor_and_codeload_resolved() {
+    let git = crate::GitSource {
+        url: "ssh://git@github.com/vercel/ms.git".to_string(),
+        committish: Some("4ff48cec099f0514c3e9bbca18706c9c21122bfb".to_string()),
+        resolved: "4ff48cec099f0514c3e9bbca18706c9c21122bfb".to_string(),
+        integrity: None,
+        subpath: None,
+    };
+    let source = LocalSource::Git(git);
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        source.dep_path("ms"),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "4.0.0".to_string(),
+            dep_path: source.dep_path("ms"),
+            local_source: Some(source),
+            ..Default::default()
+        },
+    );
+    let graph = LockfileGraph {
+        importers: BTreeMap::from([(".".to_string(), vec![])]),
+        packages,
+        ..Default::default()
+    };
+    // The manifest declares the GitHub shorthand; the block header must
+    // reproduce it, not the expanded ssh url.
+    let manifest = make_manifest(&[("ms", "vercel/ms#4ff48cec")], &[]);
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write_classic(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    assert!(
+        written.contains("\"ms@vercel/ms#4ff48cec\":\n"),
+        "git block must be keyed by the declared descriptor:\n{written}"
+    );
+    assert!(
+        written.contains(
+            "  resolved \"https://codeload.github.com/vercel/ms/tar.gz/\
+             4ff48cec099f0514c3e9bbca18706c9c21122bfb\"\n"
+        ),
+        "git block must carry the codeload resolved URL:\n{written}"
+    );
+    assert!(
+        !written.contains("ssh://git@github.com"),
+        "the expanded ssh url must not leak into the block header or resolved:\n{written}"
+    );
+}
+
+// When a git dep's original descriptor can't be recovered from the
+// manifest (e.g. a transitive git dep absent from every package.json), the
+// writer must REFUSE rather than emit the unmatchable expanded-URL header
+// — never silently write a yarn-rejected lockfile.
+#[test]
+fn test_write_classic_git_dep_without_declared_descriptor_is_refused() {
+    let git = crate::GitSource {
+        url: "ssh://git@github.com/vercel/ms.git".to_string(),
+        committish: Some("4ff48cec099f0514c3e9bbca18706c9c21122bfb".to_string()),
+        resolved: "4ff48cec099f0514c3e9bbca18706c9c21122bfb".to_string(),
+        integrity: None,
+        subpath: None,
+    };
+    let source = LocalSource::Git(git);
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        source.dep_path("ms"),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "4.0.0".to_string(),
+            dep_path: source.dep_path("ms"),
+            local_source: Some(source),
+            ..Default::default()
+        },
+    );
+    let graph = LockfileGraph {
+        importers: BTreeMap::from([(".".to_string(), vec![])]),
+        packages,
+        ..Default::default()
+    };
+    // No `ms` in the manifest (nor any other package's declared deps): the
+    // descriptor is unrecoverable.
+    let manifest = make_manifest(&[], &[]);
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    let err = write_classic(out.path(), &graph, &manifest).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ms") && msg.contains("git dependency"),
+        "the refusal must name the dep and explain the git-conversion limit, got: {msg}"
+    );
+}
