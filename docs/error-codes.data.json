@@ -22,25 +22,25 @@
       "name": "ERR_AUBE_OUTDATED_LOCKFILE",
       "category": "Lockfile",
       "description": "A `--frozen-lockfile` install found the lockfile out of date with `package.json` / `pnpm-workspace.yaml` (same condition as pnpm's `ERR_PNPM_OUTDATED_LOCKFILE`).",
-      "exit_code": 13
+      "exit_code": 16
     },
     {
       "name": "ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH",
       "category": "Lockfile",
       "description": "`package.json` declares a package manager (`packageManager` or `devEngines.packageManager`) but the only lockfile(s) on disk belong to other tools. Regenerate the declared tool's lockfile, convert with `aube import`, or fix the declaration.",
-      "exit_code": 14
+      "exit_code": 17
     },
     {
       "name": "ERR_AUBE_LOCKFILE_AMBIGUOUS",
       "category": "Lockfile",
       "description": "Lockfiles from two or more package managers coexist and `package.json` doesn't declare which tool owns the project. Remove the stale lockfile(s) or add a `packageManager` declaration.",
-      "exit_code": 15
+      "exit_code": 18
     },
     {
       "name": "ERR_AUBE_RESOLUTION_SHAPE_MISMATCH",
       "category": "Lockfile",
       "description": "A registry-style lockfile dependency path is backed by a git, local directory, or direct tarball resolution.",
-      "exit_code": 16
+      "exit_code": 13
     },
     {
       "name": "ERR_AUBE_NO_MATCHING_VERSION",
@@ -462,6 +462,12 @@
       "name": "WARN_AUBE_IGNORED_BUILD_SCRIPTS",
       "category": "Install lifecycle",
       "description": "Dep had `preinstall`/`install`/`postinstall` scripts but isn't on the `allowBuilds` allowlist. Run `aube approve-builds`.",
+      "exit_code": null
+    },
+    {
+      "name": "WARN_AUBE_DEFAULT_TRUST_BUILDS",
+      "category": "Install lifecycle",
+      "description": "The `defaultTrust` floor let listed packages run build scripts without an explicit `allowBuilds` entry. Disclosure, not an error — set `defaultTrust=false` or an explicit `allowBuilds: false` entry to opt out.",
       "exit_code": null
     },
     {

@@ -152,25 +152,25 @@ pub const ALL: &[CodeMeta] = &[
         name: ERR_AUBE_OUTDATED_LOCKFILE,
         category: category::LOCKFILE,
         description: "A `--frozen-lockfile` install found the lockfile out of date with `package.json` / `pnpm-workspace.yaml` (same condition as pnpm's `ERR_PNPM_OUTDATED_LOCKFILE`).",
-        exit_code: Some(13),
+        exit_code: Some(16),
     },
     CodeMeta {
         name: ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH,
         category: category::LOCKFILE,
         description: "`package.json` declares a package manager (`packageManager` or `devEngines.packageManager`) but the only lockfile(s) on disk belong to other tools. Regenerate the declared tool's lockfile, convert with `aube import`, or fix the declaration.",
-        exit_code: Some(14),
+        exit_code: Some(17),
     },
     CodeMeta {
         name: ERR_AUBE_LOCKFILE_AMBIGUOUS,
         category: category::LOCKFILE,
         description: "Lockfiles from two or more package managers coexist and `package.json` doesn't declare which tool owns the project. Remove the stale lockfile(s) or add a `packageManager` declaration.",
-        exit_code: Some(15),
+        exit_code: Some(18),
     },
     CodeMeta {
         name: ERR_AUBE_RESOLUTION_SHAPE_MISMATCH,
         category: category::LOCKFILE,
         description: "A registry-style lockfile dependency path is backed by a git, local directory, or direct tarball resolution.",
-        exit_code: Some(16),
+        exit_code: Some(13),
     },
     // Resolver
     CodeMeta {
