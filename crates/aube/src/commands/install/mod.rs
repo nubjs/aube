@@ -96,7 +96,7 @@ use workspace::{
 /// stat only the first file per package — enough to catch the common
 /// crash-residue class of a wiped CAS shard). An embedder that trusts
 /// the atomically-published store (nub, Bun's model) sets
-/// `warm_store_verify = false` on the engine context to skip the
+/// `warm_store_verify = false` on its embedder profile to skip the
 /// per-file stat sweep.
 ///
 /// **This is independent of import-time integrity.** It does NOT touch
@@ -104,10 +104,11 @@ use workspace::{
 /// setting, or `strict-store-integrity` — those stay on regardless.
 /// Only the local-cache warm-relink stat depth relaxes.
 ///
-/// Sourced from the engine context. Defaults to `true` (upstream) when
-/// an embedder never relaxed it.
+/// Sourced from the compile-time embedder profile (a fixed posture, not
+/// per-project). Defaults to `true` (upstream) when an embedder never
+/// relaxed it.
 pub(crate) fn warm_store_verify() -> bool {
-    aube_util::engine_context().warm_store_verify
+    aube_util::embedder().warm_store_verify
 }
 
 /// Load a cached package index for a warm-relink classifier site,
@@ -812,7 +813,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 // entries across warm re-runs (Step 1b's Fresh/Missing/Stale
                 // state machine readlinks them; it does not wipe `.aube/`).
                 // So when an embedder opts into fast-trust
-                // (`warm_store_verify = false` on the engine context) we re-enable the shortcut
+                // (`warm_store_verify = false` on the embedder profile) we re-enable the shortcut
                 // for workspaces too, skipping a serial per-package
                 // `load_index` inside the linker. Default (verify on) keeps
                 // upstream behavior exactly.
@@ -1226,7 +1227,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                     // Stat depth follows the warm-store-verify seam:
                     // full per-file verify by default (upstream), or
                     // first-file-only under an embedder that opted into
-                    // fast-trust via `warm_store_verify = false` on the engine context.
+                    // fast-trust via `warm_store_verify = false` on the embedder profile.
                     // Either way a stale index drops here and re-fetches
                     // the tarball cleanly instead of letting the
                     // materializer die later with

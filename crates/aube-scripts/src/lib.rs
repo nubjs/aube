@@ -473,13 +473,20 @@ pub fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
 /// (`darwin`/`linux`/`win32`, `x64`/`arm64`), not Rust's native
 /// `std::env::consts::{OS,ARCH}` values, so tools that parse the full
 /// UA string identify the platform the same way npm/yarn/pnpm do.
+///
+/// The product token defaults to the compile-time
+/// [`Embedder::user_agent`](aube_util::identity::Embedder::user_agent)
+/// (`aube/<version>` for standalone aube). A lifecycle-specific token set on
+/// the engine context's `lifecycle_user_agent_product` outranks it — that
+/// token is genuinely runtime (an embedder advertises the served PM's role
+/// plus the project's *resolved* node version, which can't be a compile-time
+/// literal), and it exists exactly for this export so postinstall sniffers see
+/// it while the const identity governs everything else.
 pub fn aube_user_agent() -> String {
-    format!(
-        "{} {} {}",
-        aube_util::embedder().user_agent,
-        node_platform(),
-        node_arch(),
-    )
+    let product = aube_util::engine_context()
+        .lifecycle_user_agent_product
+        .unwrap_or_else(|| aube_util::embedder().user_agent.to_owned());
+    format!("{product} {} {}", node_platform(), node_arch())
 }
 
 fn node_platform() -> &'static str {

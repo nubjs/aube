@@ -57,14 +57,26 @@ pub struct EngineContext {
     /// Bun itself from the version that dropped it).
     pub trusted_dependencies_honored: bool,
 
-    /// Whether the config loader reads pnpm's global
-    /// `~/.config/pnpm/auth.ini`. `true` (default) is upstream behavior — the
-    /// file is read on every load and its tokens merged. An embedder whose
-    /// active PM isn't pnpm sets `false`: under a non-pnpm incumbent that
-    /// pnpm-named global file is another tool's state and must not be read at
-    /// all (a name-based policy). The `.npmrc` / `npmrcAuthFile` sources are
-    /// unaffected.
-    pub pnpm_auth_ini_enabled: bool,
+    /// Whether aube reads the *branded pnpm* config-compat surface. `true`
+    /// (default) is upstream behavior: aube consults pnpm's surfaces alongside
+    /// its own. This single posture drives all three pnpm-branded read-sites
+    /// together —
+    ///
+    /// 1. `pnpm-workspace.yaml` is included in the workspace-yaml candidate
+    ///    list (probed/read for workspace settings);
+    /// 2. the `pnpm` `package.json` config namespace is consulted (folded with
+    ///    the tool's own `aube.*` namespace);
+    /// 3. pnpm's global `~/.config/pnpm/auth.ini` is read and its tokens
+    ///    merged.
+    ///
+    /// The actual branded values (`"pnpm-workspace.yaml"`, the `"pnpm"`
+    /// namespace) are aube's own compiled-in pnpm-compat knowledge; this bool
+    /// only *gates* whether they apply. An embedder whose active PM isn't pnpm
+    /// sets `false`: under a non-pnpm incumbent those pnpm-named surfaces are
+    /// another tool's state and must not be read (a name-based policy). The
+    /// tool's own branded YAML/namespace, `.npmrc`, and `npmrcAuthFile`
+    /// sources are unaffected.
+    pub read_branded_pnpm_config: bool,
 
     /// Whether the cwd-default `.pnpmfile` is detected. `true` (default) is
     /// upstream. An embedder under a non-pnpm incumbent sets `false`: a stray
@@ -88,12 +100,16 @@ pub struct EngineContext {
     /// empty = behavior-preserving.
     pub env_overlay: Vec<(OsString, OsString)>,
 
-    /// Whether warm-relink store verification stats every cached file (`true`,
-    /// upstream default) or only the first file per package (`false`,
-    /// fast-trust). An embedder that trusts the atomically-published store
-    /// (nub, Bun's model) sets `false` to skip the per-file stat sweep.
-    /// Independent of import-time SRI / `verifyStoreIntegrity`.
-    pub warm_store_verify: bool,
+    /// Replacement lifecycle `npm_config_user_agent` product token. `None`
+    /// (default) falls back to the compile-time [`Embedder::user_agent`] —
+    /// standalone aube reports `aube/<version>`. An embedder sets `Some` when
+    /// the product string is genuinely *runtime*: nub emits a per-mode UA
+    /// embedding the project's RESOLVED node version (e.g.
+    /// `pnpm/x nub/x node/vX`), which can't be a compile-time literal. Read at
+    /// the lifecycle-UA seam in `aube-scripts`.
+    ///
+    /// [`Embedder::user_agent`]: crate::identity::Embedder::user_agent
+    pub lifecycle_user_agent_product: Option<String>,
 }
 
 impl Default for EngineContext {
@@ -103,11 +119,11 @@ impl Default for EngineContext {
         Self {
             embedder_overrides: None,
             trusted_dependencies_honored: true,
-            pnpm_auth_ini_enabled: true,
+            read_branded_pnpm_config: true,
             pnpmfile_default_enabled: true,
             path_prepends: Vec::new(),
             env_overlay: Vec::new(),
-            warm_store_verify: true,
+            lifecycle_user_agent_product: None,
         }
     }
 }
@@ -159,10 +175,10 @@ mod tests {
         let ctx = EngineContext::default();
         assert_eq!(ctx.embedder_overrides, None);
         assert!(ctx.trusted_dependencies_honored);
-        assert!(ctx.pnpm_auth_ini_enabled);
+        assert!(ctx.read_branded_pnpm_config);
         assert!(ctx.pnpmfile_default_enabled);
         assert!(ctx.path_prepends.is_empty());
         assert!(ctx.env_overlay.is_empty());
-        assert!(ctx.warm_store_verify);
+        assert_eq!(ctx.lifecycle_user_agent_product, None);
     }
 }

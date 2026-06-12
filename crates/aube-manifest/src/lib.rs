@@ -405,10 +405,15 @@ impl PackageJson {
         // Compatible namespaces first (lower precedence), then this tool's
         // own namespace (last = wins on key conflict). Standalone aube:
         // `["pnpm", "aube"]`. An empty `manifest_namespace` (root) carries
-        // no object key and is skipped.
+        // no object key and is skipped. The compatible (`pnpm`) namespaces are
+        // gated on the engine context's `read_branded_pnpm_config` (upstream
+        // default true) — an embedder under a non-pnpm incumbent clears it, so
+        // only this tool's own namespace is consulted.
         let id = aube_util::embedder();
+        let read_pnpm = aube_util::engine_context().read_branded_pnpm_config;
+        let compatible = if read_pnpm { id.compatible_names } else { &[] };
         let self_ns = (!id.manifest_namespace.is_empty()).then_some(id.manifest_namespace);
-        id.compatible_names
+        compatible
             .iter()
             .copied()
             .chain(self_ns)

@@ -29,6 +29,7 @@ static MYTOOL: Embedder = Embedder {
     runtime_switching: true,
     self_engines_check: true,
     self_update_enabled: true,
+    warm_store_verify: true,
 };
 
 #[test]

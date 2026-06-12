@@ -12,10 +12,10 @@
 //! [`embedder`].
 //!
 //! This struct holds *embedder-fixed* data: branding (pure naming constants)
-//! plus the four behavior toggles that an embedder — not an end user — owns
+//! plus the behavior toggles that an embedder — not an end user — owns
 //! (`canonical_lockfile_always_wins`, `runtime_switching`, `self_engines_check`,
-//! `self_update_enabled`). Genuinely *user-tunable* knobs do not belong here;
-//! those stay settings.
+//! `self_update_enabled`, `warm_store_verify`). Genuinely *user-tunable* knobs
+//! do not belong here; those stay settings.
 //!
 //! An embedder selects its profile by registering it with [`set_embedder`].
 //! A host that goes through the library entry point `aube::cli_main` passes
@@ -33,10 +33,11 @@ use std::sync::OnceLock;
 ///
 /// Branding fields are pure naming constants. The behavior toggles
 /// (`canonical_lockfile_always_wins`, `runtime_switching`,
-/// `self_engines_check`, `self_update_enabled`) are embedder-fixed, not
-/// user-tunable: a host that mirrors the project's incumbent package manager,
-/// owns Node provisioning, lives outside aube's version namespace, or owns its
-/// own self-update flips them. Genuinely user-tunable knobs stay settings.
+/// `self_engines_check`, `self_update_enabled`, `warm_store_verify`) are
+/// embedder-fixed, not user-tunable: a host that mirrors the project's
+/// incumbent package manager, owns Node provisioning, lives outside aube's
+/// version namespace, owns its own self-update, or trusts the published store
+/// flips them. Genuinely user-tunable knobs stay settings.
 #[derive(Clone, Copy, Debug)]
 pub struct Embedder {
     /// Tool name, lowercase (e.g. `"aube"`). The proper noun users type and
@@ -118,6 +119,14 @@ pub struct Embedder {
     /// embedder that owns its own upgrade path sets this `false` so those
     /// code paths never run. Embedder-fixed.
     pub self_update_enabled: bool,
+    /// When `true` (aube's default), warm-relink store verification stats
+    /// every cached file; when `false`, only the first file per package is
+    /// stat'd (fast-trust). An embedder that trusts the atomically-published
+    /// store (nub, Bun's model) sets this `false` to skip the per-file stat
+    /// sweep. Independent of import-time SRI / `verifyStoreIntegrity`. A fixed
+    /// embedder posture (it doesn't vary per project), so it lives here rather
+    /// than on the runtime engine context.
+    pub warm_store_verify: bool,
 }
 
 /// Standalone aube's embedder profile. Reproduces every hardcoded branding
@@ -141,6 +150,7 @@ pub const AUBE: Embedder = Embedder {
     runtime_switching: true,
     self_engines_check: true,
     self_update_enabled: true,
+    warm_store_verify: true,
 };
 
 static ACTIVE: OnceLock<&'static Embedder> = OnceLock::new();
@@ -229,5 +239,6 @@ mod tests {
         assert!(id.runtime_switching);
         assert!(id.self_engines_check);
         assert!(id.self_update_enabled);
+        assert!(id.warm_store_verify);
     }
 }

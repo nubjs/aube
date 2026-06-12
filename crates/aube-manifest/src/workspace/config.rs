@@ -12,25 +12,21 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Workspace-config YAML filenames, in probe/write precedence order: this
-/// tool's branded YAML first (if it has one), then the shared
+/// tool's branded YAML first (if it has one), then — when the engine context's
+/// `read_branded_pnpm_config` is set (upstream default) — the shared
 /// `pnpm-workspace.yaml` compatibility surface. Standalone aube:
-/// `["aube-workspace.yaml", "pnpm-workspace.yaml"]`.
-///
-/// Memoized: the names derive from `embedder().workspace_yaml` (a fixed
-/// `&'static` per process) plus the literal `pnpm-workspace.yaml`, so the
-/// `Vec` is built once and the slice returned on every later call. This is
-/// hit on hot-ish discovery paths (workspace-root detection), so the old
-/// per-call allocation was pure waste.
-pub fn workspace_yaml_names() -> &'static [&'static str] {
-    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        let mut names: Vec<&'static str> = Vec::with_capacity(2);
-        if let Some(branded) = aube_util::embedder().workspace_yaml {
-            names.push(branded);
-        }
+/// `["aube-workspace.yaml", "pnpm-workspace.yaml"]`. An embedder under a
+/// non-pnpm incumbent clears the posture, dropping `pnpm-workspace.yaml` so a
+/// stray copy left by another tool isn't read.
+pub fn workspace_yaml_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::with_capacity(2);
+    if let Some(branded) = aube_util::embedder().workspace_yaml {
+        names.push(branded);
+    }
+    if aube_util::engine_context().read_branded_pnpm_config {
         names.push("pnpm-workspace.yaml");
-        names
-    })
+    }
+    names
 }
 
 fn find_and_read(project_dir: &Path) -> Result<Option<(PathBuf, String)>, crate::Error> {

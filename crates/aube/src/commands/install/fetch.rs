@@ -584,7 +584,7 @@ where
             // can drift them apart even after (Docker BuildKit cache
             // mounts that only cover one path, foreign sync tools, partial
             // wipes mid-install). Under an embedder that opted into
-            // fast-trust via `warm_store_verify = false` on the engine context, only the
+            // fast-trust via `warm_store_verify = false` on the embedder profile, only the
             // first file per package is stat'd — enough to catch the
             // common wiped-CAS-shard crash residue. Either way a stale
             // index drops here and falls through to `NeedsFetch`, which

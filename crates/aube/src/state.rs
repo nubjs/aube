@@ -984,10 +984,15 @@ fn hash_settings(project_dir: &Path, cli_flags: &[(String, String)]) -> String {
     // catalog edits, overrides bumps, packageExtensions, allowBuilds list.
     // any of those mean re-resolve is needed, yaml bytes are the source.
     hasher.update(b"workspace_yaml=");
-    // The shared `pnpm-workspace.yaml` compatibility surface first, then
-    // this tool's own branded YAML (if it has one). Standalone aube:
-    // `["pnpm-workspace.yaml", "aube-workspace.yaml"]`.
-    let workspace_yaml_files: Vec<&str> = std::iter::once("pnpm-workspace.yaml")
+    // The shared `pnpm-workspace.yaml` compatibility surface first (only when
+    // the `read_branded_pnpm_config` posture has aube reading it), then this
+    // tool's own branded YAML (if it has one). Standalone aube:
+    // `["pnpm-workspace.yaml", "aube-workspace.yaml"]`. Under a non-pnpm
+    // incumbent the pnpm entry drops out, matching what aube actually reads.
+    let read_pnpm = aube_util::engine_context().read_branded_pnpm_config;
+    let workspace_yaml_files: Vec<&str> = read_pnpm
+        .then_some("pnpm-workspace.yaml")
+        .into_iter()
         .chain(aube_util::embedder().workspace_yaml)
         .collect();
     for name in workspace_yaml_files {

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Serializes the auth.ini tests that touch the process-global
-/// `engine_context().pnpm_auth_ini_enabled` gate, so the toggle test's
+/// `engine_context().read_branded_pnpm_config` gate, so the toggle test's
 /// disabled-window can't race a concurrent auth.ini read that assumes the
 /// upstream default (enabled). Restored to `true` by the toggle test
 /// inside the same critical section. Poison is ignored — these tests don't
@@ -1374,7 +1374,7 @@ fn pnpm_global_auth_ini_loses_to_project_npmrc() {
 #[test]
 fn pnpm_global_auth_ini_not_read_when_gate_disabled() {
     // Brand-boundary gate (Colin 2026-06-11): under a non-pnpm incumbent the
-    // embedder sets `pnpm_auth_ini_enabled = false` on the context, and the pnpm-NAMED
+    // embedder clears `read_branded_pnpm_config` on the context, and the pnpm-NAMED
     // `~/.config/pnpm/auth.ini` must then not be read at all — its token is
     // never applied. The `~/.npmrc` user source is untouched, so the stale
     // npmrc token (not the auth.ini one) is what survives. Restores the gate
@@ -1397,9 +1397,9 @@ fn pnpm_global_auth_ini_not_read_when_gate_disabled() {
     )
     .unwrap();
 
-    aube_util::update_engine_context(|ctx| ctx.pnpm_auth_ini_enabled = false);
+    aube_util::update_engine_context(|ctx| ctx.read_branded_pnpm_config = false);
     let disabled = load_npmrc_entries_with_home(Some(home_dir.path()), None, proj_dir.path(), None);
-    aube_util::update_engine_context(|ctx| ctx.pnpm_auth_ini_enabled = true);
+    aube_util::update_engine_context(|ctx| ctx.read_branded_pnpm_config = true);
 
     let mut cfg = NpmConfig::default();
     cfg.apply(disabled);
