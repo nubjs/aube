@@ -939,6 +939,90 @@ fn test_write_berry_roundtrip() {
 }
 
 #[test]
+fn test_write_berry_output_matches_yarn4_layout() {
+    // The berry writer reproduces yarn 4's exact on-disk layout — proven
+    // byte-identical against real `yarn install` output (tests/conformance
+    // berry leg). This guards the specific shape choices that make
+    // `yarn install --immutable` zero-churn: metadata version 10, the root
+    // `<name>@workspace:.` block sorted in among the packages, unquoted
+    // `version`/`checksum`/bare-key scalars, quoted `resolution`/`npm:`
+    // values, headers carrying only the declared ranges (not the exact
+    // `name@npm:version` resolution).
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"foo@npm:^1.0.0":
+  version: 1.2.3
+  resolution: "foo@npm:1.2.3"
+  dependencies:
+    bar: "npm:^2.0.0"
+  checksum: 10c0/foohash
+  languageName: node
+  linkType: hard
+
+"bar@npm:^2.0.0":
+  version: 2.5.0
+  resolution: "bar@npm:2.5.0"
+  checksum: 10c0/barhash
+  languageName: node
+  linkType: hard
+"#;
+    let src = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(src.path(), content).unwrap();
+    let manifest = make_manifest(&[("foo", "^1.0.0")], &[]);
+    let graph = parse(src.path(), &manifest).unwrap();
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write_berry(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    // metadata version is yarn 4's (10), not the historical 8.
+    assert!(
+        written.contains("__metadata:\n  version: 10\n  cacheKey: 10c0\n"),
+        "metadata must be yarn-4-shaped, got:\n{written}"
+    );
+    // root workspace block present (manifest name defaults to "root").
+    assert!(
+        written.contains("\"test@workspace:.\":\n  version: 0.0.0-use.local\n"),
+        "root workspace importer block must be emitted, got:\n{written}"
+    );
+    // version + checksum unquoted; resolution + npm-range values quoted.
+    assert!(
+        written.contains("  version: 1.2.3\n"),
+        "version must be unquoted"
+    );
+    assert!(
+        written.contains("  checksum: 10c0/foohash\n"),
+        "checksum must be unquoted"
+    );
+    assert!(
+        written.contains("  resolution: \"foo@npm:1.2.3\"\n"),
+        "resolution must be quoted (carries a `:`)"
+    );
+    assert!(
+        written.contains("    bar: \"npm:^2.0.0\"\n"),
+        "dep keys bare, npm-range values quoted"
+    );
+    // header carries the declared range only, not the exact resolution spec.
+    assert!(
+        written.contains("\"foo@npm:^1.0.0\":\n"),
+        "header lists the declared range, got:\n{written}"
+    );
+    assert!(
+        !written.contains("foo@npm:1.2.3, "),
+        "the exact resolution spec must not be folded into the header"
+    );
+    // blocks sorted by descriptor: bar < foo < root@workspace.
+    let bar_at = written.find("\"bar@npm").unwrap();
+    let foo_at = written.find("\"foo@npm").unwrap();
+    let root_at = written.find("\"test@workspace").unwrap();
+    assert!(
+        bar_at < foo_at && foo_at < root_at,
+        "blocks must be sorted by header"
+    );
+}
+
+#[test]
 fn test_write_berry_roundtrips_patch_protocol() {
     let mut packages = BTreeMap::new();
     packages.insert(
