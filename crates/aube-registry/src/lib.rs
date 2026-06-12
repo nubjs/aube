@@ -733,13 +733,25 @@ pub enum Error {
     #[error("version not found: {0}@{1}")]
     #[diagnostic(code(ERR_AUBE_VERSION_NOT_FOUND))]
     VersionNotFound(String, String),
-    /// The registry rejected the request with 401/403 — either no auth
-    /// token was configured, it was invalid, or the account doesn't
-    /// have permission for this package. Callers should point the user
-    /// at `aube login`.
+    /// The registry rejected the request with 401 — no auth token was
+    /// configured, or the one we sent was invalid/expired. Callers
+    /// should point the user at `aube login`. A 403 is a *different*
+    /// case (authenticated but forbidden) and maps to [`Error::Forbidden`].
     #[error("authentication required")]
     #[diagnostic(code(ERR_AUBE_UNAUTHORIZED))]
     Unauthorized,
+    /// The registry rejected the request with 403 — the request was
+    /// authenticated but the credentials lack permission for this
+    /// operation. The cause is almost always actionable and registry-
+    /// specific (insufficient token scope, package blocked by an
+    /// org/Artifactory policy, write to a read-only mirror), and
+    /// registries put that detail in the response body — so we preserve
+    /// it here verbatim. `aube login` does NOT fix a 403, so callers must
+    /// surface the body and a permissions-oriented hint, not an auth one.
+    /// The body may be empty if the registry sent none.
+    #[error("forbidden by registry: {body}")]
+    #[diagnostic(code(ERR_AUBE_FORBIDDEN))]
+    Forbidden { body: String },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("registry rejected write: HTTP {status}: {body}")]

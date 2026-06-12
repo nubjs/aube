@@ -71,6 +71,24 @@ pub enum DistTagCommand {
     },
 }
 
+/// Render a registry 403 into a user-facing report. A 403 means the
+/// request authenticated but the credentials aren't permitted, so —
+/// unlike a 401 — `aube login` won't help. We surface the registry's
+/// own message (Artifactory/GitHub Packages put the actionable reason
+/// there: blocked by policy, missing token scope, read-only mirror) and
+/// give a permissions-oriented hint instead of an auth one. When the
+/// registry sent no body we still name the right remediation class.
+fn forbidden_report(name: &str, body: String) -> miette::Report {
+    let detail = if body.is_empty() {
+        String::new()
+    } else {
+        format!("\nregistry: {body}")
+    };
+    miette!(
+        "forbidden by registry for {name}{detail}\nhelp: your token authenticated but isn\'t allowed to do this — check its permissions/scope (e.g. `read:packages`/`write:packages`) or whether the package is blocked by an org or registry policy. `aube login` won\'t fix a 403."
+    )
+}
+
 pub async fn run(args: DistTagArgs) -> miette::Result<()> {
     args.network.install_overrides();
     match args.command {
@@ -105,6 +123,7 @@ async fn add(spec: &str, tag: Option<&str>, otp: Option<&str>) -> miette::Result
             aube_registry::Error::Unauthorized => miette!(
                 "authentication required for {name}\nhelp: run `aube login` first, then retry"
             ),
+            aube_registry::Error::Forbidden { body } => forbidden_report(name, body),
             other => miette!("failed to set {name}@{tag} -> {version}: {other}"),
         })?;
 
@@ -133,6 +152,7 @@ async fn rm(package: &str, tag: &str, otp: Option<&str>) -> miette::Result<()> {
             aube_registry::Error::Unauthorized => miette!(
                 "authentication required for {name}\nhelp: run `aube login` first, then retry"
             ),
+            aube_registry::Error::Forbidden { body } => forbidden_report(name, body),
             other => miette!("failed to remove {name}@{tag}: {other}"),
         })?;
 
@@ -175,6 +195,7 @@ async fn ls(package: Option<&str>) -> miette::Result<()> {
         aube_registry::Error::Unauthorized => {
             miette!("authentication required for {name}\nhelp: run `aube login` first, then retry")
         }
+        aube_registry::Error::Forbidden { body } => forbidden_report(&name, body),
         other => miette!("failed to fetch dist-tags for {name}: {other}"),
     })?;
 
