@@ -344,15 +344,21 @@ fn test_write_canonicalizes_hosted_git_resolved_to_sshurl() {
     );
 }
 
+/// A `file:` directory dep must serialize as npm's two-entry pair: a
+/// `<path>: { name, version }` package record keyed by the on-disk
+/// path, plus a `node_modules/<name>: { resolved: "<path>", link: true }`
+/// link node. Emitting neither (the prior behavior) made `npm ci` reject
+/// nub's lockfile with `Missing: <name>@<version> from lock file`, since
+/// the root `dependencies` entry had no matching `packages` record.
 #[test]
-fn test_write_skips_non_git_local_sources() {
-    let local = LocalSource::Directory(PathBuf::from("vendor/local-dir"));
-    let dep_path = local.dep_path("local-dir");
+fn test_write_emits_file_dir_dep_as_link_pair() {
+    let local = LocalSource::Directory(PathBuf::from("./local-pkg"));
+    let dep_path = local.dep_path("local-utils");
     let mut graph = LockfileGraph::default();
     graph.packages.insert(
         dep_path.clone(),
         LockedPackage {
-            name: "local-dir".to_string(),
+            name: "local-utils".to_string(),
             version: "1.0.0".to_string(),
             dep_path: dep_path.clone(),
             local_source: Some(local),
@@ -362,17 +368,17 @@ fn test_write_skips_non_git_local_sources() {
     graph.importers.insert(
         ".".to_string(),
         vec![DirectDep {
-            name: "local-dir".to_string(),
+            name: "local-utils".to_string(),
             dep_path,
             dep_type: DepType::Production,
-            specifier: Some("file:vendor/local-dir".to_string()),
+            specifier: Some("file:./local-pkg".to_string()),
         }],
     );
 
     let manifest = aube_manifest::PackageJson {
         name: Some("test".to_string()),
         version: Some("1.0.0".to_string()),
-        dependencies: [("local-dir".to_string(), "file:vendor/local-dir".to_string())]
+        dependencies: [("local-utils".to_string(), "file:./local-pkg".to_string())]
             .into_iter()
             .collect(),
         ..Default::default()
@@ -381,7 +387,22 @@ fn test_write_skips_non_git_local_sources() {
     write(out.path(), &graph, &manifest).unwrap();
 
     let body = std::fs::read_to_string(out.path()).unwrap();
-    assert!(!body.contains("\"node_modules/local-dir\""));
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let packages = &doc["packages"];
+
+    // npm strips `file:` and the leading `./`, keying the metadata
+    // entry by the bare path `local-pkg` with only name + version.
+    assert_eq!(packages["local-pkg"]["name"], "local-utils");
+    assert_eq!(packages["local-pkg"]["version"], "1.0.0");
+    assert!(
+        packages["local-pkg"].get("resolved").is_none(),
+        "file: metadata entry carries no resolved field, got {}",
+        packages["local-pkg"]
+    );
+
+    // The link node points back at that path.
+    assert_eq!(packages["node_modules/local-utils"]["resolved"], "local-pkg");
+    assert_eq!(packages["node_modules/local-utils"]["link"], true);
 }
 
 #[test]
