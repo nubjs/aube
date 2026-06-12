@@ -76,6 +76,82 @@ use workspace::{
     importer_project_dir, write_per_project_lockfiles,
 };
 
+/// Process-global toggle for the warm-relink store verification depth.
+///
+/// Default `true` == upstream behavior: the two warm-relink classifier
+/// sites (`fetch::fetch_packages_with_root` and the GVS prewarm loop in
+/// this module) call [`aube_store::Store::load_index_verified`], which
+/// stats *every* file recorded in a package's cached index on a cache
+/// hit (~150 ms on a 1.4k-package warm install). That full stat guards
+/// only against external drift of the local CAS — a Docker BuildKit
+/// cache mount that covers `index/` but not `files/`, a foreign sync
+/// tool, a manual `rm` inside the store — and even then only partially:
+/// a stale entry simply re-fetches the tarball cleanly, never silent
+/// corruption (the index is the store's completeness marker; aube
+/// publishes to the CAS atomically — O_TMPFILE+linkat / O_CREAT|O_EXCL
+/// per file, index written LAST, a torn index is parse-rejected).
+///
+/// When set `false`, the warm-relink sites use the cheap
+/// [`aube_store::Store::load_index`] path instead (parse the index +
+/// stat only the first file per package — enough to catch the common
+/// crash-residue class of a wiped CAS shard). An embedder that trusts
+/// the atomically-published store (nub, Bun's model) calls
+/// [`set_warm_store_verify(false)`] once at startup to skip the
+/// per-file stat sweep.
+///
+/// **This is independent of import-time integrity.** It does NOT touch
+/// download/tarball SHA-512 verification, the `verifyStoreIntegrity`
+/// setting, or `strict-store-integrity` — those stay on regardless.
+/// Only the local-cache warm-relink stat depth relaxes.
+static WARM_STORE_VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Set whether warm-relink store verification stats every cached file
+/// (`true`, upstream default) or only the first file per package
+/// (`false`, fast-trust). Call once at startup, before any install runs.
+/// Defaults to `true` when never set.
+pub fn set_warm_store_verify(enabled: bool) {
+    let _ = WARM_STORE_VERIFY.set(enabled);
+}
+
+/// Whether warm-relink store verification stats every file. `true`
+/// (upstream) unless an embedder relaxed it via [`set_warm_store_verify`].
+pub(crate) fn warm_store_verify() -> bool {
+    *WARM_STORE_VERIFY.get().unwrap_or(&true)
+}
+
+/// Load a cached package index for a warm-relink classifier site,
+/// choosing stat depth per the process-global [`warm_store_verify`]
+/// flag: full per-file verify by default (upstream), first-file-only
+/// when an embedder opted into fast-trust. Independent of import-time
+/// SRI / `verifyStoreIntegrity`, which is enforced elsewhere on fetch.
+pub(crate) fn warm_load_index(
+    store: &aube_store::Store,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+) -> Option<aube_store::PackageIndex> {
+    let verify = warm_store_verify();
+    // Log the selected depth exactly once per process so a `-v` warm
+    // install can confirm which path is active without per-package noise.
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::debug!(
+            verify,
+            "warm-relink store verification: {}",
+            if verify {
+                "full (stat every cached file)"
+            } else {
+                "fast (first-file stat only)"
+            }
+        );
+    });
+    if verify {
+        store.load_index_verified(name, version, integrity)
+    } else {
+        store.load_index(name, version, integrity)
+    }
+}
+
 #[derive(Default)]
 struct InstallPhaseTimings {
     path: Option<std::path::PathBuf>,
@@ -709,7 +785,20 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 &cwd,
                 &aube_dir,
                 Some(lock_materialize_tx),
-                /*skip_already_linked_shortcut=*/ has_workspace,
+                // Workspace installs disable the `AlreadyLinked` fast path
+                // under the upstream default (full warm-store-verify): the
+                // historical rationale was that `link_workspace` would
+                // invalidate the classification. That no longer holds —
+                // `link_workspace` preserves `.aube/<dep_path>` virtual-store
+                // entries across warm re-runs (Step 1b's Fresh/Missing/Stale
+                // state machine readlinks them; it does not wipe `.aube/`).
+                // So when an embedder opts into fast-trust
+                // (`set_warm_store_verify(false)`) we re-enable the shortcut
+                // for workspaces too, skipping a serial per-package
+                // `load_index` inside the linker. Default (verify on) keeps
+                // upstream behavior exactly.
+                /*skip_already_linked_shortcut=*/
+                has_workspace && warm_store_verify(),
                 virtual_store_dir_max_length,
                 opts.ignore_scripts,
                 network_concurrency_setting,
@@ -1097,15 +1186,18 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                     // under the same (name, version) can't return the
                     // registry-cached file list.
                     //
-                    // `_verified`: see the matching call in
-                    // `fetch_packages_with_root` for the full
-                    // rationale — short version, a stat-per-file cache
-                    // check is cheap, and dropping a stale index
-                    // here re-fetches the tarball cleanly instead of
-                    // letting the materializer die later with
-                    // `ERR_AUBE_MISSING_STORE_FILE`.
+                    // Stat depth follows the warm-store-verify seam:
+                    // full per-file verify by default (upstream), or
+                    // first-file-only under an embedder that opted into
+                    // fast-trust via `set_warm_store_verify(false)`.
+                    // Either way a stale index drops here and re-fetches
+                    // the tarball cleanly instead of letting the
+                    // materializer die later with
+                    // `ERR_AUBE_MISSING_STORE_FILE`. Independent of
+                    // import-time SRI / `verifyStoreIntegrity`.
                     let pkg_registry_name = pkg.registry_name().to_string();
-                    if let Some(index) = fetch_store.load_index_verified(
+                    if let Some(index) = warm_load_index(
+                        &fetch_store,
                         &pkg_registry_name,
                         &pkg.version,
                         pkg.integrity.as_deref(),
@@ -1660,7 +1752,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                     &cwd,
                     &aube_dir,
                     /*materialize_tx=*/ None,
-                    /*skip_already_linked_shortcut=*/ has_workspace,
+                    // Same warm-store-verify gate as the primary fetch
+                    // above: re-enable the workspace `AlreadyLinked`
+                    // shortcut only under fast-trust; default keeps the
+                    // upstream `has_workspace` value.
+                    /*skip_already_linked_shortcut=*/
+                    has_workspace && warm_store_verify(),
                     virtual_store_dir_max_length,
                     opts.ignore_scripts,
                     network_concurrency_setting,
