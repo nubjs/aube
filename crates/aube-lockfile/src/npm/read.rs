@@ -6,7 +6,7 @@ use super::raw::{InstallPathInfo, RawNpmLockfile};
 /// Parse a package-lock.json or npm-shrinkwrap.json file into a LockfileGraph.
 pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let content = crate::read_lockfile(path)?;
-    let raw: RawNpmLockfile = crate::parse_json(path, content)?;
+    let mut raw: RawNpmLockfile = crate::parse_json(path, content)?;
 
     if raw.lockfile_version < 2 {
         return Err(Error::parse(
@@ -17,6 +17,22 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             ),
         ));
     }
+
+    // `npm install --prefix <proj>` (run from a different cwd than the
+    // project) writes every `packages` key — and every `link.resolved`
+    // target — as a path that *climbs out* of npm's cwd back to the
+    // project: `../../../abs/path/to/proj/node_modules/debug` instead of
+    // the canonical project-relative `node_modules/debug`. The whole
+    // reader keys off the canonical form (`resolve_nested`,
+    // `package_name_from_install_path`, the `node_modules/<name>` root
+    // lookups), so the climb prefix made root direct deps resolve to
+    // nothing: importers came out empty (every direct-dep specifier and
+    // every hoist-tree root vanished), which then produced a pnpm-lock
+    // with an empty importer `specifiers:` map and a bun.lock with
+    // `"packages": {}`. Normalize each key/target down to its canonical
+    // project-relative form (everything from the first `node_modules/`
+    // segment) up front so the rest of the reader is climb-prefix-blind.
+    normalize_install_path_prefixes(&mut raw);
 
     let mut graph = LockfileGraph {
         importers: BTreeMap::new(),
@@ -305,25 +321,33 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let root = raw.packages.get("").cloned().unwrap_or_default();
 
     let mut direct: Vec<DirectDep> = Vec::new();
-    let push_direct = |dep_name: &str, dep_type: DepType, direct: &mut Vec<DirectDep>| {
-        let root_path = format!("node_modules/{dep_name}");
-        if let Some(info) = install_path_info.get(&root_path) {
-            direct.push(DirectDep {
-                name: info.name.clone(),
-                dep_path: info.dep_path.clone(),
-                dep_type,
-                specifier: None,
-            });
-        }
-    };
-    for dep_name in root.dependencies.keys() {
-        push_direct(dep_name, DepType::Production, &mut direct);
+    // Carry the declared range npm wrote on the root entry's
+    // `dependencies`/`devDependencies`/`optionalDependencies` value
+    // through to the importer's `specifier`. Without it the pnpm
+    // writer emits an empty importer `specifiers:` map and pnpm's
+    // frozen install rejects the lockfile with
+    // `specifiers in the lockfile don't match package.json` — the same
+    // way the non-root workspace importers below already thread it.
+    let push_direct =
+        |dep_name: &str, specifier: &str, dep_type: DepType, direct: &mut Vec<DirectDep>| {
+            let root_path = format!("node_modules/{dep_name}");
+            if let Some(info) = install_path_info.get(&root_path) {
+                direct.push(DirectDep {
+                    name: info.name.clone(),
+                    dep_path: info.dep_path.clone(),
+                    dep_type,
+                    specifier: Some(specifier.to_string()),
+                });
+            }
+        };
+    for (dep_name, specifier) in &root.dependencies {
+        push_direct(dep_name, specifier, DepType::Production, &mut direct);
     }
-    for dep_name in root.dev_dependencies.keys() {
-        push_direct(dep_name, DepType::Dev, &mut direct);
+    for (dep_name, specifier) in &root.dev_dependencies {
+        push_direct(dep_name, specifier, DepType::Dev, &mut direct);
     }
-    for dep_name in root.optional_dependencies.keys() {
-        push_direct(dep_name, DepType::Optional, &mut direct);
+    for (dep_name, specifier) in &root.optional_dependencies {
+        push_direct(dep_name, specifier, DepType::Optional, &mut direct);
     }
 
     // npm symlinks every workspace member (and any other top-level
@@ -422,4 +446,62 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         graph.importers.insert(target.clone(), direct);
     }
     Ok(graph)
+}
+
+/// Canonical project-relative form of an npm `packages` install path
+/// (or a `link.resolved` target). `--prefix` installs prepend a climb
+/// out of npm's cwd back to the project dir
+/// (`../../../abs/proj/node_modules/foo`); the rest of the reader
+/// assumes the project-relative spelling (`node_modules/foo`). Returns
+/// the slice beginning at the first `node_modules/` segment when the
+/// path doesn't already start there; otherwise returns the path
+/// unchanged. The root key (`""`) and paths with no `node_modules/`
+/// segment (e.g. a workspace target like `packages/app`) pass through
+/// untouched.
+fn canonical_install_path(install_path: &str) -> &str {
+    if install_path.starts_with("node_modules/") {
+        return install_path;
+    }
+    match install_path.find("node_modules/") {
+        Some(idx) => &install_path[idx..],
+        None => install_path,
+    }
+}
+
+/// Rewrite every `packages` key and every `link.resolved` target to its
+/// canonical project-relative form (see [`canonical_install_path`]) so
+/// `--prefix`-written lockfiles read identically to in-directory ones.
+/// A no-op for the common case where npm wrote project-relative paths.
+fn normalize_install_path_prefixes(raw: &mut super::raw::RawNpmLockfile) {
+    let needs_rewrite = raw
+        .packages
+        .keys()
+        .any(|k| canonical_install_path(k) != k.as_str())
+        || raw.packages.values().any(|p| {
+            p.resolved
+                .as_deref()
+                .is_some_and(|r| canonical_install_path(r) != r)
+        });
+    if !needs_rewrite {
+        return;
+    }
+
+    let old = std::mem::take(&mut raw.packages);
+    for (key, mut pkg) in old {
+        // Only `link.resolved` is an install-path target that must be
+        // canonicalized to match the rewritten keys. A non-link
+        // `resolved` is a tarball URL and must be left verbatim.
+        if pkg.link
+            && let Some(resolved) = pkg.resolved.as_deref()
+        {
+            let canonical = canonical_install_path(resolved);
+            if canonical != resolved {
+                pkg.resolved = Some(canonical.to_string());
+            }
+        }
+        let canonical_key = canonical_install_path(&key).to_string();
+        // First write wins, mirroring the rest of the reader's
+        // dedupe-by-canonical-path behavior.
+        raw.packages.entry(canonical_key).or_insert(pkg);
+    }
 }
