@@ -720,18 +720,46 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // `aube ci`, `aube install --frozen-lockfile`, and
             // every frozen reinstall actually run the routing
             // (previously skipped, surfaced by review).
+            //
+            // Scheduling: the gate is fired as a concurrent task that
+            // overlaps the tarball-download phase below, then `await`ed
+            // at line `lock_osv_gate_active = …` BEFORE any build /
+            // lifecycle script runs (those live in
+            // `run_finalize_phase`, well after fetch + link). The set
+            // of packages queried and the gating decision are
+            // identical to the prior serial-before-fetch call — only
+            // the `await` point moved later, hiding the OSV round-trip
+            // behind the download tail. Downloading a tarball the gate
+            // later flags is harmless; it is never *executed* before
+            // the gate clears because the `?` on the awaited result
+            // aborts the whole install before the finalize/build phase.
             let osv_settings = resolve_osv_routing_settings(&cwd);
-            osv_gate_active = super::add_supply_chain::run_post_resolve_osv_routing(
-                &cwd,
-                &graph,
-                /*fresh_resolution=*/ false,
-                opts.osv_transitive_check,
-                osv_settings.advisory_check,
-                osv_settings.advisory_check_on_install,
-                osv_settings.advisory_bloom_check,
-                osv_settings.advisory_check_every_install,
-            )
-            .await?;
+            let lock_osv_cwd = cwd.clone();
+            let lock_osv_graph = graph.clone();
+            let lock_osv_transitive_check = opts.osv_transitive_check;
+            // Single-task `JoinSet` (abort-on-drop): a few fallible `?`
+            // sites sit between here and the gate `await` below
+            // (link-strategy / patch loading, the fetch). If any
+            // early-returns, the install is aborting before the build
+            // phase, and dropping the set cancels the in-flight probe so
+            // it doesn't keep doing network I/O post-error. On the
+            // normal path the verdict is consumed via `join_next()`
+            // below, strictly before any build / lifecycle script.
+            let mut lock_osv_set: tokio::task::JoinSet<miette::Result<bool>> =
+                tokio::task::JoinSet::new();
+            lock_osv_set.spawn(async move {
+                super::add_supply_chain::run_post_resolve_osv_routing(
+                    &lock_osv_cwd,
+                    &lock_osv_graph,
+                    /*fresh_resolution=*/ false,
+                    lock_osv_transitive_check,
+                    osv_settings.advisory_check,
+                    osv_settings.advisory_check_on_install,
+                    osv_settings.advisory_bloom_check,
+                    osv_settings.advisory_check_every_install,
+                )
+                .await
+            });
             // Graph came straight from the lockfile (frozen reinstall /
             // `aube ci` / clone) — it carries the advisory + cooling
             // vetting performed when the lockfile was written, so the
@@ -821,12 +849,30 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             let (indices, cached, fetched) = match fetch_result {
                 Ok(t) => t,
                 Err(e) => {
+                    // Fetch failed: the install is aborting, so no build
+                    // script will run. Dropping `lock_osv_set` aborts the
+                    // in-flight OSV probe so it doesn't keep doing network
+                    // I/O after the CLI has errored.
+                    drop(lock_osv_set);
                     return Err(combine_install_pipeline_errors(lock_materialize_handle, e).await);
                 }
             };
             // Materializer stats roll into link via GVS-already-linked
             // fast path. Errors abort install.
             let _ = lock_materialize_handle.await.into_diagnostic()??;
+            // Gate: consume the OSV verdict that ran concurrently with
+            // the download phase above. This `await` is strictly before
+            // the link + finalize phases, so a `MAL-*` finding aborts
+            // the install (via `?`) before any dependency build /
+            // lifecycle script can execute — the security posture is
+            // unchanged, only the OSV round-trip now overlaps downloads
+            // instead of serializing ahead of them. `join_next()` is
+            // `Some` (exactly one spawned task); inner `?` = OSV finding
+            // / required-check failure, outer `?` = task-join panic.
+            osv_gate_active = match lock_osv_set.join_next().await {
+                Some(joined) => joined.into_diagnostic()??,
+                None => unreachable!("OSV JoinSet had exactly one spawned task"),
+            };
             tracing::debug!(
                 "phase:fetch {:.1?} ({fetched} packages)",
                 phase_start.elapsed()
@@ -1474,17 +1520,44 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             let fresh_resolution =
                 super::add_supply_chain::lockfile_has_new_picks(&cwd, prior_lockfile, &graph);
             let osv_settings = resolve_osv_routing_settings(&cwd);
-            osv_gate_active = super::add_supply_chain::run_post_resolve_osv_routing(
-                &cwd,
-                &graph,
-                fresh_resolution,
-                opts.osv_transitive_check,
-                osv_settings.advisory_check,
-                osv_settings.advisory_check_on_install,
-                osv_settings.advisory_bloom_check,
-                osv_settings.advisory_check_every_install,
-            )
-            .await?;
+            // Fire the OSV gate as a concurrent task that overlaps the
+            // tail of the in-flight tarball downloads (`fetch_handle`,
+            // spawned during resolution above and still draining here),
+            // then `await` it just before the fetch await below —
+            // strictly before link + finalize, so the gate still aborts
+            // the install before any dependency build / lifecycle script
+            // runs. Set of packages queried + the gating decision are
+            // unchanged; only the `await` point moved past the download
+            // tail. A flagged tarball may finish downloading, but it is
+            // never executed before the gate clears (the `?` on the
+            // awaited verdict aborts ahead of the finalize/build phase).
+            let fresh_osv_cwd = cwd.clone();
+            let fresh_osv_graph = graph.clone();
+            let fresh_osv_transitive_check = opts.osv_transitive_check;
+            // Single-task `JoinSet` rather than a bare `tokio::spawn`
+            // so the OSV probe is aborted-on-drop: between here and the
+            // gate `await` below sit several fallible `?` sites (the
+            // security scanner, patch/link-strategy loading, the
+            // fetch-join). If any of them early-returns, the install is
+            // aborting before the build phase anyway, and the `JoinSet`
+            // drop cancels the in-flight probe so no detached task keeps
+            // doing network I/O after the CLI has errored. The verdict
+            // is consumed via `join_next()` on the success path below.
+            let mut fresh_osv_set: tokio::task::JoinSet<miette::Result<bool>> =
+                tokio::task::JoinSet::new();
+            fresh_osv_set.spawn(async move {
+                super::add_supply_chain::run_post_resolve_osv_routing(
+                    &fresh_osv_cwd,
+                    &fresh_osv_graph,
+                    fresh_resolution,
+                    fresh_osv_transitive_check,
+                    osv_settings.advisory_check,
+                    osv_settings.advisory_check_on_install,
+                    osv_settings.advisory_bloom_check,
+                    osv_settings.advisory_check_every_install,
+                )
+                .await
+            });
             // The resolver ran, but when it reproduced the locked picks
             // (`fresh_resolution == false`) the graph still matches what
             // the lockfile vetted, so the floor may inherit that vetting.
@@ -1560,8 +1633,25 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             let fetch_result = match fetch_handle.await.into_diagnostic()? {
                 Ok(v) => v,
                 Err(e) => {
+                    // Fetch failed → install is aborting, no build script
+                    // will run. Dropping `fresh_osv_set` aborts the
+                    // in-flight OSV probe so it doesn't keep doing
+                    // network I/O after the CLI has errored.
+                    drop(fresh_osv_set);
                     return Err(combine_install_pipeline_errors(materialize_handle, e).await);
                 }
+            };
+            // Gate: consume the OSV verdict that ran concurrently with
+            // the download tail. Strictly before link + finalize, so a
+            // `MAL-*` finding aborts (via `?`) before any dependency
+            // build / lifecycle script can execute. Posture unchanged —
+            // only the `await` point moved past the fetch tail. The
+            // `join_next()` Option is `Some` (we spawned exactly one
+            // task); inner `?` surfaces an OSV finding / required-check
+            // failure, outer `?` a task-join panic.
+            osv_gate_active = match fresh_osv_set.join_next().await {
+                Some(joined) => joined.into_diagnostic()??,
+                None => unreachable!("OSV JoinSet had exactly one spawned task"),
             };
             let (canonical_indices, mut cached, mut fetched) = fetch_result;
             tracing::debug!(
