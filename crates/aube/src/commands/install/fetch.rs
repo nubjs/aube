@@ -577,17 +577,24 @@ where
             // archive vs. the npm-published bytes — can't return the
             // wrong file list.
             //
-            // `_verified` because the index cache and the CAS shards
-            // live in separate paths until the v1/index/ migration
-            // completes on disk, and external systems can drift them
-            // apart even after (Docker BuildKit cache mounts that
-            // only cover one path, foreign sync tools, partial wipes
-            // mid-install). Stat-per-file is paid only on a cache hit;
-            // a stale index drops here and falls through to `NeedsFetch`,
-            // which re-fetches the tarball cleanly — the alternative is
-            // the materializer dying mid-link with `ERR_AUBE_MISSING_STORE_FILE`,
-            // forcing the user to retry the whole install.
-            match store.load_index_verified(
+            // Stat depth follows the warm-store-verify seam. By default
+            // (upstream) this is a full per-file verify: the index cache
+            // and the CAS shards live in separate paths until the
+            // v1/index/ migration completes on disk, and external systems
+            // can drift them apart even after (Docker BuildKit cache
+            // mounts that only cover one path, foreign sync tools, partial
+            // wipes mid-install). Under an embedder that opted into
+            // fast-trust via `set_warm_store_verify(false)`, only the
+            // first file per package is stat'd — enough to catch the
+            // common wiped-CAS-shard crash residue. Either way a stale
+            // index drops here and falls through to `NeedsFetch`, which
+            // re-fetches the tarball cleanly — the alternative is the
+            // materializer dying mid-link with
+            // `ERR_AUBE_MISSING_STORE_FILE`, forcing a whole-install
+            // retry. Independent of import-time SRI / `verifyStoreIntegrity`,
+            // which is enforced on fetch regardless of this flag.
+            match super::warm_load_index(
+                store,
                 pkg.registry_name(),
                 &pkg.version,
                 pkg.integrity.as_deref(),

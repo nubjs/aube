@@ -627,6 +627,19 @@ pub use aube_lockfile::set_aube_lock_base_filename;
 /// before invoking any command.
 pub use engines::set_aube_engine_check;
 
+/// Warm-relink store-verification depth toggle for embedders — see
+/// [`commands::install::set_warm_store_verify`]. Defaults to `true`
+/// (upstream behavior: the warm-relink classifier stats *every* file in
+/// each cached package index on a cache hit, ~150 ms on a large warm
+/// install, to catch external drift of the local CAS). An embedder that
+/// trusts aube's atomically-published store (nub, Bun's model) passes
+/// `false` to use the cheap first-file-only check instead, and to
+/// re-enable the workspace `AlreadyLinked` fast path. **Independent of
+/// import-time integrity** — does NOT touch download/tarball SHA-512
+/// verification, `verifyStoreIntegrity`, or `strict-store-integrity`,
+/// which stay on regardless. Call once per process before any install.
+pub use commands::install::set_warm_store_verify;
+
 /// Node version-switching toggle for embedders — see
 /// [`runtime::set_runtime_switching_enabled`]. Defaults to enabled
 /// (upstream #861 behavior: resolve `.nvmrc`/`.node-version`/
