@@ -562,7 +562,23 @@ pub(crate) fn resolve_virtual_store_dir(
             || k == "NPM_CONFIG_VIRTUAL_STORE_DIR"
             || k == "AUBE_VIRTUAL_STORE_DIR"
     });
-    if !(has_explicit_npmrc || has_explicit_yaml || has_explicit_env) {
+    // An embedder-supplied default (keyed by canonical setting name) counts
+    // as explicit too — without this check a `virtualStoreDir` registered via
+    // `set_embedder_defaults` (e.g. a host that wants `node_modules/.nub`)
+    // would be silently discarded in favor of the `<modulesDir>/.aube`
+    // derivation, since `resolved::virtual_store_dir` *does* honor the
+    // embedder-defaults source via the ctx. Standalone aube registers no
+    // embedder defaults, so this is empty and the default branch is taken
+    // exactly as before.
+    let has_explicit_embedder_default = ctx
+        .embedder_defaults
+        .iter()
+        .any(|(k, _)| k == "virtualStoreDir");
+    if !(has_explicit_npmrc
+        || has_explicit_yaml
+        || has_explicit_env
+        || has_explicit_embedder_default)
+    {
         return default_from_modules_dir();
     }
     let raw = aube_settings::resolved::virtual_store_dir(ctx);

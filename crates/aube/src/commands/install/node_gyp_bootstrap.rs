@@ -122,7 +122,11 @@ pub(crate) fn lazy_shim_bin_dir(project_bin_dir: &Path) -> miette::Result<Option
     Ok(Some(shim_dir))
 }
 
-pub(crate) async fn print_bootstrapped_binary(project_dir: &Path) -> miette::Result<()> {
+/// `pub` so an embedder driving the lazy node-gyp shim re-entry (its own
+/// `current_exe()` is what the shim execs) can print the bootstrapped binary
+/// path. Pairs with the `pub`-widened [`ensure_cached`]; standalone aube is
+/// unaffected.
+pub async fn print_bootstrapped_binary(project_dir: &Path) -> miette::Result<()> {
     let bin_dir = ensure_cached(project_dir).await?;
     println!("{}", bin_dir.join(primary_binary_name()).display());
     Ok(())

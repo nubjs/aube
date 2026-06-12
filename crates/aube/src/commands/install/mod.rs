@@ -21,7 +21,11 @@ mod lifecycle;
 mod link;
 mod lockfile_dir;
 mod materialize;
-pub(crate) mod node_gyp_bootstrap;
+// `pub` (not `pub(crate)`) so an embedder whose `current_exe()` is the binary
+// the lazy node-gyp shim re-execs can reach `ensure_cached` /
+// `print_bootstrapped_binary` to service the bootstrap re-entry. Standalone
+// aube reaches them the same way; widening visibility changes no behavior.
+pub mod node_gyp_bootstrap;
 mod resolve;
 mod settings;
 mod side_effects_cache;
