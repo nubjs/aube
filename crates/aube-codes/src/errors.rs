@@ -40,6 +40,7 @@ pub const ERR_AUBE_PEER_CONTEXT_NOT_CONVERGED: &str = "ERR_AUBE_PEER_CONTEXT_NOT
 pub const ERR_AUBE_PACKAGE_NOT_FOUND: &str = "ERR_AUBE_PACKAGE_NOT_FOUND";
 pub const ERR_AUBE_VERSION_NOT_FOUND: &str = "ERR_AUBE_VERSION_NOT_FOUND";
 pub const ERR_AUBE_UNAUTHORIZED: &str = "ERR_AUBE_UNAUTHORIZED";
+pub const ERR_AUBE_FORBIDDEN: &str = "ERR_AUBE_FORBIDDEN";
 pub const ERR_AUBE_OFFLINE: &str = "ERR_AUBE_OFFLINE";
 pub const ERR_AUBE_INVALID_PACKAGE_NAME: &str = "ERR_AUBE_INVALID_PACKAGE_NAME";
 pub const ERR_AUBE_REGISTRY_WRITE_REJECTED: &str = "ERR_AUBE_REGISTRY_WRITE_REJECTED";
@@ -292,8 +293,18 @@ pub const ALL: &[CodeMeta] = &[
     CodeMeta {
         name: ERR_AUBE_UNAUTHORIZED,
         category: category::REGISTRY_NETWORK,
-        description: "Registry returned 401/403 — missing or invalid auth. Run `aube login`.",
+        description: "Registry returned 401 — missing or invalid auth. Run `aube login`.",
         exit_code: Some(42),
+    },
+    CodeMeta {
+        name: ERR_AUBE_FORBIDDEN,
+        category: category::REGISTRY_NETWORK,
+        // The registry/network exit band (40–49) is full; a 403 is an
+        // auth-class rejection like 401, but distinct enough to warrant
+        // its own code so CI can branch on it. Falls back to
+        // EXIT_GENERIC — precedent: ERR_AUBE_SECURITY_SCANNER_FAILED.
+        description: "Registry returned 403 — authenticated but forbidden (insufficient permissions, token scope, or blocked by policy). The registry's message is included.",
+        exit_code: None,
     },
     CodeMeta {
         name: ERR_AUBE_OFFLINE,

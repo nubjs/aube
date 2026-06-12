@@ -2,7 +2,7 @@ use super::body::check_body_cap;
 use super::cache::packument_full_cache_path;
 use super::{
     AUDIT_BODY_CAP, PACKUMENT_FULL_ACCEPT, RegistryClient, check_dist_tag_status,
-    dist_tag_root_url, dist_tag_url, parse_full_response,
+    dist_tag_root_url, dist_tag_url, forbidden_with_body, map_dist_tag_error, parse_full_response,
 };
 use crate::Error;
 use std::path::Path;
@@ -166,7 +166,7 @@ impl RegistryClient {
                 self.authed_get(&url, registry_url)
             })
             .await?;
-        check_dist_tag_status(&resp, name)?;
+        let resp = check_dist_tag_status(resp, name).await?;
         let map: std::collections::BTreeMap<String, String> =
             resp.error_for_status()?.json().await?;
         Ok(map)
@@ -205,7 +205,7 @@ impl RegistryClient {
             req
         };
         let resp = self.authed(req, registry_url).send().await?;
-        check_dist_tag_status(&resp, name)?;
+        let resp = check_dist_tag_status(resp, name).await?;
         resp.error_for_status()?;
         Ok(())
     }
@@ -236,11 +236,12 @@ impl RegistryClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(Error::NotFound(format!("{name}@{tag}")));
         }
-        if matches!(
-            resp.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            return Err(Error::Unauthorized);
+        // 401 -> Unauthorized (run `aube login`); 403 -> Forbidden with
+        // the registry's response body preserved (a 403 is an
+        // authenticated-but-not-permitted rejection — `aube login` won't
+        // fix it, and the actionable detail is in the body).
+        if let Some(err) = map_dist_tag_error(&resp, name) {
+            return Err(forbidden_with_body(err, resp).await);
         }
         resp.error_for_status()?;
         Ok(())
