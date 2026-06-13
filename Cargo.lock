@@ -312,6 +312,7 @@ dependencies = [
  "glob",
  "hex",
  "junction",
+ "libc",
  "miette",
  "pathdiff",
  "rayon",

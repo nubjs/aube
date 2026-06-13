@@ -841,3 +841,250 @@ fn validate_index_key_rejects_windows_drive() {
         Err(Error::UnsafeIndexKey(_))
     ));
 }
+
+// --- Whole-dir clonefile(2) materialization (macOS+APFS) ---------------
+//
+// These cover the load-bearing invariant: a package filled by the
+// whole-dir clone fast path must be byte-identical to one filled by
+// the per-file loop — files, nested directories, symlinks, and the +x
+// mode bits. A wrong tree is worse than a slow one.
+
+/// Recursively compare two trees for byte-identical content, identical
+/// symlink targets, identical +x bits, and identical directory shape.
+/// Returns a human-readable mismatch description, or `None` on match.
+#[cfg(all(unix, test))]
+fn diff_trees(a: &Path, b: &Path) -> Option<String> {
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut names_a = BTreeSet::new();
+    for e in std::fs::read_dir(a)
+        .map_err(|e| format!("read_dir {a:?}: {e}"))
+        .ok()?
+    {
+        names_a.insert(e.ok()?.file_name());
+    }
+    let mut names_b = BTreeSet::new();
+    for e in std::fs::read_dir(b)
+        .map_err(|e| format!("read_dir {b:?}: {e}"))
+        .ok()?
+    {
+        names_b.insert(e.ok()?.file_name());
+    }
+    if names_a != names_b {
+        return Some(format!(
+            "entry sets differ at {a:?} vs {b:?}: {names_a:?} != {names_b:?}"
+        ));
+    }
+    for name in names_a {
+        let pa = a.join(&name);
+        let pb = b.join(&name);
+        let ma = std::fs::symlink_metadata(&pa).ok()?;
+        let mb = std::fs::symlink_metadata(&pb).ok()?;
+        let ta = ma.file_type();
+        let tb = mb.file_type();
+        if ta.is_symlink() != tb.is_symlink() {
+            return Some(format!("symlink-ness differs at {name:?}"));
+        }
+        if ta.is_symlink() {
+            let la = std::fs::read_link(&pa).ok()?;
+            let lb = std::fs::read_link(&pb).ok()?;
+            if la != lb {
+                return Some(format!(
+                    "symlink target differs at {name:?}: {la:?} != {lb:?}"
+                ));
+            }
+            continue;
+        }
+        if ta.is_dir() != tb.is_dir() {
+            return Some(format!("dir-ness differs at {name:?}"));
+        }
+        if ta.is_dir() {
+            if let Some(d) = diff_trees(&pa, &pb) {
+                return Some(d);
+            }
+            continue;
+        }
+        // Regular file: compare content + the +x bit.
+        let ca = std::fs::read(&pa).ok()?;
+        let cb = std::fs::read(&pb).ok()?;
+        if ca != cb {
+            return Some(format!("content differs at {name:?}"));
+        }
+        let xa = ma.permissions().mode() & 0o111;
+        let xb = mb.permissions().mode() & 0o111;
+        if xa != xb {
+            return Some(format!(
+                "exec bits differ at {name:?}: {:o} != {:o}",
+                ma.permissions().mode() & 0o777,
+                mb.permissions().mode() & 0o777
+            ));
+        }
+    }
+    None
+}
+
+/// Direct test of the clone primitive: a hand-built package directory
+/// with every tricky shape — a regular file, an executable bin, a
+/// nested subdir, an in-package symlink, and a nested `node_modules`
+/// — must come across a raw `clonefile(2)` byte-identical.
+#[cfg(target_os = "macos")]
+#[test]
+fn clonefile_dir_preserves_files_symlinks_exec_and_nested_node_modules() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("lib/deep")).unwrap();
+    std::fs::create_dir_all(src.join("bin")).unwrap();
+    std::fs::create_dir_all(src.join("node_modules/inner")).unwrap();
+
+    std::fs::write(
+        src.join("package.json"),
+        br#"{"name":"x","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("lib/deep/mod.js"), b"module.exports = 42;\n").unwrap();
+    let bin = src.join("bin/cli.js");
+    std::fs::write(&bin, b"#!/usr/bin/env node\nconsole.log(1);\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("deep/mod.js", src.join("lib/alias.js")).unwrap();
+    std::fs::write(src.join("node_modules/inner/index.js"), b"1").unwrap();
+
+    let dst = dir.path().join("dst");
+    crate::clonedir::clonefile_dir(&src, &dst).expect("clonefile of a directory tree");
+
+    assert!(
+        diff_trees(&src, &dst).is_none(),
+        "clone diverged: {:?}",
+        diff_trees(&src, &dst)
+    );
+    // Spell out the load-bearing specifics so a failure names the cause.
+    assert_eq!(
+        std::fs::metadata(dst.join("bin/cli.js"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111,
+        "+x bit must survive the clone"
+    );
+    assert!(
+        std::fs::symlink_metadata(dst.join("lib/alias.js"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "in-package symlink must clone as a symlink"
+    );
+    assert_eq!(
+        std::fs::read_link(dst.join("lib/alias.js")).unwrap(),
+        Path::new("deep/mod.js")
+    );
+    assert!(dst.join("node_modules/inner/index.js").exists());
+
+    // CoW independence: mutating the clone must not write through to src.
+    std::fs::write(dst.join("package.json"), b"MUTATED").unwrap();
+    assert_eq!(
+        std::fs::read(src.join("package.json")).unwrap(),
+        br#"{"name":"x","version":"1.0.0"}"#,
+        "clone must be an independent CoW copy"
+    );
+}
+
+/// End-to-end: materialize the same package via the CloneDir fast path
+/// (real `ensure_in_aube_dir` on APFS, which builds the tree then
+/// clones) and via the per-file loop (a hand-rolled baseline using the
+/// same `link_file_fresh` the loop uses), and assert the two package
+/// directories are byte-identical including +x bits. This is the
+/// "materialize both ways and diff" guard the design hinges on.
+#[cfg(target_os = "macos")]
+#[test]
+fn clonedir_materialize_matches_per_file_byte_for_byte() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path().join("store/files"));
+
+    // A package with a plain file, a package.json, a nested subdir
+    // file, and an executable bin — the shapes the +x and nested-dir
+    // handling must get right.
+    let idx_js = store
+        .import_bytes(b"module.exports = 'pkg';\n", false)
+        .unwrap();
+    let pkg_json = store
+        .import_bytes(
+            br#"{"name":"pkg","version":"1.2.3","bin":{"pkg":"bin/cli.js"}}"#,
+            false,
+        )
+        .unwrap();
+    let deep = store.import_bytes(b"export const x = 1;\n", false).unwrap();
+    let cli = store
+        .import_bytes(b"#!/usr/bin/env node\nconsole.log('cli');\n", true)
+        .unwrap();
+    let mut index = PackageIndex::default();
+    index.insert("index.js".to_string(), idx_js);
+    index.insert("package.json".to_string(), pkg_json);
+    index.insert("lib/deep/mod.js".to_string(), deep);
+    index.insert("bin/cli.js".to_string(), cli);
+
+    let pkg = LockedPackage {
+        name: "pkg".to_string(),
+        version: "1.2.3".to_string(),
+        integrity: None,
+        dependencies: BTreeMap::new(),
+        dep_path: "pkg@1.2.3".to_string(),
+        ..Default::default()
+    };
+
+    // --- Path A: the real CloneDir materialize via ensure_in_aube_dir.
+    // On the APFS dev box / CI this exercises build_tree + clonefile_dir.
+    let aube_dir = dir.path().join("projectA/node_modules/.aube");
+    std::fs::create_dir_all(&aube_dir).unwrap();
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Reflink, false);
+    let mut stats = LinkStats::default();
+    linker
+        .ensure_in_aube_dir(&aube_dir, "pkg@1.2.3", &pkg, &index, &mut stats, None)
+        .expect("clonedir materialize");
+    let entry_name = linker.aube_dir_entry_name("pkg@1.2.3");
+    let clonedir_pkg = aube_dir.join(&entry_name).join("node_modules").join("pkg");
+
+    // Confirm the tree tier was actually built and the clone path taken
+    // (otherwise this test would silently degrade to comparing per-file
+    // against per-file and prove nothing).
+    let tree = store.tree_path(&linker.virtual_store_subdir("pkg@1.2.3"));
+    assert!(
+        tree.exists(),
+        "tree tier must have been built (clonedir path not exercised?)"
+    );
+
+    // --- Path B: per-file baseline. Reflink each file straight into a
+    // fresh dir exactly as the per-file loop does, then chmod +x.
+    let baseline = dir.path().join("baseline/node_modules/pkg");
+    for rel in ["index.js", "package.json", "lib/deep/mod.js", "bin/cli.js"] {
+        let stored = &index[rel];
+        let target = baseline.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        linker.link_file_fresh(stored, rel, &target).unwrap();
+        if stored.executable {
+            xx::file::make_executable(&target).unwrap();
+        }
+    }
+
+    // The two materializations must be byte-identical.
+    assert!(
+        diff_trees(&baseline, &clonedir_pkg).is_none(),
+        "clonedir vs per-file diverged: {:?}",
+        diff_trees(&baseline, &clonedir_pkg)
+    );
+    // And the bin must be executable in the cloned result specifically.
+    assert_eq!(
+        std::fs::metadata(clonedir_pkg.join("bin/cli.js"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111,
+        "cloned bin must carry +x"
+    );
+    // Stats parity: the clone counts every index entry as linked.
+    assert_eq!(stats.files_linked, index.len());
+}

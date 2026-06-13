@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 mod builder;
+mod clonedir;
 mod error;
 mod hoisted;
 mod link;
