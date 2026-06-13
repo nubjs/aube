@@ -34,6 +34,7 @@ static ROOT_TOOL: Embedder = Embedder {
     self_engines_check: true,
     self_update_enabled: true,
     warm_store_verify: true,
+    no_churn_lockfile_write: false,
 };
 
 fn read_manifest(dir: &std::path::Path) -> serde_json::Value {

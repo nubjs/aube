@@ -127,6 +127,26 @@ pub struct Embedder {
     /// embedder posture (it doesn't vary per project), so it lives here rather
     /// than on the runtime engine context.
     pub warm_store_verify: bool,
+    /// When `false` (aube's default), the lockfile writer always writes —
+    /// matching upstream aube and pnpm, which rewrite the lockfile whenever
+    /// the resolution/write path is reached, even to byte-identical content.
+    /// When `true`, the writer first compares the resolved graph's identity
+    /// hash against the graph the existing on-disk lockfile encodes and
+    /// *skips the write* when they are equal, so an install that didn't
+    /// change the resolved graph leaves the lockfile's bytes/mtime untouched.
+    ///
+    /// This is a behavior an embedder opts into, NOT upstream pnpm behavior:
+    /// pnpm achieves an untouched-on-no-op lockfile via an up-front
+    /// skip-resolution short-circuit (`allProjectsAreUpToDate` + a deep-equal
+    /// of the parsed current/wanted lockfiles) and, once it does resolve,
+    /// writes unconditionally — it has no post-resolution "resolved graph ==
+    /// on-disk, so skip the write" guard. An embedder that interoperates with
+    /// another package manager on the same lockfile (e.g. nub round-tripping
+    /// a `pnpm-lock.yaml`) sets this `true` to break the rewrite flip-flop
+    /// where each tool rewrites a graph-equal lockfile back into its own
+    /// serialization forever. Embedder-fixed: it's the host's call, not the
+    /// user's, and it doesn't vary per project.
+    pub no_churn_lockfile_write: bool,
 }
 
 /// Standalone aube's embedder profile. Reproduces every hardcoded branding
@@ -151,6 +171,7 @@ pub const AUBE: Embedder = Embedder {
     self_engines_check: true,
     self_update_enabled: true,
     warm_store_verify: true,
+    no_churn_lockfile_write: false,
 };
 
 static ACTIVE: OnceLock<&'static Embedder> = OnceLock::new();
@@ -240,5 +261,6 @@ mod tests {
         assert!(id.self_engines_check);
         assert!(id.self_update_enabled);
         assert!(id.warm_store_verify);
+        assert!(!id.no_churn_lockfile_write);
     }
 }

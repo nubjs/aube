@@ -26,7 +26,7 @@
 //! gives us alphabetized keys for free. BLAKE3 is the project default
 //! for non-crypto-verifying hashes (3-5x faster than SHA-256).
 
-use crate::{LockedPackage, LockfileGraph};
+use crate::{LockedPackage, LockfileGraph, dep_type_label};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -197,6 +197,94 @@ pub fn compute_graph_hashes_with_patches(
     }
 
     GraphHashes { node_hash }
+}
+
+/// A single 32-byte digest identifying the WHOLE resolved graph —
+/// every package's recursive dep-graph hash plus every importer's
+/// direct-dependency edges. Two graphs that resolve to the same set of
+/// `(dep_path → identity)` package nodes AND the same importer edges
+/// produce the same digest; any change to a package's identity, its
+/// dependency wiring, the package set, or an importer's direct deps
+/// flips it.
+///
+/// This is the equality primitive a no-churn write guard compares:
+/// hash the freshly-resolved graph, hash the graph the on-disk lockfile
+/// parses to, and skip the write when the two digests match. It is
+/// deliberately engine-AGNOSTIC (`engine: None`) — the virtual-store
+/// engine taint is a per-host materialization concern, not part of the
+/// lockfile's recorded identity, so two hosts on different Node majors
+/// must still see an unchanged lockfile as unchanged.
+///
+/// Order-independent by construction: package hashes are folded through
+/// the sorted `node_hash` `BTreeMap`, and importer edges are serialized
+/// from `BTreeMap`/sorted `Vec`s, so re-parsing a lockfile whose entries
+/// landed in a different on-disk order yields the same digest.
+pub fn graph_identity_hash(graph: &LockfileGraph, allow_build: AllowBuildFn<'_>) -> [u8; 32] {
+    graph_identity_hash_with_patches(graph, allow_build, &|_, _| None)
+}
+
+/// [`graph_identity_hash`] variant that folds per-package patch
+/// fingerprints into each node's identity, so a re-patched package
+/// counts as a graph change (matching the delta path's treatment).
+pub fn graph_identity_hash_with_patches(
+    graph: &LockfileGraph,
+    allow_build: AllowBuildFn<'_>,
+    patch_hash: PatchHashFn<'_>,
+) -> [u8; 32] {
+    // Engine-agnostic: the recorded lockfile identity must not depend
+    // on the host's os/arch/node-major.
+    let hashes = compute_graph_hashes_with_patches(graph, allow_build, None, patch_hash);
+
+    // Canonical, order-independent serialization of the parts that
+    // define the graph: every package's identity hash, plus every
+    // importer's sorted direct-dependency edges.
+    #[derive(Serialize)]
+    struct ImporterEdge<'a> {
+        name: &'a str,
+        dep_path: &'a str,
+        dep_type: &'a str,
+        specifier: Option<&'a str>,
+    }
+    #[derive(Serialize)]
+    struct GraphIdentityInput<'a> {
+        nodes: &'a BTreeMap<String, String>,
+        importers: BTreeMap<&'a str, Vec<ImporterEdge<'a>>>,
+    }
+
+    let importers: BTreeMap<&str, Vec<ImporterEdge<'_>>> = graph
+        .importers
+        .iter()
+        .map(|(path, deps)| {
+            let mut edges: Vec<ImporterEdge<'_>> = deps
+                .iter()
+                .map(|d| ImporterEdge {
+                    name: &d.name,
+                    dep_path: &d.dep_path,
+                    dep_type: dep_type_label(d.dep_type),
+                    specifier: d.specifier.as_deref(),
+                })
+                .collect();
+            // Direct deps are written in a stable order, but re-parsing
+            // a foreign lockfile (e.g. pnpm's) could yield a different
+            // edge order; sort so the digest is order-independent.
+            edges.sort_by(|a, b| {
+                (a.name, a.dep_path, a.dep_type, a.specifier).cmp(&(
+                    b.name,
+                    b.dep_path,
+                    b.dep_type,
+                    b.specifier,
+                ))
+            });
+            (path.as_str(), edges)
+        })
+        .collect();
+
+    let input = GraphIdentityInput {
+        nodes: &hashes.node_hash,
+        importers,
+    };
+    let json = serde_json::to_vec(&input).expect("graph identity input must serialize");
+    *blake3::hash(&json).as_bytes()
 }
 
 /// Compute the recursive dep-graph hash for one package. Uses the
@@ -529,5 +617,93 @@ mod tests {
         // Unknown architectures pass through rather than getting
         // silently remapped onto an adjacent bucket.
         assert_eq!(node_arch("riscv64"), "riscv64");
+    }
+
+    // --- graph_identity_hash (no-churn write guard primitive) ---
+
+    use crate::DepType;
+
+    fn graph_with_importer(pkgs: &[LockedPackage], direct: &[(&str, &str)]) -> LockfileGraph {
+        let mut g = empty_graph();
+        for p in pkgs {
+            g.packages.insert(p.dep_path.clone(), p.clone());
+        }
+        let deps: Vec<DirectDep> = direct
+            .iter()
+            .map(|(name, dep_path)| DirectDep {
+                name: (*name).to_string(),
+                dep_path: (*dep_path).to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("^1".to_string()),
+            })
+            .collect();
+        g.importers.insert(".".into(), deps);
+        g
+    }
+
+    #[test]
+    fn graph_identity_hash_equal_for_identical_graphs() {
+        let g1 = graph_with_importer(&[mk_pkg("foo", "1.0.0", Some("sha512-A"))], &[("foo", "foo@1.0.0")]);
+        let g2 = graph_with_importer(&[mk_pkg("foo", "1.0.0", Some("sha512-A"))], &[("foo", "foo@1.0.0")]);
+        assert_eq!(
+            graph_identity_hash(&g1, &|_| false),
+            graph_identity_hash(&g2, &|_| false)
+        );
+    }
+
+    #[test]
+    fn graph_identity_hash_differs_when_a_package_changes() {
+        let g1 = graph_with_importer(&[mk_pkg("foo", "1.0.0", Some("sha512-A"))], &[("foo", "foo@1.0.0")]);
+        let g2 = graph_with_importer(&[mk_pkg("foo", "1.0.0", Some("sha512-B"))], &[("foo", "foo@1.0.0")]);
+        assert_ne!(
+            graph_identity_hash(&g1, &|_| false),
+            graph_identity_hash(&g2, &|_| false)
+        );
+    }
+
+    #[test]
+    fn graph_identity_hash_differs_when_importer_direct_dep_changes() {
+        // Same package set, different importer edge (a dep was added) —
+        // the lockfile genuinely changed, so the digest must move.
+        let pkgs = [mk_pkg("foo", "1.0.0", Some("sha512-A"))];
+        let g1 = graph_with_importer(&pkgs, &[]);
+        let g2 = graph_with_importer(&pkgs, &[("foo", "foo@1.0.0")]);
+        assert_ne!(
+            graph_identity_hash(&g1, &|_| false),
+            graph_identity_hash(&g2, &|_| false)
+        );
+    }
+
+    #[test]
+    fn graph_identity_hash_is_engine_agnostic() {
+        // A package allowed to build would taint per-host engine in the
+        // per-node hash, but the identity hash forces `engine: None`, so
+        // the digest is the same regardless of the build policy passed.
+        let g = graph_with_importer(
+            &[mk_pkg("native", "1.0.0", Some("sha512-N"))],
+            &[("native", "native@1.0.0")],
+        );
+        let allow_all = |_: &LockedPackage| true;
+        let allow_none = |_: &LockedPackage| false;
+        assert_eq!(
+            graph_identity_hash(&g, &allow_all),
+            graph_identity_hash(&g, &allow_none)
+        );
+    }
+
+    #[test]
+    fn graph_identity_hash_stable_under_importer_edge_reorder() {
+        // Re-parsing a foreign lockfile can yield direct deps in a
+        // different order; the digest must not depend on edge order.
+        let pkgs = [
+            mk_pkg("a", "1.0.0", Some("sha512-A")),
+            mk_pkg("b", "1.0.0", Some("sha512-B")),
+        ];
+        let g1 = graph_with_importer(&pkgs, &[("a", "a@1.0.0"), ("b", "b@1.0.0")]);
+        let g2 = graph_with_importer(&pkgs, &[("b", "b@1.0.0"), ("a", "a@1.0.0")]);
+        assert_eq!(
+            graph_identity_hash(&g1, &|_| false),
+            graph_identity_hash(&g2, &|_| false)
+        );
     }
 }

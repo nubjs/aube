@@ -3805,6 +3805,79 @@ fn peer_suffix_propagates_through_non_peer_intermediary() {
     );
 }
 
+// pnpm-parity regression: a package that DECLARES its own peer must
+// STILL absorb a *descendant* peer it does not declare. pnpm's
+// `resolvePeersOfNode` unions children's resolved peers
+// (`unknownResolvedPeersOfChildren`) with the package's own resolved
+// peers (`allResolvedPeers`) — there is no "has own peers ⇒ stop
+// propagating" branch. The previous aube code early-returned on
+// `has_own_peers`, dropping the descendant peer and producing a
+// snapshot key that diverged from pnpm's (→ `node_modules/.pnpm` path
+// mismatch → lockfile churn). This guards that the descendant peer
+// bubbles into a peer-declarer's key alongside its own.
+#[test]
+fn peer_suffix_propagation_unions_descendant_peer_onto_peer_declarer() {
+    // mid declares its OWN peer (own-peer) and depends on leaf.
+    // leaf declares a DIFFERENT peer (desc-peer) that mid does not
+    // declare. After resolution mid's key must carry BOTH suffixes.
+    let mut mid = mk_locked(
+        "mid",
+        "1.0.0",
+        &[("own-peer", "1.0.0"), ("leaf", "1.0.0")],
+        &[("own-peer", "^1")],
+    );
+    mid.dep_path = "mid@1.0.0".to_string();
+    let leaf = mk_locked("leaf", "1.0.0", &[("desc-peer", "1.0.0")], &[("desc-peer", "^1")]);
+    let own_peer = mk_locked("own-peer", "1.0.0", &[], &[]);
+    let desc_peer = mk_locked("desc-peer", "1.0.0", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    packages.insert("mid@1.0.0".to_string(), mid);
+    packages.insert("leaf@1.0.0".to_string(), leaf);
+    packages.insert("own-peer@1.0.0".to_string(), own_peer);
+    packages.insert("desc-peer@1.0.0".to_string(), desc_peer);
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "mid".to_string(),
+            dep_path: "mid@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^1".to_string()),
+        }],
+    );
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default())
+        .expect("test graph should converge");
+
+    // mid's key is the UNION of its own resolved peer and the
+    // descendant peer bubbled up from leaf — sorted by peer name
+    // (`desc-peer` < `own-peer`).
+    let mid_key = "mid@1.0.0(desc-peer@1.0.0)(own-peer@1.0.0)";
+    assert!(
+        out.packages.contains_key(mid_key),
+        "peer-declarer must union the descendant peer (desc-peer) with its own (own-peer); got {:?}",
+        out.packages.keys().collect::<Vec<_>>()
+    );
+    // The importer row tracks the unioned key.
+    assert_eq!(
+        &out.importers["."][0].dep_path, mid_key,
+        "importer DirectDep.dep_path tracks the unioned mid key"
+    );
+    // leaf keeps its own self-peer suffix.
+    assert!(
+        out.packages.contains_key("leaf@1.0.0(desc-peer@1.0.0)"),
+        "leaf keeps its self-peer suffix; got {:?}",
+        out.packages.keys().collect::<Vec<_>>()
+    );
+}
+
 // Mutual peer cycle (a -> peer b, b -> peer a). The propagation post-
 // pass must NOT lift `(a@…)` onto a's own dep_path — a node listing
 // itself as a peer is not valid pnpm shape. The cycle break suppresses

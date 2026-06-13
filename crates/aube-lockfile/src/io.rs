@@ -127,6 +127,28 @@ pub fn write_lockfile_as(
         other => other.filename().to_string(),
     };
     let path = project_dir.join(&filename);
+
+    // No-churn write guard (embedder opt-in; default upstream = always
+    // write). When the embedder enables it, skip the write if the graph
+    // we'd serialize is identical (by engine-agnostic graph-identity
+    // hash) to the graph the file already on disk parses to. This breaks
+    // the rewrite flip-flop where aube and a co-resident package manager
+    // (e.g. pnpm) take turns re-serializing a graph-equal lockfile into
+    // their own form forever. Upstream aube and pnpm don't compare here
+    // — they write unconditionally once the write path is reached — so
+    // the comparison runs ONLY behind the embedder toggle, and any
+    // failure to read/parse the existing file falls through to a normal
+    // write (the feature is additive, never load-bearing).
+    if aube_util::embedder().no_churn_lockfile_write
+        && lockfile_write_is_noop(&path, kind, graph, manifest)
+    {
+        tracing::debug!(
+            "no-churn: resolved graph matches existing {}; skipping rewrite",
+            filename
+        );
+        return Ok(path);
+    }
+
     match kind {
         LockfileKind::Aube | LockfileKind::Pnpm => pnpm::write(&path, graph, manifest)?,
         LockfileKind::Npm | LockfileKind::NpmShrinkwrap => npm::write(&path, graph, manifest)?,
@@ -135,6 +157,36 @@ pub fn write_lockfile_as(
         LockfileKind::Bun => bun::write(&path, graph, manifest)?,
     }
     Ok(path)
+}
+
+/// True when `path` already holds a lockfile (of the same `kind`) whose
+/// resolved graph is identical to `graph` — i.e. rewriting it would be a
+/// no-op at the graph level. Used by the embedder no-churn guard above.
+///
+/// Parse-or-compare failures return `false` (fall through to a normal
+/// write): a missing/corrupt/unreadable existing file is exactly the
+/// case that *should* be (re)written, and the guard must never suppress
+/// a write it isn't certain is redundant. The identity hash is
+/// engine-agnostic (see [`graph_hash::graph_identity_hash`]) so a host
+/// on a different Node major still recognizes an unchanged lockfile.
+fn lockfile_write_is_noop(
+    path: &Path,
+    kind: LockfileKind,
+    graph: &LockfileGraph,
+    manifest: &aube_manifest::PackageJson,
+) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(existing) = parse_one(path, kind, manifest) else {
+        return false;
+    };
+    // `allow_build` doesn't affect the engine-agnostic identity hash
+    // (the engine taint it would gate is computed with `engine: None`),
+    // so a trivial policy is correct here.
+    let no_build = |_: &LockedPackage| false;
+    crate::graph_hash::graph_identity_hash(graph, &no_build)
+        == crate::graph_hash::graph_identity_hash(&existing, &no_build)
 }
 
 /// Return the [`LockfileKind`] of the lockfile already on disk in

@@ -977,30 +977,38 @@ fn peer_names_in_segments_recursive(segments: &[&str]) -> BTreeSet<String> {
 
 /// Walk the resolved graph from each node and accumulate the union of
 /// peer-suffix segments contributed by self + every reachable
-/// descendant (gated on the package having no declared peers of its
-/// own), then rewrite each node's dep_path to embed that union.
+/// descendant — for *every* node, regardless of whether it declares
+/// its own peers — then rewrite each node's dep_path to embed that
+/// union.
 ///
-/// Why: pnpm's lockfile shape tags non-peer-declaring intermediaries
-/// with the same `(peer@version)` suffix their peer-declaring
-/// descendants produced — so a parent that pulls in a peer-bearing
-/// child carries the resolved peer set on its own dep_path. aube's
+/// Why: pnpm's lockfile shape tags intermediaries with the same
+/// `(peer@version)` suffix their peer-bearing descendants produced —
+/// so a parent that pulls in a peer-bearing child carries the
+/// resolved peer set on its own dep_path. aube's
 /// `apply_peer_contexts_once` only emits the suffix on the package
 /// that *declares* the peer; without this post-pass an importer row
 /// for `parent → leaf(peer)` would render `parent: 1.0.0` (no
 /// suffix) where pnpm renders `parent: 1.0.0(peer@v)`.
 ///
-/// pnpm-parity gate (inferred from observed lockfile shape): **a
-/// package gets descendant-peer propagation only if its own
-/// `peerDependencies` map is empty.** Packages that declare their
-/// own peers have an authoritative self-suffix encoding exactly the
-/// peers they care about; descendant peers don't bubble through
-/// because the descendant peers belong to a NESTED child, which the
-/// snapshot already encodes via the nested-tail form (see
-/// `apply_peer_contexts_once`'s nested-suffix handling). Two
-/// observable shapes this gate lines up with:
+/// pnpm-parity: **a package's key suffix is the UNION of its own
+/// resolved peers and every descendant peer that bubbles up** —
+/// declaring your own `peerDependencies` does *not* suppress
+/// descendant-peer propagation. This matches pnpm's
+/// `resolvePeersOfNode`
+/// (`installing/deps-resolver/src/resolvePeers.ts`): children's
+/// resolved peers (`unknownResolvedPeersOfChildren`) are accumulated
+/// unconditionally and the package's own declared peers are merged on
+/// top (`allResolvedPeers`); there is no branch that stops descendant
+/// propagation when the package declares peers. The previous code
+/// early-returned on `has_own_peers`, dropping descendant peers from
+/// a peer-declarer's key — that diverged from pnpm and churned the
+/// lockfile (different `node_modules/.pnpm` paths). Two observable
+/// shapes the corrected behavior lines up with:
 ///   - `@testing-library/react@14.0.0(react@18.2.0)(react-dom@18.2.0(react@18.2.0))`
-///     — declares peers, gets self-suffix only; `@types/react` from a
-///     descendant doesn't bubble up.
+///     — declares peers; its descendant peers union into the suffix
+///     too (here `react`/`react-dom` are exactly the declared set, so
+///     the union adds nothing visible, but a descendant peer the
+///     package does *not* declare would still bubble up).
 ///   - `abc-parent-with-missing-peers@1.0.0(peer-a@…)(peer-b@…)(peer-c@…)`
 ///     — no declared peers, picks up descendant peers from `abc`.
 ///
@@ -1008,9 +1016,8 @@ fn peer_names_in_segments_recursive(segments: &[&str]) -> BTreeSet<String> {
 ///  1. Build a forward dep map: `pkg_key → [child_key]` from each
 ///     LockedPackage's `dependencies`.
 ///  2. Memoized DFS. For each node, compute
-///     `cumulative_segments = outer_paren_segments(node.key)`. If the
-///     node has no declared peers, also union in
-///     `⋃ cumulative(child)` (gated by the rule above).
+///     `cumulative_segments = outer_paren_segments(node.key)`, then
+///     union in `⋃ cumulative(child)` for every node.
 ///  3. Cycles short-circuit via a `visiting` guard — cycle members
 ///     can't add new peers from each other beyond what reaches them
 ///     through non-cycle paths, so returning the empty set on
@@ -1031,10 +1038,6 @@ fn propagate_peer_suffixes_to_ancestors(
     // (e.g. an unresolved peer that `detect_unmet_peers` will warn
     // about) are dropped — they can't contribute cumulative peers.
     let mut forward: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // Per-package "has declared peers" lookup. Packages that declare
-    // their own peers don't accept descendant-peer propagation (see
-    // the rule in the doc comment above).
-    let mut has_own_peers: BTreeMap<String, bool> = BTreeMap::new();
     for (key, pkg) in &graph.packages {
         let children: Vec<String> = pkg
             .dependencies
@@ -1043,7 +1046,6 @@ fn propagate_peer_suffixes_to_ancestors(
             .filter(|k| graph.packages.contains_key(k))
             .collect();
         forward.insert(key.clone(), children);
-        has_own_peers.insert(key.clone(), !pkg.peer_dependencies.is_empty());
     }
 
     // Memoized DFS. `cumulative` stores the by-name segment map per
@@ -1054,7 +1056,6 @@ fn propagate_peer_suffixes_to_ancestors(
     fn collect(
         key: &str,
         forward: &BTreeMap<String, Vec<String>>,
-        has_own_peers: &BTreeMap<String, bool>,
         cumulative: &mut BTreeMap<String, BTreeMap<String, String>>,
         visiting: &mut BTreeSet<String>,
     ) -> BTreeMap<String, String> {
@@ -1084,14 +1085,16 @@ fn propagate_peer_suffixes_to_ancestors(
             }
         }
 
-        // Pnpm-parity gate: only packages with no declared peers absorb
-        // descendant-peer propagation. The cycle-break visiting guard
-        // is still released for symmetry with the non-gated branch.
-        if has_own_peers.get(key).copied().unwrap_or(false) {
-            visiting.remove(key);
-            cumulative.insert(key.to_string(), acc.clone());
-            return acc;
-        }
+        // pnpm-parity: descendant peers union into EVERY node's suffix,
+        // including packages that declare their own peers — pnpm's
+        // `resolvePeersOfNode` accumulates children's resolved peers
+        // unconditionally and merges the package's own declared peers on
+        // top (`allResolvedPeers`), with no "has own peers ⇒ stop
+        // propagating" branch. So there is no early return here; the
+        // child-contribution merge below runs for all nodes. (A package's
+        // *own* declared peers already appear in `acc` as self-segments
+        // — those were emitted by `apply_peer_contexts_once` into the
+        // node key — so the union is self ∪ descendants for every node.)
 
         // Names suppressed when merging child contributions:
         //   1. Every peer name reachable transitively in self segments —
@@ -1119,7 +1122,7 @@ fn propagate_peer_suffixes_to_ancestors(
         // Child contributions.
         if let Some(children) = forward.get(key) {
             for child in children {
-                let child_peers = collect(child, forward, has_own_peers, cumulative, visiting);
+                let child_peers = collect(child, forward, cumulative, visiting);
                 for (name, seg) in child_peers {
                     if suppressed.contains(&name) {
                         continue;
@@ -1138,23 +1141,11 @@ fn propagate_peer_suffixes_to_ancestors(
     // below is deterministic.
     let pkg_keys: Vec<String> = graph.packages.keys().cloned().collect();
     for key in &pkg_keys {
-        collect(
-            key,
-            &forward,
-            &has_own_peers,
-            &mut cumulative,
-            &mut visiting,
-        );
+        collect(key, &forward, &mut cumulative, &mut visiting);
     }
     for deps in graph.importers.values() {
         for dep in deps {
-            collect(
-                &dep.dep_path,
-                &forward,
-                &has_own_peers,
-                &mut cumulative,
-                &mut visiting,
-            );
+            collect(&dep.dep_path, &forward, &mut cumulative, &mut visiting);
         }
     }
 
