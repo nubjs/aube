@@ -318,6 +318,35 @@ impl Linker {
             self.aube_dir_entry_name(dep_path)
         };
         let pkg_nm_dir = base_dir.join(&subdir).join("node_modules").join(&pkg.name);
+        let pkg_nm_parent = base_dir.join(&subdir).join("node_modules");
+
+        // Whole-dir `clonefile(2)` fast path (macOS+APFS, same volume).
+        // When the store's extracted-tree tier holds this package, the
+        // kernel clones the entire package directory in ONE syscall
+        // instead of the per-file reflink loop below — measured ~12x on
+        // the link pass. The clone replaces ONLY the file-fill; the +x
+        // pass is unneeded (clonefile preserves mode bits) and the
+        // patch + transitive-symlink passes run identically afterward.
+        //
+        // Gate is conservative and additive: any miss (tier not built,
+        // non-macOS, non-APFS dst, cross-volume, or the clone itself
+        // erroring) falls through to the unchanged per-file path, so
+        // default behavior is byte-for-byte today's. `tree_key` is the
+        // global-store subdir name regardless of `apply_hashes` — the
+        // tree tier is a shared global resource keyed the same way the
+        // GVS is, so per-project `.aube/` materializations can clone
+        // from the same trees the GVS built.
+        let tree_key = self.virtual_store_subdir(dep_path);
+        let tree_src = self.store.tree_path(&tree_key);
+        let used_clonedir = self.try_clonedir_fill(
+            &pkg_nm_dir,
+            &pkg_nm_parent,
+            &tree_src,
+            dep_path,
+            pkg,
+            index,
+            stats,
+        )?;
 
         // Pre-compute the set of unique parent directories across
         // every file in the index AND every scoped transitive-dep
@@ -332,7 +361,6 @@ impl Linker {
         // out the redundant stats entirely. `BTreeSet` sorts
         // lexicographically, which is good enough because every
         // ancestor of a directory is a prefix of it.
-        let pkg_nm_parent = base_dir.join(&subdir).join("node_modules");
         // Collect into Vec + sort + dedup instead of BTreeSet. For a
         // package with thousands of files (typescript, next), the
         // BTreeSet's per-insert log-N PathBuf comparison (~50-byte
@@ -340,15 +368,27 @@ impl Linker {
         // create_dir_all that the set was deduplicating in the first
         // place.
         let mut parents: Vec<PathBuf> = Vec::with_capacity(index.len() / 4 + 4);
-        parents.push(pkg_nm_dir.clone());
+        // The whole-dir clone already created `pkg_nm_dir` and every
+        // per-file subdir under it, and `clonefile(2)` REQUIRES its
+        // destination not pre-exist — so in the CloneDir case we must
+        // NOT push `pkg_nm_dir` or the per-file parents. We still
+        // validate every index key (the path-traversal guard is not
+        // optional) and still create the scoped-`@scope` parents the
+        // transitive-symlink pass needs (those live under
+        // `pkg_nm_parent`, a sibling of the cloned tree, not inside it).
+        if !used_clonedir {
+            parents.push(pkg_nm_dir.clone());
+        }
         // Validate every key once here. The file-linking loop below
         // walks the same immutable index, so skipping the check
         // there is safe.
         for rel_path in index.keys() {
             validate_index_key(rel_path)?;
-            let target = pkg_nm_dir.join(rel_path);
-            if let Some(parent) = target.parent() {
-                parents.push(parent.to_path_buf());
+            if !used_clonedir {
+                let target = pkg_nm_dir.join(rel_path);
+                if let Some(parent) = target.parent() {
+                    parents.push(parent.to_path_buf());
+                }
             }
         }
         // Scoped transitive deps need `pkg_nm_parent/@scope/` to exist
@@ -373,7 +413,14 @@ impl Linker {
         // `link_file` does defensively. Pass `fresh = true` to suppress
         // the unlink syscall on every file. For a 1.4k-package install
         // that's ~45k wasted `unlink` calls on the hot path.
+        //
+        // Skipped entirely when the whole-dir clone already filled the
+        // package directory — files, subdirs, symlinks, and +x bits all
+        // came across in the single `clonefile(2)`.
         for (rel_path, stored) in index {
+            if used_clonedir {
+                break;
+            }
             // Key already validated in the parent-collection loop
             // above. The index is immutable between the two loops.
             let target = pkg_nm_dir.join(rel_path);
@@ -610,6 +657,219 @@ impl Linker {
             aube_util::diag::event(aube_util::diag::Category::Linker, name, t0.elapsed(), None);
         }
         Ok(())
+    }
+
+    /// Attempt the whole-dir `clonefile(2)` fill of `pkg_nm_dir` from
+    /// the store's extracted-tree tier. Returns `Ok(true)` when the
+    /// clone happened (caller skips the per-file loop) and `Ok(false)`
+    /// when any gate condition failed (caller runs the unchanged
+    /// per-file path). Never returns a hard error for a *clone* failure
+    /// — those degrade to the per-file path — only for the bookkeeping
+    /// that would also fail the per-file path.
+    ///
+    /// Steps, all gated so a miss is byte-for-byte today's behavior:
+    /// 1. macOS+APFS+same-volume probe (`clonedir::can_clonedir`),
+    ///    against `pkg_nm_parent` (the dir the clone lands inside).
+    /// 2. Ensure the tree source exists (lazily build it once from the
+    ///    CAS, reflinking each file — the per-package amortized cost).
+    /// 3. One `clonefile(2)` of the whole tree into `pkg_nm_dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn try_clonedir_fill(
+        &self,
+        pkg_nm_dir: &Path,
+        pkg_nm_parent: &Path,
+        tree_src: &Path,
+        dep_path: &str,
+        pkg: &LockedPackage,
+        index: &PackageIndex,
+        stats: &mut LinkStats,
+    ) -> Result<bool, Error> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            // No recursive-dir clone primitive off macOS — keep the
+            // per-file path. Suppress unused-variable warnings.
+            let _ = (
+                pkg_nm_dir,
+                pkg_nm_parent,
+                tree_src,
+                dep_path,
+                pkg,
+                index,
+                stats,
+            );
+            Ok(false)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Kill-switch for the whole-dir clone fast path. Set
+            // `AUBE_DISABLE_CLONEDIR=1` to force the per-file path on
+            // macOS — used to A/B the mechanism and as a regression
+            // escape hatch. Read once per process.
+            {
+                static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *DISABLED.get_or_init(|| std::env::var_os("AUBE_DISABLE_CLONEDIR").is_some()) {
+                    return Ok(false);
+                }
+            }
+            // Empty packages (no files) gain nothing and the tree-build
+            // would create an empty source dir; let the (no-op) per-file
+            // path handle them.
+            if index.is_empty() {
+                return Ok(false);
+            }
+            // `pkg_nm_parent` is created by the caller's parent batch
+            // AFTER this returns, so it may not exist yet — create it
+            // now so the same-volume probe has a real dir to stat and
+            // the clone has somewhere to land. `create_dir_all` is
+            // idempotent with the later batch.
+            std::fs::create_dir_all(pkg_nm_parent)
+                .map_err(|e| Error::Io(pkg_nm_parent.to_path_buf(), e))?;
+
+            // Volume/fs probe against `trees/` (created lazily if this
+            // is the first clonedir attempt of the install) vs the
+            // destination parent. A `false` here keeps the per-file
+            // path: non-APFS dst, cross-volume, or `trees/` uncreatable.
+            if !self.ensure_trees_dir_then_probe(pkg_nm_parent) {
+                return Ok(false);
+            }
+
+            // Ensure the clone source exists. Build it once if missing.
+            if !tree_src.exists() && self.build_tree(tree_src, dep_path, pkg, index).is_err() {
+                // Tree build failed (e.g. a CAS shard went missing) —
+                // fall back to the per-file path, which surfaces the
+                // same error with full attribution + index invalidation.
+                return Ok(false);
+            }
+
+            // The destination must not pre-exist for clonefile. The
+            // caller guarantees `pkg_nm_dir` is in a fresh staging tree,
+            // so it does not — but guard anyway: a stray dir would make
+            // the clone EEXIST, and silently falling back is safer than
+            // erroring.
+            if pkg_nm_dir.exists() {
+                return Ok(false);
+            }
+
+            match crate::clonedir::clonefile_dir(tree_src, pkg_nm_dir) {
+                Ok(()) => {
+                    // Keep stats identical to the per-file path: every
+                    // index entry is "linked", just in one syscall.
+                    stats.files_linked += index.len();
+                    if let Some(t0) = aube_util::diag::enabled().then(std::time::Instant::now) {
+                        aube_util::diag::event(
+                            aube_util::diag::Category::Linker,
+                            "link_clonedir",
+                            t0.elapsed(),
+                            None,
+                        );
+                    }
+                    trace!("clonedir-materialized {dep_path} ({} files)", index.len());
+                    Ok(true)
+                }
+                Err(e) => {
+                    // A failed clone can leave a partial dst. Remove it
+                    // so the per-file fallback writes into a clean dir.
+                    let _ = std::fs::remove_dir_all(pkg_nm_dir);
+                    trace!("clonedir failed for {dep_path}, falling back to per-file: {e}");
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// Lazily create the `trees/` root then re-run the volume probe.
+    /// `trees/` may not exist on the very first clonedir attempt of an
+    /// install; `can_clonedir` needs it to stat the source volume. We
+    /// create it, then probe `trees/` against `pkg_nm_parent`. Returns
+    /// the probe result. macOS-only caller.
+    #[cfg(target_os = "macos")]
+    fn ensure_trees_dir_then_probe(&self, pkg_nm_parent: &Path) -> bool {
+        let trees_dir = self.store.trees_dir();
+        if std::fs::create_dir_all(&trees_dir).is_err() {
+            return false;
+        }
+        crate::clonedir::can_clonedir(trees_dir.as_path(), pkg_nm_parent)
+    }
+
+    /// Build the extracted-tree clone source for a package at
+    /// `tree_src`, reflinking each CAS file into it exactly as the
+    /// per-file materialize loop would. Written into a PID-stamped temp
+    /// dir then atomically renamed into place so concurrent installers
+    /// either see the complete tree or none of it. A lost rename race
+    /// (another process built it first) is success — its tree is
+    /// byte-identical (same CAS content) and we discard ours.
+    ///
+    /// The tree root IS the package root: files land at their index
+    /// `rel_path` directly under `tree_src`, +x bits applied, matching
+    /// what a `clonefile(2)` of it into `<entry>/node_modules/<name>/`
+    /// must reproduce. Transitive-dep symlinks are deliberately NOT
+    /// written here — those are per-materialization (they point at
+    /// sibling entries whose paths differ per project/GVS), so the
+    /// clone fills only the package's own files and the symlink pass
+    /// runs after every clone. macOS-only caller.
+    #[cfg(target_os = "macos")]
+    fn build_tree(
+        &self,
+        tree_src: &Path,
+        dep_path: &str,
+        pkg: &LockedPackage,
+        index: &PackageIndex,
+    ) -> Result<(), Error> {
+        let trees_dir = self.store.trees_dir();
+        std::fs::create_dir_all(&trees_dir).map_err(|e| Error::Io(trees_dir.clone(), e))?;
+
+        let leaf = tree_src
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dep_path.to_string());
+        let tmp = trees_dir.join(format!(".tmp-tree-{}-{leaf}", std::process::id()));
+        // Clear any leftover from a crashed predecessor.
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Reuse the per-file fill. Collect unique parents first (same
+        // single-pass mkdir discipline as `materialize_into`).
+        let mut parents: Vec<PathBuf> = Vec::with_capacity(index.len() / 4 + 4);
+        parents.push(tmp.clone());
+        for rel_path in index.keys() {
+            validate_index_key(rel_path)?;
+            if let Some(parent) = tmp.join(rel_path).parent() {
+                parents.push(parent.to_path_buf());
+            }
+        }
+        parents.sort_unstable();
+        parents.dedup();
+        for parent in &parents {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Io(parent.clone(), e))?;
+        }
+
+        for (rel_path, stored) in index {
+            let target = tmp.join(rel_path);
+            if let Err(e) = self.link_file_fresh(stored, rel_path, &target) {
+                let _ = std::fs::remove_dir_all(&tmp);
+                if let Error::MissingStoreFile { .. } = &e {
+                    invalidate_stale_index_for_package(&self.store, pkg);
+                }
+                return Err(e);
+            }
+            #[cfg(unix)]
+            if stored.executable {
+                xx::file::make_executable(&target).map_err(|e| Error::Xx(e.to_string()))?;
+            }
+        }
+
+        // Atomic publish. A lost race means another writer's
+        // byte-identical tree already landed — keep theirs.
+        match aube_util::fs_atomic::rename_with_retry(&tmp, tree_src) {
+            Ok(()) => Ok(()),
+            Err(_) if tree_src.exists() => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                Err(Error::Io(tree_src.to_path_buf(), e))
+            }
+        }
     }
 }
 

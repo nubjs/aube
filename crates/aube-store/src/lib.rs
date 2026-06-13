@@ -45,6 +45,10 @@ use std::sync::atomic::Ordering;
 
 pub const CACHE_DIR_NAME: &str = "aube-cache";
 pub const INDEX_SUBDIR: &str = "index";
+/// Sibling of `files/` holding per-package extracted trees — the
+/// single-`clonefile(2)` clone sources for the macOS whole-dir linker
+/// fast path. See [`Store::trees_dir`].
+pub const TREES_SUBDIR: &str = "trees";
 pub const VIRTUAL_STORE_SUBDIR: &str = "virtual-store";
 pub const PACKUMENT_CACHE_SUBDIR: &str = "packuments-v1";
 pub const PACKUMENT_FULL_CACHE_SUBDIR: &str = "packuments-full-v1";
@@ -254,6 +258,31 @@ impl Store {
     /// Directory for the global virtual store (materialized packages).
     pub fn virtual_store_dir(&self) -> PathBuf {
         self.cache_dir.join(VIRTUAL_STORE_SUBDIR)
+    }
+
+    /// Root of the per-package *extracted-tree* tier, a sibling of the
+    /// CAS `files/` dir at `<v1_dir>/trees/`. Each entry is a real,
+    /// fully-materialized package directory (every file reflinked from
+    /// the CAS) keyed by the linker's virtual-store subdir name. It
+    /// exists solely as a single-`clonefile(2)` clone *source* for the
+    /// macOS whole-dir materialization fast path: the kernel clones the
+    /// whole tree in one syscall instead of the linker reflinking each
+    /// file individually. Lives next to `files/` so one store
+    /// mount/backup/prune unit covers the CAS, the cached indexes, and
+    /// the trees together. Empty/absent on platforms that never build
+    /// the tier (everything but macOS+APFS), where the linker keeps its
+    /// per-file path unchanged.
+    pub fn trees_dir(&self) -> PathBuf {
+        self.store_v1_dir().join(TREES_SUBDIR)
+    }
+
+    /// On-disk path of the extracted tree for `tree_key` (the linker's
+    /// virtual-store subdir name — already filesystem-safe, with `/`
+    /// flattened to `+`, so it's a single path component). The tree
+    /// root *is* the package root: files sit at the same relative
+    /// layout they'd have under `<entry>/node_modules/<name>/`.
+    pub fn tree_path(&self, tree_key: &str) -> PathBuf {
+        self.trees_dir().join(tree_key)
     }
 
     /// Directory for cached packument metadata (abbreviated/corgi format).
