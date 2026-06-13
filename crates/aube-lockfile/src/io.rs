@@ -185,8 +185,29 @@ fn lockfile_write_is_noop(
     // (the engine taint it would gate is computed with `engine: None`),
     // so a trivial policy is correct here.
     let no_build = |_: &LockedPackage| false;
-    crate::graph_hash::graph_identity_hash(graph, &no_build)
-        == crate::graph_hash::graph_identity_hash(&existing, &no_build)
+    // Fold each graph's OWN patch config into its identity so a newly
+    // patched graph never hashes equal to the unpatched lockfile already
+    // on disk. Without this the guard suppresses the very write that
+    // would record `patchedDependencies` + `(patch_hash=…)`, leaving
+    // real pnpm to reject the frozen install (ERR_PNPM_LOCKFILE_CONFIG_MISMATCH)
+    // and aube itself to frozen-fail its own lock (patch drift). Each
+    // closure reads from its source graph's `patched_dependency_hashes`
+    // (selector `name@version` → sha256 hex), matching how the link /
+    // materialize paths derive their patch fingerprints.
+    let graph_patch = |name: &str, version: &str| -> Option<String> {
+        graph
+            .patched_dependency_hashes
+            .get(&format!("{name}@{version}"))
+            .cloned()
+    };
+    let existing_patch = |name: &str, version: &str| -> Option<String> {
+        existing
+            .patched_dependency_hashes
+            .get(&format!("{name}@{version}"))
+            .cloned()
+    };
+    crate::graph_hash::graph_identity_hash_with_patches(graph, &no_build, &graph_patch)
+        == crate::graph_hash::graph_identity_hash_with_patches(&existing, &no_build, &existing_patch)
 }
 
 /// Return the [`LockfileKind`] of the lockfile already on disk in

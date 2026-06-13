@@ -128,3 +128,72 @@ fn guard_skips_rewrite_when_graph_unchanged_and_writes_when_changed() {
         "a changed graph must rewrite the lockfile"
     );
 }
+
+/// Regression: adding `patchedDependencies` over an otherwise-identical
+/// package set must NOT be treated as a no-op. The guard hashes each
+/// graph's own patch fingerprints into its identity, so a freshly-patched
+/// graph never collapses onto the unpatched lockfile already on disk.
+/// Without this, `patch-commit`'s re-install silently skips the rewrite,
+/// the lockfile never records `patchedDependencies` + `(patch_hash=…)`,
+/// and real pnpm rejects the frozen install with
+/// ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (and aube frozen-fails its own lock).
+#[test]
+fn guard_rewrites_when_only_patch_config_is_added() {
+    aube_util::set_embedder(&NO_CHURN_TOOL);
+    assert!(aube_util::embedder().no_churn_lockfile_write);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("package.json"), r#"{"name":"t"}"#).unwrap();
+    let manifest = PackageJson::default();
+
+    // Unpatched graph hits disk first.
+    let graph = graph_with(vec![pkg("ms", "2.1.3", "sha512-AAA==")]);
+    let path = write_lockfile_as(dir.path(), &graph, &manifest, LockfileKind::Pnpm).unwrap();
+    let first = mtime(&path);
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // Same package set, but now the project declares a patch for it.
+    let mut patched = graph.clone();
+    patched
+        .patched_dependencies
+        .insert("ms@2.1.3".to_string(), "patches/ms@2.1.3.patch".to_string());
+    patched.patched_dependency_hashes.insert(
+        "ms@2.1.3".to_string(),
+        "82ff0b4d1c20272cdb11684045f28947472d5b8a10a04c0d972102d14815e536".to_string(),
+    );
+    write_lockfile_as(dir.path(), &patched, &manifest, LockfileKind::Pnpm).unwrap();
+    assert!(
+        mtime(&path) > first,
+        "adding patchedDependencies must rewrite the lockfile, not be skipped as a no-op"
+    );
+
+    // And the written lockfile actually carries the patch block + suffix —
+    // the records real pnpm reads to apply the patch under --frozen.
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("patchedDependencies:"),
+        "rewritten lockfile must record the patchedDependencies block:\n{written}"
+    );
+    assert!(
+        written.contains("(patch_hash=82ff0b4d1c20272cdb11684045f28947472d5b8a10a04c0d972102d14815e536)"),
+        "rewritten lockfile must stamp the (patch_hash=…) suffix:\n{written}"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let after_patch = mtime(&path);
+
+    // Re-writing the now-on-disk patched lockfile back (parse → write of
+    // the same file's graph) is a no-op: the existing file already carries
+    // the matching patch hash, so the two identities agree and the guard
+    // suppresses the rewrite. (Parsing first is what the install pipeline
+    // does — a hand-built graph isn't byte-faithful to a parsed one.)
+    let reparsed =
+        aube_lockfile::parse_lockfile_with_kind(dir.path(), &manifest).unwrap().0;
+    write_lockfile_as(dir.path(), &reparsed, &manifest, LockfileKind::Pnpm).unwrap();
+    assert_eq!(
+        mtime(&path),
+        after_patch,
+        "an unchanged patched lockfile must stay a no-op (zero churn)"
+    );
+}

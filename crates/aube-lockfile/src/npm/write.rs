@@ -15,34 +15,35 @@ struct WriteNpmLockfile<'a> {
     packages: BTreeMap<String, WriteNpmPackage<'a>>,
 }
 
-// Field order mirrors npm's own package-lock.json output, so a
-// parse → write round-trip diffs cleanly against what `npm install`
-// would produce: `name`, `version`, `resolved`, `integrity`,
-// `license`, then the dep sections, then `bin`, `engines`, platform
-// fields, `funding`, then the dev/optional flags. Don't reorder — the JSON is
-// serialized as a `BTreeMap`-like structure but serde preserves
-// struct field order for us, which is what npm readers (and git
-// diffs) expect.
-#[derive(Debug, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
+// The fields a `packages` entry can carry. The *declaration* order here
+// is irrelevant: npm does NOT serialize these in any fixed sequence —
+// its writer (`@npmcli/arborist` → `json-stringify-nice`) emits every
+// object's keys with one comparator (`compare` in
+// `json-stringify-nice/index.js`, with the `swKeyOrder` preferred list):
+//
+//   1. all NON-object keys, then all OBJECT (`{…}`) keys — JSON arrays
+//      count as non-objects, so `os`/`cpu`/`libc` sort with the scalars;
+//   2. within each of those two groups, the `swKeyOrder` preferred keys
+//      (`name`, `version`, `resolved`, `integrity`, … `dependencies`)
+//      come first in list order, and every remaining key falls back to
+//      `localeCompare('en')` — i.e. plain alphabetical.
+//
+// A struct's serde field order can't express that two-pass type-then-
+// alpha rule, so `Serialize` is hand-written below in npm's exact order
+// instead of derived. Reproducing it (not a hand-curated sequence) is
+// what keeps a write → `npm install` rewrite byte-identical: e.g. npm
+// emits `…, cpu, license, optional, os, engines` for a platform-gated
+// optional dep, with `engines` LAST because it's the only object key.
+#[derive(Debug, Default)]
 struct WriteNpmPackage<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     resolved: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     integrity: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     license: Option<&'a str>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     dependencies: BTreeMap<&'a str, &'a str>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     dev_dependencies: BTreeMap<&'a str, &'a str>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     optional_dependencies: BTreeMap<&'a str, &'a str>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     peer_dependencies: BTreeMap<&'a str, &'a str>,
     /// Paired with `peer_dependencies` above. Required for round-trip
     /// parity: the `optional: true` bit gates
@@ -50,25 +51,15 @@ struct WriteNpmPackage<'a> {
     /// it on write-back would silently re-flag every optional peer as
     /// required on the next install. Only the `optional` key is
     /// meaningful; other fields npm may add elsewhere aren't modeled.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     peer_dependencies_meta: BTreeMap<&'a str, WriteNpmPeerDepMeta>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     bin: BTreeMap<&'a str, &'a str>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     engines: BTreeMap<&'a str, &'a str>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     os: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     cpu: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     libc: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     funding: Option<WriteNpmFunding<'a>>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     link: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     dev: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     optional: bool,
     /// npm v3 collapses the "reachable via dev *and* via optional,
     /// but never via production" case into a single `devOptional`
@@ -76,8 +67,94 @@ struct WriteNpmPackage<'a> {
     /// would trip `npm install --omit=dev` into dropping a package
     /// that should have stayed because it's still reachable via
     /// the optional chain (or vice versa with `--omit=optional`).
-    #[serde(rename = "devOptional", skip_serializing_if = "std::ops::Not::not")]
     dev_optional: bool,
+}
+
+impl Serialize for WriteNpmPackage<'_> {
+    // Emit keys in npm's order: NON-object keys first (preferred list,
+    // then alphabetical), then OBJECT keys (preferred list, then
+    // alphabetical). The two `match`-free sequences below are that
+    // order spelled out for this struct's exact field set; each arm
+    // applies the same emptiness skip the derived `skip_serializing_if`
+    // used to. Keep the comments naming the bucket so the order stays
+    // auditable against `json-stringify-nice`.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+
+        // --- non-object keys ---
+        // preferred (swKeyOrder): name, version, resolved, integrity
+        if let Some(v) = self.name {
+            map.serialize_entry("name", v)?;
+        }
+        if let Some(v) = self.version {
+            map.serialize_entry("version", v)?;
+        }
+        if let Some(v) = &self.resolved {
+            map.serialize_entry("resolved", v)?;
+        }
+        if let Some(v) = self.integrity {
+            map.serialize_entry("integrity", v)?;
+        }
+        // remaining non-object keys, alphabetical:
+        // cpu, dev, devOptional, libc, license, link, optional, os
+        if !self.cpu.is_empty() {
+            map.serialize_entry("cpu", &self.cpu)?;
+        }
+        if self.dev {
+            map.serialize_entry("dev", &true)?;
+        }
+        if self.dev_optional {
+            map.serialize_entry("devOptional", &true)?;
+        }
+        if !self.libc.is_empty() {
+            map.serialize_entry("libc", &self.libc)?;
+        }
+        if let Some(v) = self.license {
+            map.serialize_entry("license", v)?;
+        }
+        if self.link {
+            map.serialize_entry("link", &true)?;
+        }
+        if self.optional {
+            map.serialize_entry("optional", &true)?;
+        }
+        if !self.os.is_empty() {
+            map.serialize_entry("os", &self.os)?;
+        }
+
+        // --- object keys ---
+        // preferred (swKeyOrder): dependencies
+        if !self.dependencies.is_empty() {
+            map.serialize_entry("dependencies", &self.dependencies)?;
+        }
+        // remaining object keys, alphabetical: bin, devDependencies,
+        // engines, funding, optionalDependencies, peerDependencies,
+        // peerDependenciesMeta
+        if !self.bin.is_empty() {
+            map.serialize_entry("bin", &self.bin)?;
+        }
+        if !self.dev_dependencies.is_empty() {
+            map.serialize_entry("devDependencies", &self.dev_dependencies)?;
+        }
+        if !self.engines.is_empty() {
+            map.serialize_entry("engines", &self.engines)?;
+        }
+        if let Some(v) = &self.funding {
+            map.serialize_entry("funding", v)?;
+        }
+        if !self.optional_dependencies.is_empty() {
+            map.serialize_entry("optionalDependencies", &self.optional_dependencies)?;
+        }
+        if !self.peer_dependencies.is_empty() {
+            map.serialize_entry("peerDependencies", &self.peer_dependencies)?;
+        }
+        if !self.peer_dependencies_meta.is_empty() {
+            map.serialize_entry("peerDependenciesMeta", &self.peer_dependencies_meta)?;
+        }
+
+        map.end()
+    }
 }
 
 /// npm emits `funding: {"url": "…"}` verbatim, one key, on every
