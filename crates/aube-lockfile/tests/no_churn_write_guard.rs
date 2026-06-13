@@ -39,6 +39,7 @@ static NO_CHURN_TOOL: Embedder = Embedder {
     self_update_enabled: true,
     warm_store_verify: true,
     no_churn_lockfile_write: true,
+    read_branded_settings_env: true,
 };
 
 fn pkg(name: &str, version: &str, integrity: &str) -> LockedPackage {
