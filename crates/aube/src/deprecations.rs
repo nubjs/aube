@@ -129,8 +129,13 @@ fn write_warn_line(r: &DeprecationRecord) {
 fn write_transitive_count_line(count: usize) {
     let pkgs = pluralizer::pluralize("transitive package", count as isize, true);
     let verb = if count == 1 { "has" } else { "have" };
+    // Product name from the active embedder (nub → "nub", standalone aube →
+    // "aube"), not a hardcoded "aube": this hint streams to stderr mid-install,
+    // so the host's capture-time `present::rewrite` brand pass never sees it —
+    // the only place to brand it correctly is the emit site.
+    let product = aube_util::embedder().name;
     let msg = format!(
-        "{pkgs} {verb} deprecation warnings. Run `aube deprecations --transitive` to see them."
+        "{pkgs} {verb} deprecation warnings. Run `{product} deprecations --transitive` to see them."
     );
     let _ = writeln!(std::io::stderr(), "{}", style::edim(msg));
 }
@@ -138,10 +143,12 @@ fn write_transitive_count_line(count: usize) {
 fn write_count_line(count: usize, has_transitive: bool) {
     let pkgs = pluralizer::pluralize("package", count as isize, true);
     let verb = if count == 1 { "has" } else { "have" };
+    // See `write_transitive_count_line`: streamed line, brand at emit.
+    let product = aube_util::embedder().name;
     let cmd = if has_transitive {
-        "aube deprecations --transitive"
+        format!("{product} deprecations --transitive")
     } else {
-        "aube deprecations"
+        format!("{product} deprecations")
     };
     let msg = format!("{pkgs} {verb} deprecation warnings. Run `{cmd}` to see them.");
     let _ = writeln!(std::io::stderr(), "{}", style::edim(msg));

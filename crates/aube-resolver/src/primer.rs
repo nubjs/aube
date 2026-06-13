@@ -273,7 +273,13 @@ fn primer_cache_dir() -> Option<PathBuf> {
     if let Some(base) = std::env::var_os("AUBE_CACHE_DIR") {
         return Some(PathBuf::from(base).join("primer"));
     }
-    cache_base_dir().map(|p| p.join("aube").join("primer"))
+    // Engine-cache namespace, not the literal "aube": the active embedder's
+    // `cache_namespace` (nub → "nub/pm") is what aube-store's `cache_dir`
+    // derives from, so the primer lands beside the packument cache instead of
+    // leaking an `aube`-named path into a host's $XDG_CACHE. Standalone aube
+    // (`cache_namespace == "aube"`) is unchanged. Replaces the dropped
+    // `set_cache_root` seam the Embedder refactor removed.
+    cache_base_dir().map(|p| p.join(aube_util::embedder().cache_namespace).join("primer"))
 }
 
 #[cfg(unix)]
