@@ -3878,6 +3878,142 @@ fn peer_suffix_propagation_unions_descendant_peer_onto_peer_declarer() {
     );
 }
 
+// pnpm-parity (direct-dependency filter): a descendant peer that the
+// peer-declaring node ALSO directly depends on must NOT bubble onto the
+// node's key — it is resolved locally. pnpm's `resolvePeersOfChildren`
+// builds the bubbling set (`unknownResolvedPeersOfChildren`) by keeping
+// only child-resolved peers whose alias is NOT a direct child of the
+// node (`if (!children[alias])`,
+// `installing/deps-resolver/src/resolvePeers.ts`). Without this filter
+// aube over-unions: it would emit `mid@1.0.0(desc-peer@…)(own-peer@…)`
+// where pnpm emits `mid@1.0.0(own-peer@…)`. This is the peer-declarer
+// shape of the over-union bug.
+#[test]
+fn peer_suffix_propagation_suppresses_direct_dep_peer_on_peer_declarer() {
+    // mid declares its OWN peer (own-peer) and directly depends on BOTH
+    // leaf and desc-peer. leaf declares desc-peer as a peer — but since
+    // mid directly depends on desc-peer, that peer is resolved locally
+    // and must NOT bubble onto mid's key. mid's key carries only its
+    // own resolved peer.
+    let mut mid = mk_locked(
+        "mid",
+        "1.0.0",
+        &[("own-peer", "1.0.0"), ("leaf", "1.0.0"), ("desc-peer", "1.0.0")],
+        &[("own-peer", "^1")],
+    );
+    mid.dep_path = "mid@1.0.0".to_string();
+    let leaf = mk_locked("leaf", "1.0.0", &[("desc-peer", "1.0.0")], &[("desc-peer", "^1")]);
+    let own_peer = mk_locked("own-peer", "1.0.0", &[], &[]);
+    let desc_peer = mk_locked("desc-peer", "1.0.0", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    packages.insert("mid@1.0.0".to_string(), mid);
+    packages.insert("leaf@1.0.0".to_string(), leaf);
+    packages.insert("own-peer@1.0.0".to_string(), own_peer);
+    packages.insert("desc-peer@1.0.0".to_string(), desc_peer);
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "mid".to_string(),
+            dep_path: "mid@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^1".to_string()),
+        }],
+    );
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default())
+        .expect("test graph should converge");
+
+    // mid carries ONLY its own resolved peer — desc-peer is suppressed
+    // because mid directly depends on it.
+    let mid_key = "mid@1.0.0(own-peer@1.0.0)";
+    assert!(
+        out.packages.contains_key(mid_key),
+        "peer-declarer must NOT absorb a descendant peer it directly depends on; got {:?}",
+        out.packages.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !out
+            .packages
+            .contains_key("mid@1.0.0(desc-peer@1.0.0)(own-peer@1.0.0)"),
+        "desc-peer is mid's direct dep → must not over-union onto mid's key"
+    );
+    assert_eq!(
+        &out.importers["."][0].dep_path, mid_key,
+        "importer DirectDep.dep_path tracks mid's own-peer-only key"
+    );
+}
+
+// pnpm-parity (direct-dependency filter, peer-less shape): a peer-less
+// intermediary that directly depends on a peer its child resolves must
+// NOT carry that peer on its own key. mid → {leaf, shared}, leaf peers
+// on shared. Because mid directly depends on shared, pnpm resolves it
+// locally (`if (!children[alias])` drops it from the bubbling set) and
+// mid's key stays bare `mid@1.0.0`. This is the peer-less shape of the
+// over-union bug — pre-existing before the Q2 patch, same root cause.
+#[test]
+fn peer_suffix_propagation_suppresses_direct_dep_peer_on_peer_less_intermediary() {
+    // mid (no own peers) depends on leaf AND shared. leaf peers on
+    // shared. shared is mid's direct child → resolved locally → does
+    // not bubble onto mid.
+    let mut mid = mk_locked("mid", "1.0.0", &[("leaf", "1.0.0"), ("shared", "1.0.0")], &[]);
+    mid.dep_path = "mid@1.0.0".to_string();
+    let leaf = mk_locked("leaf", "1.0.0", &[("shared", "1.0.0")], &[("shared", "^1")]);
+    let shared = mk_locked("shared", "1.0.0", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    packages.insert("mid@1.0.0".to_string(), mid);
+    packages.insert("leaf@1.0.0".to_string(), leaf);
+    packages.insert("shared@1.0.0".to_string(), shared);
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "mid".to_string(),
+            dep_path: "mid@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^1".to_string()),
+        }],
+    );
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default())
+        .expect("test graph should converge");
+
+    // mid stays bare — shared is its own direct dep, not a bubbled peer.
+    assert!(
+        out.packages.contains_key("mid@1.0.0"),
+        "peer-less intermediary that directly depends on the peer keeps a bare key; got {:?}",
+        out.packages.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !out.packages.contains_key("mid@1.0.0(shared@1.0.0)"),
+        "shared is mid's direct dep → must not over-union onto mid's key"
+    );
+    // leaf still carries its own resolved peer suffix.
+    assert!(
+        out.packages.contains_key("leaf@1.0.0(shared@1.0.0)"),
+        "leaf keeps its self-peer suffix; got {:?}",
+        out.packages.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        &out.importers["."][0].dep_path, "mid@1.0.0",
+        "importer DirectDep.dep_path tracks mid's bare key"
+    );
+}
+
 // Mutual peer cycle (a -> peer b, b -> peer a). The propagation post-
 // pass must NOT lift `(a@…)` onto a's own dep_path — a node listing
 // itself as a peer is not valid pnpm shape. The cycle break suppresses

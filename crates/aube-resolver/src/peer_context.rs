@@ -1025,8 +1025,13 @@ fn peer_names_in_segments_recursive(segments: &[&str]) -> BTreeSet<String> {
 ///     set).
 ///  4. Dedupe by peer name. Suppressed names: every peer name reachable
 ///     transitively in self-segments (so `(helper@1(core@1))` covers
-///     `core` and a flat `(core@1)` from descendants is dropped) plus
-///     the package's own canonical name (mutual-peer cycle break).
+///     `core` and a flat `(core@1)` from descendants is dropped); the
+///     package's own canonical name (mutual-peer cycle break); and
+///     every direct-child name of the node — pnpm's
+///     `resolvePeersOfChildren` only bubbles up child-resolved peers
+///     whose alias is NOT a direct child (`if (!children[alias])`), so
+///     a descendant peer the node *also* directly depends on is
+///     resolved locally and does not over-union onto the node's key.
 ///  5. Build a rewrite map `old_key → new_key` and apply to package
 ///     keys, dep edges (each dep's stored tail), and importer
 ///     dep_paths.
@@ -1110,6 +1115,20 @@ fn propagate_peer_suffixes_to_ancestors(
         //      only when this branch handles a node with no declared
         //      peers — but defensive in case future graph shapes
         //      surface a self-cycle through a peer-less node.)
+        //   3. Every DIRECT-child name of this node — pnpm's
+        //      `resolvePeersOfChildren` builds the set that bubbles up
+        //      (`unknownResolvedPeersOfChildren`) by keeping only
+        //      child-resolved peers whose alias is NOT itself a direct
+        //      child of the node: `for (const [alias, v] of
+        //      allResolvedPeers) { if (!children[alias]) { … } }`
+        //      (`installing/deps-resolver/src/resolvePeers.ts`). A peer
+        //      a node ALSO directly depends on is resolved locally and
+        //      does not bubble onto the node's own key. Without this,
+        //      a descendant peer that the node directly depends on
+        //      would over-union onto the node's suffix (e.g. emit
+        //      `mid@1.0.0(desc-peer@…)` when `desc-peer` is mid's own
+        //      direct dep — pnpm emits `mid@1.0.0`). Child keys are
+        //      `name@version(...)`; strip to the bare name.
         let canonical_name = canonical_tail(key)
             .rsplit_once('@')
             .map(|(name, _ver)| name.to_string())
@@ -1117,6 +1136,15 @@ fn propagate_peer_suffixes_to_ancestors(
         let mut suppressed: BTreeSet<String> = peer_names_in_segments_recursive(&self_segments);
         if !canonical_name.is_empty() {
             suppressed.insert(canonical_name);
+        }
+        if let Some(children) = forward.get(key) {
+            for child in children {
+                if let Some((child_name, _ver)) = canonical_tail(child).rsplit_once('@') {
+                    if !child_name.is_empty() {
+                        suppressed.insert(child_name.to_string());
+                    }
+                }
+            }
         }
 
         // Child contributions.
