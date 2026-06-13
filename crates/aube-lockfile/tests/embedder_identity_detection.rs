@@ -37,6 +37,7 @@ static MYTOOL: Embedder = Embedder {
     self_update_enabled: true,
     warm_store_verify: true,
     no_churn_lockfile_write: false,
+    read_branded_settings_env: true,
 };
 
 fn project(files: &[(&str, &str)]) -> tempfile::TempDir {

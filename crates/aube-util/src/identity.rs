@@ -14,8 +14,8 @@
 //! This struct holds *embedder-fixed* data: branding (pure naming constants)
 //! plus the behavior toggles that an embedder — not an end user — owns
 //! (`canonical_lockfile_always_wins`, `runtime_switching`, `self_engines_check`,
-//! `self_update_enabled`, `warm_store_verify`). Genuinely *user-tunable* knobs
-//! do not belong here; those stay settings.
+//! `self_update_enabled`, `warm_store_verify`, `read_branded_settings_env`).
+//! Genuinely *user-tunable* knobs do not belong here; those stay settings.
 //!
 //! An embedder selects its profile by registering it with [`set_embedder`].
 //! A host that goes through the library entry point `aube::cli_main` passes
@@ -33,11 +33,12 @@ use std::sync::OnceLock;
 ///
 /// Branding fields are pure naming constants. The behavior toggles
 /// (`canonical_lockfile_always_wins`, `runtime_switching`,
-/// `self_engines_check`, `self_update_enabled`, `warm_store_verify`) are
-/// embedder-fixed, not user-tunable: a host that mirrors the project's
-/// incumbent package manager, owns Node provisioning, lives outside aube's
-/// version namespace, owns its own self-update, or trusts the published store
-/// flips them. Genuinely user-tunable knobs stay settings.
+/// `self_engines_check`, `self_update_enabled`, `warm_store_verify`,
+/// `read_branded_settings_env`) are embedder-fixed, not user-tunable: a host
+/// that mirrors the project's incumbent package manager, owns Node
+/// provisioning, lives outside aube's version namespace, owns its own
+/// self-update, trusts the published store, or hides aube's branded settings
+/// env family flips them. Genuinely user-tunable knobs stay settings.
 #[derive(Clone, Copy, Debug)]
 pub struct Embedder {
     /// Tool name, lowercase (e.g. `"aube"`). The proper noun users type and
@@ -147,6 +148,24 @@ pub struct Embedder {
     /// serialization forever. Embedder-fixed: it's the host's call, not the
     /// user's, and it doesn't vary per project.
     pub no_churn_lockfile_write: bool,
+    /// When `true` (aube's default), this tool honors its *branded* `AUBE_*`
+    /// settings env-var family — the tool-prefixed aliases (`{env_prefix}_<NAME>`)
+    /// for user-facing config knobs declared in `settings.toml`. An embedder
+    /// whose users shouldn't reach aube's settings through a branded env family
+    /// sets this `false`, and every tool-branded settings env var is ignored;
+    /// the neutral `npm_config_*` / `NPM_CONFIG_*` aliases and bare external
+    /// vars (`CI`, `HTTP_PROXY`, …) are unaffected. Distinct from, and composed
+    /// with, [`env_prefix`](Self::env_prefix): `env_prefix` says *which* prefix
+    /// is the brand (used to match a var to this tool), while this toggle says
+    /// *whether the branded settings-env surface is read at all* — so an
+    /// embedder can keep a branded `env_prefix` for identity yet read no branded
+    /// settings env vars. This gates only aube's user-facing `AUBE_*` *settings*
+    /// surface, never the internal cross-process env vars aube sets for its own
+    /// plumbing, and never the error/exit codes in `aube-codes`. Symmetric with
+    /// the runtime [`read_branded_pnpm_config`] posture; embedder-fixed.
+    ///
+    /// [`read_branded_pnpm_config`]: crate::engine_context::EngineContext::read_branded_pnpm_config
+    pub read_branded_settings_env: bool,
 }
 
 /// Standalone aube's embedder profile. Reproduces every hardcoded branding
@@ -172,6 +191,7 @@ pub const AUBE: Embedder = Embedder {
     self_update_enabled: true,
     warm_store_verify: true,
     no_churn_lockfile_write: false,
+    read_branded_settings_env: true,
 };
 
 static ACTIVE: OnceLock<&'static Embedder> = OnceLock::new();
@@ -262,5 +282,6 @@ mod tests {
         assert!(id.self_update_enabled);
         assert!(id.warm_store_verify);
         assert!(!id.no_churn_lockfile_write);
+        assert!(id.read_branded_settings_env);
     }
 }

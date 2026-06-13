@@ -4,23 +4,29 @@ use crate::identity::embedder;
 
 /// Whether a *branded* settings env-var alias (the tool-prefixed form like
 /// `AUBE_NODE_LINKER`) should be read, given the active embedder's
-/// [`env_prefix`](crate::identity::Embedder::env_prefix).
+/// [`read_branded_settings_env`](crate::identity::Embedder::read_branded_settings_env)
+/// posture and [`env_prefix`](crate::identity::Embedder::env_prefix).
 ///
 /// aube's settings table declares each branded env alias as `{PREFIX}_<NAME>`
 /// alongside the neutral `npm_config_*` / `NPM_CONFIG_*` forms and a handful of
-/// bare external vars (`CI`, `HTTP_PROXY`, `NODE_OPTIONS`, …). `env_prefix` is
-/// the single on/off switch for the *branded* surface only:
+/// bare external vars (`CI`, `HTTP_PROXY`, `NODE_OPTIONS`, …). Two
+/// embedder-fixed levers gate the *branded* surface only, composed in order:
 ///
-/// - `Some(prefix)` — a branded alias is read only when it is `{prefix}_…`.
-///   Standalone aube (`Some("AUBE")`) thus reads every `AUBE_*` settings var
-///   exactly as before, and nothing else changes.
-/// - `None` — the embedder reads *no* branded settings env vars; every
-///   tool-branded alias is skipped.
+/// 1. [`read_branded_settings_env`](crate::identity::Embedder::read_branded_settings_env)
+///    — the on/off switch for the whole branded settings-env family. `true`
+///    (standalone aube) honors it; `false` skips *every* tool-branded settings
+///    alias regardless of prefix, for an embedder that exposes no branded env
+///    surface for its settings.
+/// 2. [`env_prefix`](crate::identity::Embedder::env_prefix) — *which* prefix is
+///    the brand. When the family is honored, a branded alias is read only when
+///    it is `{prefix}_…`; `None` likewise reads no branded settings env vars.
 ///
-/// The neutral `npm_config_*` / `NPM_CONFIG_*` aliases and the bare external
-/// vars are never the tool's brand and are always honored. Standalone aube's
-/// settings table only ever emits its own `env_prefix` as the branded prefix,
-/// so the brand family is exactly the `{prefix}_*` set.
+/// Standalone aube (`read_branded_settings_env = true`, `env_prefix =
+/// Some("AUBE")`) thus reads every `AUBE_*` settings var exactly as before, and
+/// nothing else changes. The neutral `npm_config_*` / `NPM_CONFIG_*` aliases and
+/// the bare external vars are never the tool's brand and are always honored.
+/// Standalone aube's settings table only ever emits its own `env_prefix` as the
+/// branded prefix, so the brand family is exactly the `{prefix}_*` set.
 pub fn branded_env_alias_enabled(alias: &str) -> bool {
     // npm-compat family — never the tool's brand, always honored.
     if alias.starts_with("npm_config_") || alias.starts_with("NPM_CONFIG_") {
@@ -30,8 +36,15 @@ pub fn branded_env_alias_enabled(alias: &str) -> bool {
     if !looks_branded(alias) {
         return true;
     }
-    // A branded-shaped alias: read it only when it matches the active prefix.
-    match embedder().env_prefix {
+    let id = embedder();
+    // A branded-shaped alias. First the family on/off posture, then the prefix
+    // match. An embedder that hides its branded settings-env surface
+    // (`read_branded_settings_env = false`) skips every branded alias even when
+    // it would match the active prefix.
+    if !id.read_branded_settings_env {
+        return false;
+    }
+    match id.env_prefix {
         Some(prefix) => alias
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with('_')),
