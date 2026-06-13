@@ -83,23 +83,57 @@ fn env_truthy(name: &str) -> bool {
     })
 }
 
-/// Build the standard `aube VERSION by jdx.dev · <msg>` one-line
-/// header used by the no-op and fast-mode summaries. Centralizes the
-/// header shape so the install-finished, already-up-to-date, and
-/// fast-mode-summary paths all read consistently.
-pub(crate) fn aube_prefix_line(msg: &str) -> String {
+/// Whether the vendor attribution (`by jdx.dev`) may render into the
+/// install banner. The vendor tag is aube's *own* credit, so it shows
+/// only when the binary is running as standalone aube — i.e. the active
+/// embedder is aube's own profile. An embedder (e.g. a host that
+/// vendors the engine under its own name) suppresses it: surfacing
+/// aube's vendor brand in the host's install output would leak the
+/// engine's identity into a brand-policed user-facing surface, which is
+/// exactly what the host's brand boundary forbids. Keyed on the
+/// embedder's `name` matching standalone aube's, because `embedder()`
+/// returns a copied profile (no stable pointer to compare against
+/// `AUBE`). Standalone aube keeps `by jdx.dev`; every other embedder
+/// gets `display_name VERSION` only.
+fn banner_vendor() -> Option<&'static str> {
     let id = aube_util::embedder();
-    let vendor = id
-        .vendor
-        .map(|v| format!("{} ", style::edim(v)))
-        .unwrap_or_default();
-    format!(
-        "{} {} {}{} {msg}",
-        style::emagenta(id.display_name).bold(),
-        style::edim(crate::version::VERSION.as_str()),
-        vendor,
-        style::edim("·"),
-    )
+    if id.name == aube_util::AUBE.name {
+        id.vendor
+    } else {
+        None
+    }
+}
+
+/// Render the product banner — `<display_name> <VERSION>[ <vendor>]` —
+/// used by the install-progress headers and the no-op/fast-mode
+/// summaries. The optional vendor attribution is gated by
+/// [`banner_vendor`] so the engine's brand never leaks into an
+/// embedder's install output. Trailing `suffix` (already styled) is
+/// appended verbatim — `" · ✓ msg"` for the summary lines, empty for
+/// the bare header.
+fn product_banner(suffix: &str) -> String {
+    let id = aube_util::embedder();
+    match banner_vendor() {
+        Some(vendor) => format!(
+            "{} {} {}{suffix}",
+            style::emagenta(id.display_name).bold(),
+            style::edim(crate::version::VERSION.as_str()),
+            style::edim(vendor),
+        ),
+        None => format!(
+            "{} {}{suffix}",
+            style::emagenta(id.display_name).bold(),
+            style::edim(crate::version::VERSION.as_str()),
+        ),
+    }
+}
+
+/// Build the standard `<product banner> · <msg>` one-line header used
+/// by the no-op and fast-mode summaries. Centralizes the header shape
+/// so the install-finished, already-up-to-date, and fast-mode-summary
+/// paths all read consistently.
+pub(crate) fn aube_prefix_line(msg: &str) -> String {
+    product_banner(&format!(" {} {msg}", style::edim("·")))
 }
 
 /// Install-time progress UI. Cheap to clone (internally `Arc`).
@@ -223,24 +257,13 @@ impl InstallProgress {
     }
 
     fn new_tty() -> Self {
-        // Colored header: magenta bold display name, dim version, dim vendor.
-        // Mirrors the `mise VERSION by @jdx` / `hk VERSION by @jdx` convention
-        // for visual parity across the trio. An embedder with `vendor: None`
-        // drops the trailing attribution.
-        let id = aube_util::embedder();
-        let header = match id.vendor {
-            Some(vendor) => format!(
-                "{} {} {}",
-                style::emagenta(id.display_name).bold(),
-                style::edim(crate::version::VERSION.as_str()),
-                style::edim(vendor),
-            ),
-            None => format!(
-                "{} {}",
-                style::emagenta(id.display_name).bold(),
-                style::edim(crate::version::VERSION.as_str()),
-            ),
-        };
+        // Colored header: magenta bold display name, dim version, dim
+        // vendor. Mirrors the `mise VERSION by @jdx` / `hk VERSION by
+        // @jdx` convention for visual parity across the trio. The vendor
+        // attribution renders only for standalone aube (see
+        // `product_banner`); an embedder drops it so the engine brand
+        // never leaks into the host's install output.
+        let header = product_banner("");
         // Layout: header, animated bar, count segment, optional bytes
         // segment (running download, with `/ ~estimated` when
         // available), phase-gated rate, ETA. Mirrors the CI-mode
