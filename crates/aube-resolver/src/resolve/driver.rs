@@ -24,7 +24,7 @@ use crate::local_source::{
     resolve_exec_manifest, resolve_git_source, resolve_remote_tarball, should_block_exotic_subdep,
 };
 use crate::package_ext::{apply_package_extensions, pick_override_spec};
-use crate::semver_util::{PickResult, pick_version, version_satisfies};
+use crate::semver_util::{PickResult, Regime, classify_regime, pick_version, version_satisfies};
 use crate::{
     Error, ExoticSubdepDetails, FxHashMap, FxHashSet, ResolutionMode, ResolveTask, ResolvedPackage,
     Resolver, error, is_deprecation_allowed, is_supported,
@@ -382,6 +382,44 @@ impl<'a> ResolveDriver<'a> {
 }
 
 impl<'a> ResolveDriver<'a> {
+    /// Decide whether a primer-seeded `Found` pick must be refetched
+    /// live before we trust it, under the `AUBE_PRIMER_PICK_GATE`
+    /// pick-site freshness gate. Only consulted when the gate is on and
+    /// the pick came from the bundled primer (both checked by the caller).
+    ///
+    /// Returns `true` (refetch) when the pick is at the live frontier
+    /// (`Current`) and the offline seed is stale for the active cutoff,
+    /// or when a `SoftFrozen` pick coincides with `trustPolicy=NoDowngrade`
+    /// (the sparse-seed fail-open hazard). Returns `false` (accept the
+    /// offline pick) for frozen picks whose history is settled. See the
+    /// big comment on the matching arm in the pick loop for the full
+    /// rationale.
+    fn primer_pick_needs_refetch(
+        &self,
+        packument: &aube_registry::Packument,
+        picked_version: &str,
+        cutoff_for_pkg: Option<&str>,
+    ) -> bool {
+        match classify_regime(packument, picked_version) {
+            // Live edge: refetch only if the offline seed predates the
+            // active cutoff (the staleness the legacy gate keyed on,
+            // now scoped to just the frontier pick that can actually be
+            // wrong). No cutoff active → nothing can be stale → accept.
+            Regime::Current => cutoff_for_pkg.is_some_and(|c| !crate::primer::covers_cutoff(c)),
+            // Settled history below a newer major: trustworthy for the
+            // version pick, BUT the no-downgrade check needs the older
+            // trusted neighbors the truncated seed may have dropped —
+            // so refetch when that policy is active. Otherwise accept.
+            Regime::SoftFrozen => {
+                self.resolver.dependency_policy.trust_policy == crate::TrustPolicy::NoDowngrade
+            }
+            // Settled history within the same major: a refetch could
+            // never surface a newer satisfying version, and the seed's
+            // window covers the relevant neighbors. Always accept.
+            Regime::HardFrozen => false,
+        }
+    }
+
     /// Drive a single task through preprocess → local-source → workspace-link → sibling-dedupe → lockfile-reuse → fetch-and-pick.
     ///
     /// Returns `Ok(())` whether the task settled on a version, was
@@ -590,6 +628,93 @@ impl<'a> ResolveDriver<'a> {
                                 .await
                         }
                         None => self.resolver.client.fetch_packument(&registry_name).await,
+                    }
+                    .map_err(|e| Error::Registry(registry_name.clone(), e.to_string()))?;
+                    self.packument_fetch_time += fetch_start.elapsed();
+                    self.packument_fetch_count += 1;
+                    self.resolver.cache.insert(registry_name.clone(), live);
+                }
+                // Pick-site freshness gate (coexistence flag
+                // `AUBE_PRIMER_PICK_GATE`, OFF by default → this arm is
+                // a no-op and the next arm `break`s exactly as before).
+                //
+                // This is the fix for the cold-install regression: the
+                // legacy fetch-time `covers_cutoff` gate keys freshness
+                // on the primer *build date*, so once the moving
+                // `published_by` cutoff overtakes it (~24h post-build),
+                // every primer hit is suppressed and a cold install
+                // goes all-network. The regime of the *picked version*
+                // is the right key instead:
+                //
+                //  - FROZEN (a higher minor in the same major exists →
+                //    HardFrozen; only a higher major exists →
+                //    SoftFrozen): the slice we picked from is immutable
+                //    history — a refetch could never surface a *newer*
+                //    satisfying version than what we already hold, so we
+                //    serve the offline primer pick indefinitely.
+                //    Cooling is NOT bypassed: the age cutoff was already
+                //    applied inside `pick_version` against the primer's
+                //    own `time` map, so a `minimumReleaseAge` floor still
+                //    holds. This is a correctness fix, not a security
+                //    weakening.
+                //
+                //  - CURRENT (the pick sits at the visible frontier —
+                //    nothing newer in the packument we hold): a newer
+                //    publish could exist upstream that the offline seed
+                //    can't see, so we KEEP the freshness gate — if the
+                //    seed is stale (`covers_cutoff` false for the active
+                //    cutoff) we refetch live before trusting it.
+                //
+                //  - SOFT-FROZEN + trustPolicy=NoDowngrade: conservative
+                //    posture-preserving exception. `check_no_downgrade`
+                //    scans *older* versions of the packument for stronger
+                //    trust evidence; on a truncated primer seed an older
+                //    trusted version may be ABSENT, so the check
+                //    silently fails open. A HardFrozen pick is deep
+                //    enough in settled history that the seed's window
+                //    still covers the relevant neighbors, but a
+                //    SoftFrozen pick (a maintenance line under a newer
+                //    major) is exactly where the seed is most likely to
+                //    have dropped the older trusted release — so we
+                //    refetch rather than trust the sparse offline seed.
+                //    Security posture is never weakened by the new path.
+                PickResult::Found(meta)
+                    if crate::primer::pick_gate_enabled()
+                        && self.fetcher.is_primer_seeded(&registry_name)
+                        && self.primer_pick_needs_refetch(
+                            packument,
+                            &meta.version,
+                            cutoff_for_pkg,
+                        ) =>
+                {
+                    // Consume the seed flag (one refetch per package,
+                    // matching the other heal arms) and fetch live.
+                    self.fetcher.take_primer_seeded(&registry_name);
+                    let fetch_start = std::time::Instant::now();
+                    let live = if self.needs_time {
+                        match self.resolver.packument_full_cache_dir.as_ref() {
+                            Some(dir) => {
+                                self.resolver
+                                    .client
+                                    .fetch_packument_with_time_cached(&registry_name, dir)
+                                    .await
+                            }
+                            None => self.resolver.client.fetch_packument(&registry_name).await,
+                        }
+                    } else {
+                        match self.resolver.client.fetch_packument(&registry_name).await {
+                            Ok(live) => {
+                                if let Some(dir) = self.resolver.packument_cache_dir.as_ref() {
+                                    self.resolver.client.replace_packument_cache(
+                                        &registry_name,
+                                        dir,
+                                        &live,
+                                    );
+                                }
+                                Ok(live)
+                            }
+                            Err(err) => Err(err),
+                        }
                     }
                     .map_err(|e| Error::Registry(registry_name.clone(), e.to_string()))?;
                     self.packument_fetch_time += fetch_start.elapsed();

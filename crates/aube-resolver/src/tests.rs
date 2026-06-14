@@ -703,6 +703,56 @@ fn test_pick_version_prefers_locked() {
 }
 
 #[test]
+fn classify_regime_hard_frozen_when_higher_minor_in_same_major() {
+    // Picking 1.0.0 while 1.1.0 / 1.2.0 exist: the same-major line has
+    // moved on, so history below is settled — a refetch can't surface a
+    // newer satisfying answer for `~1.0`.
+    use crate::semver_util::{Regime, classify_regime};
+    let packument = make_packument("foo", &["1.0.0", "1.1.0", "1.2.0", "2.0.0"], "2.0.0");
+    assert_eq!(classify_regime(&packument, "1.0.0"), Regime::HardFrozen);
+}
+
+#[test]
+fn classify_regime_soft_frozen_when_only_higher_major_exists() {
+    // Picking the top of the 1.x line while a 2.x exists: no higher
+    // minor in-major, but a whole newer major — maintenance line.
+    use crate::semver_util::{Regime, classify_regime};
+    let packument = make_packument("foo", &["1.0.0", "1.2.0", "2.0.0", "2.1.0"], "2.1.0");
+    assert_eq!(classify_regime(&packument, "1.2.0"), Regime::SoftFrozen);
+}
+
+#[test]
+fn classify_regime_current_at_the_frontier() {
+    // Picking the highest stable version: nothing newer is visible, so
+    // a newer upstream publish the offline seed can't see is possible.
+    use crate::semver_util::{Regime, classify_regime};
+    let packument = make_packument("foo", &["1.0.0", "1.1.0", "1.2.0"], "1.2.0");
+    assert_eq!(classify_regime(&packument, "1.2.0"), Regime::Current);
+}
+
+#[test]
+fn classify_regime_ignores_prereleases() {
+    // A dangling `2.0.0-rc.1` must not make a stable 1.x pick look
+    // soft-frozen, nor should it count as a higher major: the frontier
+    // for regime purposes is the highest *stable* release.
+    use crate::semver_util::{Regime, classify_regime};
+    let packument = make_packument("foo", &["1.0.0", "1.1.0", "2.0.0-rc.1"], "1.1.0");
+    assert_eq!(classify_regime(&packument, "1.1.0"), Regime::Current);
+}
+
+#[test]
+fn classify_regime_unparseable_pick_is_current() {
+    // Total + conservative: an unparseable pick can't be proven frozen,
+    // so it defaults to Current (keeps the freshness gate).
+    use crate::semver_util::{Regime, classify_regime};
+    let packument = make_packument("foo", &["1.0.0"], "1.0.0");
+    assert_eq!(
+        classify_regime(&packument, "not-a-version"),
+        Regime::Current
+    );
+}
+
+#[test]
 fn test_pick_version_locked_out_of_range() {
     let packument = make_packument("foo", &["1.0.0", "2.0.0"], "2.0.0");
     // Locked version doesn't satisfy range, should pick highest match
@@ -3827,7 +3877,12 @@ fn peer_suffix_propagation_unions_descendant_peer_onto_peer_declarer() {
         &[("own-peer", "^1")],
     );
     mid.dep_path = "mid@1.0.0".to_string();
-    let leaf = mk_locked("leaf", "1.0.0", &[("desc-peer", "1.0.0")], &[("desc-peer", "^1")]);
+    let leaf = mk_locked(
+        "leaf",
+        "1.0.0",
+        &[("desc-peer", "1.0.0")],
+        &[("desc-peer", "^1")],
+    );
     let own_peer = mk_locked("own-peer", "1.0.0", &[], &[]);
     let desc_peer = mk_locked("desc-peer", "1.0.0", &[], &[]);
 
@@ -3898,11 +3953,20 @@ fn peer_suffix_propagation_suppresses_direct_dep_peer_on_peer_declarer() {
     let mut mid = mk_locked(
         "mid",
         "1.0.0",
-        &[("own-peer", "1.0.0"), ("leaf", "1.0.0"), ("desc-peer", "1.0.0")],
+        &[
+            ("own-peer", "1.0.0"),
+            ("leaf", "1.0.0"),
+            ("desc-peer", "1.0.0"),
+        ],
         &[("own-peer", "^1")],
     );
     mid.dep_path = "mid@1.0.0".to_string();
-    let leaf = mk_locked("leaf", "1.0.0", &[("desc-peer", "1.0.0")], &[("desc-peer", "^1")]);
+    let leaf = mk_locked(
+        "leaf",
+        "1.0.0",
+        &[("desc-peer", "1.0.0")],
+        &[("desc-peer", "^1")],
+    );
     let own_peer = mk_locked("own-peer", "1.0.0", &[], &[]);
     let desc_peer = mk_locked("desc-peer", "1.0.0", &[], &[]);
 
@@ -3940,8 +4004,7 @@ fn peer_suffix_propagation_suppresses_direct_dep_peer_on_peer_declarer() {
         out.packages.keys().collect::<Vec<_>>()
     );
     assert!(
-        !out
-            .packages
+        !out.packages
             .contains_key("mid@1.0.0(desc-peer@1.0.0)(own-peer@1.0.0)"),
         "desc-peer is mid's direct dep → must not over-union onto mid's key"
     );
@@ -3963,7 +4026,12 @@ fn peer_suffix_propagation_suppresses_direct_dep_peer_on_peer_less_intermediary(
     // mid (no own peers) depends on leaf AND shared. leaf peers on
     // shared. shared is mid's direct child → resolved locally → does
     // not bubble onto mid.
-    let mut mid = mk_locked("mid", "1.0.0", &[("leaf", "1.0.0"), ("shared", "1.0.0")], &[]);
+    let mut mid = mk_locked(
+        "mid",
+        "1.0.0",
+        &[("leaf", "1.0.0"), ("shared", "1.0.0")],
+        &[],
+    );
     mid.dep_path = "mid@1.0.0".to_string();
     let leaf = mk_locked("leaf", "1.0.0", &[("shared", "1.0.0")], &[("shared", "^1")]);
     let shared = mk_locked("shared", "1.0.0", &[], &[]);

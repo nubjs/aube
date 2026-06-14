@@ -70,7 +70,20 @@ impl FetchScheduler {
             return;
         }
         self.in_flight_names.insert(name.to_string());
-        let primer_covers_cutoff = self.mra_exclude.contains(name)
+        // Legacy (flag OFF): gate the primer per-NAME at fetch time on
+        // the build-mtime freshness check. This is the path that
+        // self-disables ~24h after the build date once the moving
+        // `published_by` cutoff overtakes `AUBE_PRIMER_GENERATED_AT`.
+        //
+        // Pick-gate (flag ON): always let the primer serve at fetch
+        // time (`primer_covers_cutoff = true`); the freshness decision
+        // moves to the version-pick site, which keys it on the picked
+        // version's *regime* instead of the build date — a frozen pick
+        // is served offline indefinitely, a live-edge pick refetches
+        // when stale. See `primer::pick_gate_enabled` and the
+        // `PickResult::Found` arm in driver.rs.
+        let primer_covers_cutoff = crate::primer::pick_gate_enabled()
+            || self.mra_exclude.contains(name)
             || published_by.is_none_or(crate::primer::covers_cutoff);
         self.in_flight.spawn(fetch_one_packument(FetchInputs {
             name: name.to_string(),
@@ -100,6 +113,14 @@ impl FetchScheduler {
     /// Returns true if `name` was marked as primer-seeded, removing it.
     pub(super) fn take_primer_seeded(&mut self, name: &str) -> bool {
         self.primer_seeded_names.remove(name)
+    }
+
+    /// Non-consuming peek: is `name` currently flagged as primer-seeded?
+    /// The pick-site freshness gate uses this to *classify* a pick
+    /// before deciding whether to consume the flag and refetch (frozen
+    /// picks are accepted as-is, so they must not eagerly clear it).
+    pub(super) fn is_primer_seeded(&self, name: &str) -> bool {
+        self.primer_seeded_names.contains(name)
     }
 
     pub(super) async fn drain(&mut self) {

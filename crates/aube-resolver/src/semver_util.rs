@@ -222,6 +222,86 @@ fn looks_like_protocol_range(range_str: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
+/// Freshness regime of a picked version *relative to the rest of the
+/// packument we can see*. Used by the primer pick-site gate to decide
+/// whether an offline (primer-seeded) pick is safe to serve without a
+/// freshness refetch.
+///
+/// The intuition: a pick is "frozen" when newer releases already exist
+/// past it, so the registry can never produce a *newer* satisfying
+/// answer than what we already hold — the slice we picked from is
+/// immutable history and a refetch would change nothing. A pick is
+/// "current/live" when nothing newer exists past it, so the registry
+/// *could* have published a newer version since the primer was built
+/// and a stale offline pick would silently miss it.
+///
+/// `HardFrozen` (a higher minor exists in the same major) is the
+/// strongest signal — the user's caret range almost certainly would
+/// have moved to that higher minor were it reachable, so the fact that
+/// we picked below it means the range is pinned to an older line whose
+/// history is settled. `SoftFrozen` (only a higher *major* exists) is
+/// weaker: the next publish on the picked major line is still possible,
+/// but the existence of a whole newer major strongly implies the
+/// picked line is in maintenance, not active churn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Regime {
+    /// A higher minor (or patch within a higher minor) exists in the
+    /// same major as the pick. History below it is settled.
+    HardFrozen,
+    /// No higher minor in the pick's major, but a higher major exists.
+    /// The picked line is plausibly in maintenance.
+    SoftFrozen,
+    /// The pick is at (or above) the visible frontier — nothing newer
+    /// exists in the packument we hold. A newer publish could exist
+    /// upstream that the offline seed can't see.
+    Current,
+}
+
+/// Classify the freshness regime of `picked_version` against the
+/// other versions present in `packument`. Pure + total: an unparseable
+/// pick, or one with no comparable peers, is treated as `Current`
+/// (the conservative/posture-preserving default — never assume frozen
+/// when we can't prove it).
+///
+/// Only *stable* (non-prerelease) versions are considered when scanning
+/// for "something higher exists", to match the way ranges resolve in
+/// practice — a dangling `2.0.0-rc.1` shouldn't make a `1.x` pick look
+/// frozen, nor should it count as a higher major over a stable `1.x`.
+#[inline]
+pub(crate) fn classify_regime(packument: &Packument, picked_version: &str) -> Regime {
+    let Ok(picked) = node_semver::Version::parse(picked_version) else {
+        return Regime::Current;
+    };
+    let mut higher_minor_same_major = false;
+    let mut higher_major = false;
+    for ver_str in packument.versions.keys() {
+        let Ok(v) = node_semver::Version::parse(ver_str) else {
+            continue;
+        };
+        // Ignore prereleases — they don't gate a stable pick's regime.
+        if !v.pre_release.is_empty() {
+            continue;
+        }
+        if v <= picked {
+            continue;
+        }
+        if v.major == picked.major {
+            // Strictly newer within the same major (higher minor, or a
+            // higher patch on a higher minor): hard-frozen evidence.
+            higher_minor_same_major = true;
+        } else if v.major > picked.major {
+            higher_major = true;
+        }
+    }
+    if higher_minor_same_major {
+        Regime::HardFrozen
+    } else if higher_major {
+        Regime::SoftFrozen
+    } else {
+        Regime::Current
+    }
+}
+
 #[inline]
 pub(crate) fn highest_stable_version(packument: &Packument) -> Option<String> {
     let mut best: Option<(node_semver::Version, String)> = None;

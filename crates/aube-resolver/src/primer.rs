@@ -165,6 +165,37 @@ pub(crate) fn covers_cutoff(cutoff: &str) -> bool {
     generated_at().is_some_and(|generated_at| generated_at.as_str() >= cutoff)
 }
 
+/// Coexistence switch for the redesigned primer pick-site freshness
+/// gate. OFF by default — the legacy fetch-time `covers_cutoff` gate
+/// (computed per-NAME in `fetch.rs`) stays the shipping behavior, so a
+/// build with the flag unset behaves byte-for-byte as before and a
+/// standalone aube is completely unaffected. When ON, the freshness
+/// decision moves to the version *pick* site (see
+/// `driver.rs` PickResult::Found arm): a frozen-regime pick is served
+/// from the offline primer indefinitely (immutable history; cooling
+/// still applied via the primer's own `time` map), while a live-edge
+/// pick keeps the freshness gate and refetches when the seed is stale.
+///
+/// This is the load-bearing fix for the cold-install regression where
+/// the primer self-disables ~24h after the build date: with time-aware
+/// resolution active (`minimumReleaseAge` / `--resolution-mode=time-based`
+/// / `trustPolicy=NoDowngrade`), the moving `published_by` cutoff
+/// eventually passes `AUBE_PRIMER_GENERATED_AT`, the fetch-time gate
+/// returns false for *every* name, and the primer goes dark — turning
+/// a warm cold-install into an all-network one.
+///
+/// Toggle with `AUBE_PRIMER_PICK_GATE` (`1`/`true`/`yes` = on, anything
+/// else / unset = off). Read once and memoized.
+pub(crate) fn pick_gate_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("AUBE_PRIMER_PICK_GATE").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "YES")
+        )
+    })
+}
+
 /// The names carried by the bundled primer, in index order. Used by the
 /// resolver's tests to drive the primer code paths against real seeds.
 #[cfg(test)]
