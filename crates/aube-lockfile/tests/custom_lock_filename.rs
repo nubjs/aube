@@ -32,6 +32,7 @@ static MYTOOL: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: false,
     read_branded_settings_env: true,
+    primer_evergreen: false,
 };
 
 #[test]

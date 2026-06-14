@@ -184,16 +184,35 @@ pub(crate) fn covers_cutoff(cutoff: &str) -> bool {
 /// returns false for *every* name, and the primer goes dark — turning
 /// a warm cold-install into an all-network one.
 ///
-/// Toggle with `AUBE_PRIMER_PICK_GATE` (`1`/`true`/`yes` = on, anything
-/// else / unset = off). Read once and memoized.
+/// The default is the active embedder's `primer_evergreen` posture
+/// (`false` = legacy fetch-site gate for standalone aube; `true` for an
+/// embedder shipping an evergreen primer, e.g. nub). `AUBE_PRIMER_PICK_GATE`
+/// overrides it in *either* direction — `1`/`true`/`yes`/`on` force on,
+/// `0`/`false`/`no`/`off` force off — so the opt-out survives an
+/// embedder that defaults it on. An unrecognized value is ignored (falls
+/// back to the embedder default). Read once and memoized.
 pub(crate) fn pick_gate_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("AUBE_PRIMER_PICK_GATE").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "YES")
+        resolve_pick_gate(
+            std::env::var("AUBE_PRIMER_PICK_GATE").ok().as_deref(),
+            aube_util::embedder().primer_evergreen,
         )
     })
+}
+
+/// Pure pick-gate decision: an explicit `AUBE_PRIMER_PICK_GATE` value wins in
+/// either direction; an unset or unrecognized value defers to the embedder's
+/// `primer_evergreen` default. Split out from [`pick_gate_enabled`]'s memoized,
+/// env-reading wrapper so the override precedence is unit-testable without the
+/// process-global `OnceLock` / env var.
+fn resolve_pick_gate(env_value: Option<&str>, embedder_default: bool) -> bool {
+    match env_value {
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
+        // Unset or unrecognized → the embedder's fixed posture.
+        _ => embedder_default,
+    }
 }
 
 /// The names carried by the bundled primer, in index order. Used by the
@@ -420,5 +439,28 @@ mod tests {
 
         assert_eq!(stats.files, 0);
         assert!(primer_file.exists());
+    }
+
+    #[test]
+    fn pick_gate_default_follows_embedder_and_env_overrides_both_ways() {
+        // Unset → the embedder's posture: standalone aube (default `false`)
+        // keeps the legacy fetch-site gate; an evergreen embedder (`true`)
+        // serves frozen picks offline.
+        assert!(!resolve_pick_gate(None, false));
+        assert!(resolve_pick_gate(None, true));
+
+        // An explicit value wins over either embedder default — the opt-out
+        // (`0`) survives an evergreen embedder, and the opt-in (`1`) survives
+        // a legacy one.
+        assert!(!resolve_pick_gate(Some("0"), true));
+        assert!(!resolve_pick_gate(Some("false"), true));
+        assert!(!resolve_pick_gate(Some("off"), true));
+        assert!(resolve_pick_gate(Some("1"), false));
+        assert!(resolve_pick_gate(Some("true"), false));
+        assert!(resolve_pick_gate(Some("on"), false));
+
+        // An unrecognized value is ignored — falls back to the embedder default.
+        assert!(resolve_pick_gate(Some("maybe"), true));
+        assert!(!resolve_pick_gate(Some(""), false));
     }
 }

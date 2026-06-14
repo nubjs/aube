@@ -1016,6 +1016,301 @@ async fn primer_seeded_pick_records_publish_time_for_the_age_floor() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Empirical proof of the cold-install "24h self-disable" regression and
+/// the `AUBE_PRIMER_PICK_GATE` fix, both observed via *registry hit count*
+/// against a request-counting mock registry. The bundled primer's
+/// `AUBE_PRIMER_GENERATED_AT` is baked at build time (the primer data
+/// file's mtime); `covers_cutoff(c)` is true iff `generated_at >= c`. The
+/// active `minimumReleaseAge` cutoff is `now - minutes`, so:
+///
+///   - a LARGE window (cutoff far in the past) → `covers_cutoff` true →
+///     simulates a freshly-built binary (cutoff predates the build);
+///   - a 24h window (cutoff = now - 1 day) → once the binary is older than
+///     ~24h, `now - 1day` lands AFTER `generated_at`, so `covers_cutoff`
+///     is FALSE for every name → simulates the aged binary.
+///
+/// With the legacy gate (flag off), the aged-binary case must SKIP the
+/// primer (a registry hit). With `AUBE_PRIMER_PICK_GATE` on, a frozen pick
+/// must be served from the primer even with the aged cutoff (NO registry
+/// hit) — the evergreen fix.
+#[tokio::test]
+async fn primer_self_disables_past_the_build_age_cutoff_unless_pick_gate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Pick a real primer entry that is FROZEN (a newer version exists past
+    // the version a `^picked` range would resolve to) and resolves
+    // standalone (latest has no runtime/peer/optional deps). Frozen is
+    // what the pick-gate serves offline; standalone keeps the mock
+    // single-package. Skip honestly on an empty primer.
+    let Some((name, range, picked)) = crate::primer::names().find_map(|name| {
+        let pkt = crate::primer::get(name)?.packument();
+        // Collect parseable stable versions, ascending.
+        let mut stable: Vec<node_semver::Version> = pkt
+            .versions
+            .keys()
+            .filter_map(|v| node_semver::Version::parse(v).ok())
+            .filter(|v| v.pre_release.is_empty())
+            .collect();
+        stable.sort();
+        // Need a version in the SAME major with a strictly-higher minor
+        // *present in the primer's slice* — so `classify_regime` (which
+        // runs against the primer packument under the gate) sees the
+        // pick as HardFrozen. Pin the range to that exact lower version
+        // (`=lower`) so the pick is deterministic and leaves the higher
+        // minor sitting above it.
+        let lower = stable.iter().find(|low| {
+            stable
+                .iter()
+                .any(|hi| hi.major == low.major && hi.minor > low.minor)
+        })?;
+        let picked_str = lower.to_string();
+        let meta = pkt.versions.get(&picked_str)?;
+        (meta.dependencies.is_empty()
+            && meta.optional_dependencies.is_empty()
+            && meta.peer_dependencies.is_empty())
+        .then(|| (name.to_string(), format!("={picked_str}"), picked_str))
+    }) else {
+        return;
+    };
+
+    // A request-counting registry. Any request that reaches it means the
+    // primer did NOT serve the pick. The body is a full packument the
+    // resolver could resolve `range` against, so the test never errors —
+    // it only measures whether the network was touched.
+    fn spawn_counting_registry(
+        full_body: Vec<u8>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let registry = format!("http://{addr}/");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                seen.fetch_add(1, Ordering::Relaxed);
+                let full_body = full_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        full_body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.write_all(&full_body).await;
+                });
+            }
+        });
+        (registry, hits, server)
+    }
+
+    // Build a full packument that carries both the picked version and a
+    // strictly-higher one (so the range resolves regardless of which path
+    // is taken) plus a `time` entry for the pick (so the needs_time floor
+    // doesn't force a refetch and contaminate the measurement).
+    let make_full = || {
+        let higher = {
+            let p = node_semver::Version::parse(&picked).unwrap();
+            format!("{}.{}.0", p.major, p.minor + 1)
+        };
+        let mut full = make_packument(&name, &[&picked, &higher], &higher);
+        full.modified = Some("2024-01-01T00:00:00.000Z".to_string());
+        full.time
+            .insert(picked.clone(), "2024-01-01T00:00:00.000Z".to_string());
+        full.time
+            .insert(higher.clone(), "2024-01-02T00:00:00.000Z".to_string());
+        serde_json::to_vec(&full).unwrap()
+    };
+
+    let temp_base = |tag: &str| {
+        let base = std::env::temp_dir().join(format!(
+            "aube-resolver-primer-disable-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(base.join("packuments")).unwrap();
+        std::fs::create_dir_all(base.join("packuments-full")).unwrap();
+        base
+    };
+
+    let run = |minutes: u64, base: std::path::PathBuf, registry: String| {
+        let name = name.clone();
+        let range = range.clone();
+        async move {
+            let client = Arc::new(aube_registry::client::RegistryClient::new(&registry));
+            let mut resolver = Resolver::new(client)
+                .with_packument_cache(base.join("packuments"))
+                .with_packument_full_cache(base.join("packuments-full"))
+                .with_force_metadata_primer(true)
+                // Time field on: keeps `needs_time` false so the only
+                // reason to touch the registry is the primer being
+                // *skipped* — isolating the covers_cutoff gate from the
+                // unrelated sparse-time refetch heal. Cooling is still
+                // fully applied (cutoff computed + filtered in pick_version
+                // against the primer's own time map).
+                .with_registry_supports_time_field(true)
+                .with_minimum_release_age(Some(MinimumReleaseAge {
+                    minutes,
+                    ..Default::default()
+                }));
+            let mut manifest = PackageJson::default();
+            manifest.dependencies.insert(name.clone(), range);
+            let graph = resolver.resolve(&manifest, None).await.expect("resolve");
+            (graph, base)
+        }
+    };
+
+    // Sanity: the bundled `generated_at` must be in the past relative to a
+    // 24h-ago cutoff (i.e. the binary is "older than a day"). If a brand
+    // new build is under test (generated_at within the last day), the
+    // legacy gate wouldn't fire yet — skip honestly rather than assert a
+    // false negative.
+    let day_ago = MinimumReleaseAge {
+        minutes: 1440,
+        ..Default::default()
+    }
+    .cutoff()
+    .unwrap();
+    if crate::primer::covers_cutoff(&day_ago) {
+        // Binary built within the last 24h — self-disable not yet active.
+        return;
+    }
+
+    // (A) Fresh-binary simulation: 10-year window → cutoff far in the past
+    // → covers_cutoff TRUE → primer serves → ZERO registry hits.
+    // The pick-path determines which version is chosen (primer slice vs
+    // mock registry), so we measure *only* the hit count, not the version.
+    let (reg_a, hits_a, srv_a) = spawn_counting_registry(make_full());
+    let (graph_a, base_a) = run(10 * 365 * 24 * 60, temp_base("fresh"), reg_a).await;
+    srv_a.abort();
+    assert!(
+        graph_has_package_named(&graph_a, &name),
+        "fresh-window resolve did not resolve {name} at all"
+    );
+    let fresh_hits = hits_a.load(Ordering::Relaxed);
+
+    // (B) Aged-binary simulation, legacy gate (pick-gate OFF — the default
+    // in the test process unless AUBE_PRIMER_PICK_GATE is set): 24h window
+    // → cutoff is AFTER generated_at → covers_cutoff FALSE → primer
+    // SKIPPED → a registry hit. This is the self-disable.
+    let (reg_b, hits_b, srv_b) = spawn_counting_registry(make_full());
+    let (graph_b, base_b) = run(1440, temp_base("aged"), reg_b).await;
+    srv_b.abort();
+    assert!(
+        graph_has_package_named(&graph_b, &name),
+        "aged-window resolve did not resolve {name} at all"
+    );
+    let aged_hits = hits_b.load(Ordering::Relaxed);
+
+    let _ = std::fs::remove_dir_all(base_a);
+    let _ = std::fs::remove_dir_all(base_b);
+
+    if crate::primer::pick_gate_enabled() {
+        // Evergreen path: with the pick-gate on, a FROZEN pick is served
+        // from the primer even under the aged cutoff — no registry hit,
+        // same as the fresh case.
+        assert_eq!(
+            fresh_hits, 0,
+            "fresh window should serve the frozen pick from the primer"
+        );
+        assert_eq!(
+            aged_hits, 0,
+            "AUBE_PRIMER_PICK_GATE on: aged binary must STILL serve the \
+             frozen pick offline (evergreen), but the registry was hit"
+        );
+    } else {
+        // Legacy path: the fresh case is offline; the aged case falls
+        // back to the network — the regression, proven by hit count.
+        assert_eq!(
+            fresh_hits, 0,
+            "fresh window should serve the pick from the primer (0 hits)"
+        );
+        assert!(
+            aged_hits >= 1,
+            "legacy gate: aged binary (>24h) must self-disable the primer \
+             and hit the registry, but saw {aged_hits} hits"
+        );
+    }
+}
+
+/// Measurement (not a regression — `#[ignore]` so CI skips it): of the
+/// bundled primer's entries, what fraction of `latest`-tag picks are
+/// FROZEN — i.e. a strictly-newer stable version already exists past the
+/// pick, so the resolution is immutable and stays correct no matter how
+/// old the binary is. Run with `cargo test -p aube-resolver
+/// primer_frozen_fraction -- --ignored --nocapture` to print the split.
+///
+/// Note: `latest`-tag picks under-report the frozen fraction, because the
+/// latest tag is by definition near the live frontier. A realistic cold
+/// install resolves *caret ranges that pin older lines*, which the
+/// pick-gate classifies as frozen far more often. This number is a
+/// conservative floor on how much permanently-valid data the 24h cutoff
+/// throws away.
+#[test]
+#[ignore = "measurement, not a regression"]
+fn primer_frozen_fraction() {
+    use crate::semver_util::{Regime, classify_regime};
+
+    // (1) `latest`-tag proxy — the live-frontier pick. A FLOOR on the
+    // frozen fraction: latest is by definition near `Current`, so this
+    // badly under-counts what a real install (resolving caret ranges that
+    // pin older lines) classifies as frozen.
+    let (mut lh, mut ls, mut lc, mut lt) = (0u32, 0u32, 0u32, 0u32);
+    // (2) Every stable version in every primer slice, classified against
+    // its own packument. This is the population a cold install draws from
+    // when its lockfile / caret ranges pin historical lines — the realistic
+    // shape. Each version is one would-be primer pick.
+    let (mut ah, mut as_, mut ac, mut at) = (0u32, 0u32, 0u32, 0u32);
+    for name in crate::primer::names() {
+        let Some(pkt) = crate::primer::get(name).map(|s| s.packument()) else {
+            continue;
+        };
+        if let Some(latest) = pkt.dist_tags.get("latest") {
+            lt += 1;
+            match classify_regime(&pkt, latest) {
+                Regime::HardFrozen => lh += 1,
+                Regime::SoftFrozen => ls += 1,
+                Regime::Current => lc += 1,
+            }
+        }
+        for ver in pkt.versions.keys() {
+            // Skip prereleases: caret ranges don't resolve to them.
+            if node_semver::Version::parse(ver).is_ok_and(|v| !v.pre_release.is_empty()) {
+                continue;
+            }
+            at += 1;
+            match classify_regime(&pkt, ver) {
+                Regime::HardFrozen => ah += 1,
+                Regime::SoftFrozen => as_ += 1,
+                Regime::Current => ac += 1,
+            }
+        }
+    }
+    let lfrozen = lh + ls;
+    let afrozen = ah + as_;
+    eprintln!(
+        "[latest-tag, FLOOR] {lt} pkgs: HardFrozen={lh} SoftFrozen={ls} \
+         Current={lc} => frozen={lfrozen} ({:.1}%)",
+        100.0 * f64::from(lfrozen) / f64::from(lt.max(1)),
+    );
+    eprintln!(
+        "[all-stable-versions, realistic] {at} versions: HardFrozen={ah} \
+         SoftFrozen={as_} Current={ac} => frozen(immutable)={afrozen} \
+         ({:.1}%), current(live)={ac} ({:.1}%)",
+        100.0 * f64::from(afrozen) / f64::from(at.max(1)),
+        100.0 * f64::from(ac) / f64::from(at.max(1)),
+    );
+}
+
 /// Regression: a primer hit must not poison the full-packument cache with
 /// the registry's validators. The bundled primer is a *truncated* slice
 /// (newest `version_cap` versions) but carries the full document's real
@@ -1411,6 +1706,10 @@ fn graph_has_package(graph: &LockfileGraph, name: &str, version: &str) -> bool {
         .packages
         .values()
         .any(|pkg| pkg.name == name && pkg.version == version)
+}
+
+fn graph_has_package_named(graph: &LockfileGraph, name: &str) -> bool {
+    graph.packages.values().any(|pkg| pkg.name == name)
 }
 
 // Regression guard for the cycle-break branch in `visit_peer_context`

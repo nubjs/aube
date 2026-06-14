@@ -170,6 +170,22 @@ pub struct Embedder {
     ///
     /// [`read_branded_pnpm_config`]: crate::engine_context::EngineContext::read_branded_pnpm_config
     pub read_branded_settings_env: bool,
+    /// When `true`, the offline metadata primer's freshness is gated at the
+    /// *pick* site (per resolved-version regime) instead of the legacy
+    /// per-name *fetch* site. The legacy fetch-time gate keys freshness on the
+    /// primer's build date, so under time-aware resolution (`minimumReleaseAge`
+    /// / `trustPolicy=NoDowngrade`) the moving cutoff overtakes the build date
+    /// ~24h post-build and the primer self-disables — turning a warm
+    /// cold-install all-network. The pick-site gate serves a *frozen* pick
+    /// (settled, immutable history) from the primer indefinitely while keeping
+    /// the freshness refetch for a *live-frontier* pick; cooling is still
+    /// enforced inside `pick_version` against the primer's own `time` map, so
+    /// security posture is unchanged. `false` (aube's default) is the legacy
+    /// fetch-site behavior, byte-for-byte. An embedder that ships an "evergreen
+    /// primer" (nub) sets this `true`. The `AUBE_PRIMER_PICK_GATE` env var
+    /// overrides this default in either direction. Embedder-fixed: it's the
+    /// host's call, not the user's, and it doesn't vary per project.
+    pub primer_evergreen: bool,
 }
 
 /// Standalone aube's embedder profile. Reproduces every hardcoded branding
@@ -196,6 +212,7 @@ pub const AUBE: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: false,
     read_branded_settings_env: true,
+    primer_evergreen: false,
 };
 
 static ACTIVE: OnceLock<&'static Embedder> = OnceLock::new();
@@ -287,5 +304,6 @@ mod tests {
         assert!(id.warm_store_verify);
         assert!(!id.no_churn_lockfile_write);
         assert!(id.read_branded_settings_env);
+        assert!(!id.primer_evergreen);
     }
 }

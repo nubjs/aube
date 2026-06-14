@@ -12,7 +12,9 @@
 
 use std::collections::BTreeMap;
 
-use aube_lockfile::{DepType, DirectDep, LockedPackage, LockfileGraph, LockfileKind, write_lockfile_as};
+use aube_lockfile::{
+    DepType, DirectDep, LockedPackage, LockfileGraph, LockfileKind, write_lockfile_as,
+};
 use aube_manifest::PackageJson;
 use aube_util::Embedder;
 
@@ -40,6 +42,7 @@ static NO_CHURN_TOOL: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: true,
     read_branded_settings_env: true,
+    primer_evergreen: false,
 };
 
 fn pkg(name: &str, version: &str, integrity: &str) -> LockedPackage {
@@ -176,7 +179,9 @@ fn guard_rewrites_when_only_patch_config_is_added() {
         "rewritten lockfile must record the patchedDependencies block:\n{written}"
     );
     assert!(
-        written.contains("(patch_hash=82ff0b4d1c20272cdb11684045f28947472d5b8a10a04c0d972102d14815e536)"),
+        written.contains(
+            "(patch_hash=82ff0b4d1c20272cdb11684045f28947472d5b8a10a04c0d972102d14815e536)"
+        ),
         "rewritten lockfile must stamp the (patch_hash=…) suffix:\n{written}"
     );
 
@@ -188,8 +193,9 @@ fn guard_rewrites_when_only_patch_config_is_added() {
     // the matching patch hash, so the two identities agree and the guard
     // suppresses the rewrite. (Parsing first is what the install pipeline
     // does — a hand-built graph isn't byte-faithful to a parsed one.)
-    let reparsed =
-        aube_lockfile::parse_lockfile_with_kind(dir.path(), &manifest).unwrap().0;
+    let reparsed = aube_lockfile::parse_lockfile_with_kind(dir.path(), &manifest)
+        .unwrap()
+        .0;
     write_lockfile_as(dir.path(), &reparsed, &manifest, LockfileKind::Pnpm).unwrap();
     assert_eq!(
         mtime(&path),
