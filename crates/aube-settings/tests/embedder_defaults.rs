@@ -19,6 +19,7 @@ fn ctx<'a>(
         user_aube_config: &[],
         user_npmrc: &[],
         workspace_yaml: ws,
+        global_config_yaml: aube_settings::values::empty_yaml_map(),
         env,
         cli: &[],
         embedder_defaults: embedder_defaults(),

@@ -127,10 +127,8 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
     }
     let xdg = aube_util::env::xdg_config_home();
     let home = home_dir();
-    let user_rc_override = std::env::var("NPM_CONFIG_USERCONFIG")
-        .ok()
-        .or_else(|| std::env::var("npm_config_userconfig").ok())
-        .and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
+    let user_rc_override =
+        userconfig_env_value().and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
     let tagged = load_npmrc_entries_tagged_with_home(
         home.as_deref(),
         xdg.as_deref(),
@@ -194,16 +192,15 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     // `XDG_CONFIG_HOME` and pick up whatever auth tokens live there.
     let xdg = aube_util::env::xdg_config_home();
     let home = home_dir();
-    // `NPM_CONFIG_USERCONFIG` / `npm_config_userconfig` relocate the
-    // user-level `.npmrc` (XDG layouts, `~/.config/npm/npmrc`, etc.).
-    // Read directly rather than collecting `std::env::vars()` — we
-    // only need these two keys, and confining the env read to the
-    // public entry point keeps `_with_home` fully injectable for
-    // tests.
-    let user_rc_override = std::env::var("NPM_CONFIG_USERCONFIG")
-        .ok()
-        .or_else(|| std::env::var("npm_config_userconfig").ok())
-        .and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
+    // `*_CONFIG_USERCONFIG` relocates the user-level `.npmrc` (XDG
+    // layouts, `~/.config/npm/npmrc`, etc.). Read directly rather than
+    // collecting `std::env::vars()` — we only need these keys, and
+    // confining the env read to the public entry point keeps
+    // `_with_home` fully injectable for tests. See
+    // [`userconfig_env_value`] for the spelling precedence and the
+    // pnpm-incumbent gate on the `PNPM_CONFIG_*` forms.
+    let user_rc_override =
+        userconfig_env_value().and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
     let entries = load_npmrc_entries_with_home(
         home.as_deref(),
         xdg.as_deref(),
@@ -362,40 +359,92 @@ pub(super) fn expand_userconfig_path(raw: &str, home: Option<&Path>) -> Option<P
     Some(PathBuf::from(trimmed))
 }
 
-/// Find the `NPM_CONFIG_USERCONFIG` / `npm_config_userconfig` value
-/// in a captured env slice and expand it. npm/pnpm accept both
-/// casings; the SCREAMING form is canonical so it wins when both are
-/// set. Positional ordering can't be the tiebreaker — the typical
-/// caller builds the slice from `std::env::vars()`, which iterates
-/// in HashMap order — so we pick explicitly by casing instead. This
-/// keeps [`NpmConfig::load_with_env`] agreeing with the direct
-/// `std::env::var` chain in [`load_npmrc_entries`], so generic
-/// settings and auth config can't resolve to different files on the
-/// same host.
+/// Spelling precedence for the `userconfig` relocation env var, highest
+/// first. pnpm's branded `PNPM_CONFIG_USERCONFIG` / `pnpm_config_userconfig`
+/// outrank the npm-compat `NPM_CONFIG_USERCONFIG` / `npm_config_userconfig`
+/// (matching pnpm v11's `readEnvVar` > `readNpmEnvVar` order), and within
+/// a family the SCREAMING form is canonical so it wins over the lowercase.
+///
+/// The pnpm-named entries carry an `incumbent_gated: true` flag: they
+/// ride the existing `read_branded_pnpm_config` posture — on-by-default
+/// for standalone aube (which IS a pnpm-compatible PM), gated to the
+/// pnpm-incumbent check under the nub profile (the pnpm-named-paths hard
+/// gate). The npm-compat entries are never gated.
+const USERCONFIG_ENV_SPELLINGS: &[(&str, bool)] = &[
+    ("PNPM_CONFIG_USERCONFIG", true),
+    ("pnpm_config_userconfig", true),
+    ("NPM_CONFIG_USERCONFIG", false),
+    ("npm_config_userconfig", false),
+];
+
+/// Whether a pnpm-named, incumbent-gated env spelling may be read. A
+/// pnpm-branded `userconfig` relocation is faithful mirroring of the
+/// active PM only when pnpm IS the incumbent; under any other incumbent
+/// it's another tool's state and is skipped.
+fn pnpm_branded_env_enabled() -> bool {
+    aube_util::engine_context().read_branded_pnpm_config
+}
+
+/// Read the highest-precedence `*_CONFIG_USERCONFIG` value from the
+/// process environment, honoring [`USERCONFIG_ENV_SPELLINGS`] and the
+/// pnpm-incumbent gate. Returns the raw (unexpanded) value.
+fn userconfig_env_value() -> Option<String> {
+    for (name, incumbent_gated) in USERCONFIG_ENV_SPELLINGS {
+        if *incumbent_gated && !pnpm_branded_env_enabled() {
+            continue;
+        }
+        if let Ok(v) = std::env::var(name) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Find the highest-precedence `*_CONFIG_USERCONFIG` value in a captured
+/// env slice and expand it, honoring [`USERCONFIG_ENV_SPELLINGS`] and
+/// the pnpm-incumbent gate. Positional ordering in the slice can't be
+/// the tiebreaker — the typical caller builds it from
+/// `std::env::vars()`, which iterates in HashMap order — so we pick by
+/// the declared spelling precedence instead. This keeps
+/// [`NpmConfig::load_with_env`] agreeing with the direct `std::env::var`
+/// chain in [`load_npmrc_entries`], so generic settings and auth config
+/// can't resolve to different files on the same host.
 pub(super) fn userconfig_override_from_env(
     env: &[(String, String)],
     home: Option<&Path>,
 ) -> Option<PathBuf> {
-    let raw = env
-        .iter()
-        .find(|(name, _)| name == "NPM_CONFIG_USERCONFIG")
-        .or_else(|| env.iter().find(|(name, _)| name == "npm_config_userconfig"))?;
-    expand_userconfig_path(&raw.1, home)
+    for (spelling, incumbent_gated) in USERCONFIG_ENV_SPELLINGS {
+        if *incumbent_gated && !pnpm_branded_env_enabled() {
+            continue;
+        }
+        if let Some((_, raw)) = env.iter().find(|(name, _)| name == spelling) {
+            return expand_userconfig_path(raw, home);
+        }
+    }
+    None
 }
 pub(super) fn home_dir() -> Option<PathBuf> {
     aube_util::env::home_dir()
 }
 
-/// Resolve the path to pnpm's global auth file. When an explicit
-/// `xdg_config_home` is supplied (production reads it from
-/// `$XDG_CONFIG_HOME` in [`load_npmrc_entries`]; tests pass an
-/// injected override or `None`), the file lives at
-/// `<xdg>/pnpm/auth.ini`. Otherwise it falls back to
-/// `<home>/.config/pnpm/auth.ini`, matching pnpm's default layout
-/// on Linux and the README's documented path.
+/// Resolve the path to pnpm's global auth file: `<configDir>/auth.ini`,
+/// where `configDir` is pnpm's per-OS config directory
+/// ([`aube_util::env::pnpm_config_dir_with`]). When `xdg_config_home` is
+/// supplied (production reads it from `$XDG_CONFIG_HOME` in
+/// [`load_npmrc_entries`]; tests inject an override or `None`) the file
+/// lives at `<xdg>/pnpm/auth.ini` on every OS; otherwise it follows the
+/// platform default — macOS `~/Library/Preferences/pnpm`, Windows
+/// `%LOCALAPPDATA%\pnpm\config`, Linux `~/.config/pnpm`. A flat
+/// `~/.config/pnpm` is correct only on Linux, so the previous
+/// home-joined fallback read the wrong location on a stock macOS or
+/// Windows box and silently missed the user's `auth.ini` there.
 fn pnpm_global_auth_ini_path(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
-    let config_root = xdg_config_home
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    config_root.join("pnpm").join("auth.ini")
+    let config_dir = aube_util::env::pnpm_config_dir_with(Some(home), xdg_config_home)
+        // `home` is always `Some` at every call site (guarded by
+        // `if let Some(home) = home`), so the helper only returns `None`
+        // when both home and XDG are absent — impossible here. Keep a
+        // defined fallback rather than unwrap so a future caller change
+        // can't panic.
+        .unwrap_or_else(|| home.join(".config").join("pnpm"));
+    config_dir.join("auth.ini")
 }

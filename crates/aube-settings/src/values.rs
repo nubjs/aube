@@ -77,6 +77,19 @@ pub struct ResolveCtx<'a> {
     /// `aube-workspace.yaml`, as returned by
     /// `aube_manifest::workspace::load_raw`.
     pub workspace_yaml: &'a std::collections::BTreeMap<String, yaml_serde::Value>,
+    /// Raw top-level map from pnpm's *global* `config.yaml`
+    /// (`<configDir>/config.yaml`, pnpm v11), parsed with the same YAML
+    /// reader pnpm uses for the workspace manifest and consulted through
+    /// the same `*_from_workspace_yaml` helpers (camelCase keys). It is a
+    /// GLOBAL / user-scope source: by the default precedence it ranks
+    /// below the project-root `workspace_yaml` (a project
+    /// `pnpm-workspace.yaml` overrides the user's global `config.yaml`,
+    /// matching pnpm v11) and above the user `.npmrc` / aube config.
+    /// Populated under the existing `read_branded_pnpm_config` posture
+    /// — on-by-default for standalone aube (which IS a pnpm-compatible
+    /// PM), gated to the pnpm-incumbent check under the nub profile (the
+    /// pnpm-named-paths hard gate); [`empty_yaml_map`] otherwise.
+    pub global_config_yaml: &'a std::collections::BTreeMap<String, yaml_serde::Value>,
     /// Captured environment variables relevant to settings. In
     /// production this is populated by [`capture_env`]; tests build a
     /// literal slice. `sources.env` alias order defines priority; within
@@ -117,6 +130,10 @@ impl<'a> ResolveCtx<'a> {
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml,
+            // No global config.yaml on the reduced files-only path — these
+            // callers (lockfile/workspace readers) resolve project-shaped
+            // settings, not the user's global pnpm config.
+            global_config_yaml: empty_yaml_map(),
             env: &[],
             cli: &[],
             // Process-global embedder defaults still apply on this reduced
@@ -125,6 +142,15 @@ impl<'a> ResolveCtx<'a> {
             embedder_defaults: embedder_defaults(),
         }
     }
+}
+
+/// A shared, empty `pnpm-workspace.yaml`-shaped map. Returned as the
+/// default for `ResolveCtx::global_config_yaml` (and any other
+/// yaml-map source) when the source is absent — lets construction sites
+/// and tests fill the field without allocating a throwaway `BTreeMap`.
+pub fn empty_yaml_map() -> &'static std::collections::BTreeMap<String, yaml_serde::Value> {
+    static EMPTY: OnceLock<std::collections::BTreeMap<String, yaml_serde::Value>> = OnceLock::new();
+    EMPTY.get_or_init(std::collections::BTreeMap::new)
 }
 
 /// Embedder-supplied setting defaults, registered once at startup by an
@@ -189,6 +215,7 @@ pub fn process_env() -> &'static [(String, String)] {
 ///     > project_aube_config (<cwd>/.config/aube/config.toml)
 ///     > project_npmrc       (<cwd>/.npmrc + npmrcAuthFile)
 ///     > workspace_yaml      (pnpm-workspace.yaml / aube-workspace.yaml)
+///     > global_config_yaml  (<configDir>/config.yaml, pnpm v11, pnpm-incumbent only)
 ///     > user_aube_config    (~/.config/aube/config.toml)
 ///     > user_npmrc          (~/.npmrc + pnpm auth.ini)
 /// ```
@@ -922,6 +949,41 @@ mod tests {
     }
 
     #[test]
+    fn env_resolves_synthesized_pnpm_config_family() {
+        // build.rs auto-synthesizes `pnpm_config_<x>` / `PNPM_CONFIG_<X>`
+        // from each declared `npm_config_<x>` / `NPM_CONFIG_<X>` alias, so
+        // pnpm v11's general-settings env family resolves with no
+        // per-setting edit in settings.toml. Default engine context has
+        // `read_branded_pnpm_config = true`, so the pnpm-named family is
+        // honored (the pnpm-incumbent gate; off-incumbent coverage lives
+        // in the gate's own unit test in aube-util).
+        let lower = vec![(
+            "pnpm_config_auto_install_peers".to_string(),
+            "false".to_string(),
+        )];
+        assert_eq!(bool_from_env("autoInstallPeers", &lower), Some(false));
+        let upper = vec![(
+            "PNPM_CONFIG_AUTO_INSTALL_PEERS".to_string(),
+            "true".to_string(),
+        )];
+        assert_eq!(bool_from_env("autoInstallPeers", &upper), Some(true));
+    }
+
+    #[test]
+    fn pnpm_config_env_outranks_npm_config_env() {
+        // pnpm's own resolution prefers `pnpm_config_*` over the
+        // npm-compat `npm_config_*` fallback. build.rs orders the
+        // synthesized pnpm alias after the npm alias it derives from, and
+        // `raw_from_env` walks aliases in reverse, so the pnpm spelling
+        // wins when both are present.
+        let env = entries(&[
+            ("npm_config_auto_install_peers", "false"),
+            ("pnpm_config_auto_install_peers", "true"),
+        ]);
+        assert_eq!(bool_from_env("autoInstallPeers", &env), Some(true));
+    }
+
+    #[test]
     fn cli_bag_resolves_resolution_mode_string() {
         // `resolutionMode` is a quoted-union (string) setting with a
         // `sources.cli = ["resolution-mode"]` declaration.
@@ -993,6 +1055,7 @@ mod tests {
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
             env: &env,
             cli: &cli,
             embedder_defaults: &[],
@@ -1015,6 +1078,7 @@ mod tests {
             user_aube_config: &aube_config,
             user_npmrc: &npmrc,
             workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
             env: &env,
             cli: &[],
             embedder_defaults: &[],
@@ -1037,6 +1101,7 @@ mod tests {
             user_aube_config: &aube_config,
             user_npmrc: &[],
             workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
             env: &[],
             cli: &[],
             embedder_defaults: &[],
@@ -1050,6 +1115,7 @@ mod tests {
             user_aube_config: &aube_config,
             user_npmrc: &[],
             workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
             env: &[],
             cli: &[],
             embedder_defaults: &[],
@@ -1074,6 +1140,7 @@ mod tests {
             user_aube_config: &user_aube_config,
             user_npmrc: &user_npmrc,
             workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
             env: &[],
             cli: &[],
             embedder_defaults: &[],
@@ -1098,6 +1165,7 @@ mod tests {
             user_aube_config: &user_aube_config,
             user_npmrc: &[],
             workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
             env: &[],
             cli: &[],
             embedder_defaults: &[],
@@ -1122,6 +1190,7 @@ mod tests {
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
             env: &[],
             cli: &[],
             embedder_defaults: &[],
@@ -1149,6 +1218,7 @@ mod tests {
             user_aube_config: &user_aube_config,
             user_npmrc: &user_npmrc,
             workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
             env: &[],
             cli: &[],
             embedder_defaults: &[],
@@ -1303,6 +1373,81 @@ mod tests {
             std::collections::BTreeMap::new();
         let ctx = ResolveCtx::files_only(&npmrc, &ws);
         assert_eq!(resolved::prefer_frozen_lockfile(&ctx), Some(false));
+    }
+
+    #[test]
+    fn global_config_yaml_reads_string_setting() {
+        // pnpm v11's global `config.yaml` is consulted through the same
+        // `*_from_workspace_yaml` helpers (camelCase keys). A `storeDir`
+        // set only in config.yaml must resolve when no higher source
+        // speaks.
+        let ws = BTreeMap::new();
+        let cfg = raw_yaml("storeDir: /tmp/from-global-config\n");
+        let ctx = ResolveCtx {
+            project_aube_config: &[],
+            project_npmrc: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: &cfg,
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(
+            resolved::store_dir(&ctx),
+            Some("/tmp/from-global-config".to_string())
+        );
+    }
+
+    #[test]
+    fn project_workspace_yaml_outranks_global_config_yaml() {
+        // Precedence: the project-root `pnpm-workspace.yaml` overrides the
+        // user's global `config.yaml` (matching pnpm v11, where the
+        // project workspace manifest is applied after the global config).
+        let ws = raw_yaml("storeDir: /tmp/from-project-ws\n");
+        let cfg = raw_yaml("storeDir: /tmp/from-global-config\n");
+        let ctx = ResolveCtx {
+            project_aube_config: &[],
+            project_npmrc: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: &cfg,
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(
+            resolved::store_dir(&ctx),
+            Some("/tmp/from-project-ws".to_string()),
+            "project pnpm-workspace.yaml must win over global config.yaml"
+        );
+    }
+
+    #[test]
+    fn global_config_yaml_outranks_user_npmrc() {
+        // The global config.yaml ranks above user-scope sources: a value
+        // in config.yaml beats the same key left in `~/.npmrc`.
+        let user_npmrc = entries(&[("store-dir", "/tmp/from-user-npmrc")]);
+        let cfg = raw_yaml("storeDir: /tmp/from-global-config\n");
+        let ws = BTreeMap::new();
+        let ctx = ResolveCtx {
+            project_aube_config: &[],
+            project_npmrc: &[],
+            user_aube_config: &[],
+            user_npmrc: &user_npmrc,
+            workspace_yaml: &ws,
+            global_config_yaml: &cfg,
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(
+            resolved::store_dir(&ctx),
+            Some("/tmp/from-global-config".to_string()),
+            "global config.yaml must win over user .npmrc"
+        );
     }
 
     #[test]

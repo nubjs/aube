@@ -1279,7 +1279,12 @@ fn pnpm_global_auth_ini_loads_and_overrides_user_rc() {
         "//registry.example.com/:_authToken=stale-npmrc\n",
     )
     .unwrap();
-    let auth_ini = home_dir.path().join(".config/pnpm/auth.ini");
+    // Place auth.ini at pnpm's per-OS config dir (no XDG override), not a
+    // flat `~/.config/pnpm` — the latter is correct only on Linux, so the
+    // file must land where `pnpm_config_dir_with` resolves on the test host.
+    let auth_ini = aube_util::env::pnpm_config_dir_with(Some(home_dir.path()), None)
+        .unwrap()
+        .join("auth.ini");
     std::fs::create_dir_all(auth_ini.parent().unwrap()).unwrap();
     std::fs::write(
         &auth_ini,
@@ -1349,7 +1354,9 @@ fn pnpm_global_auth_ini_loses_to_project_npmrc() {
     let home_dir = tempfile::tempdir().unwrap();
     let proj_dir = tempfile::tempdir().unwrap();
 
-    let auth_ini = home_dir.path().join(".config/pnpm/auth.ini");
+    let auth_ini = aube_util::env::pnpm_config_dir_with(Some(home_dir.path()), None)
+        .unwrap()
+        .join("auth.ini");
     std::fs::create_dir_all(auth_ini.parent().unwrap()).unwrap();
     std::fs::write(
         &auth_ini,
@@ -1389,7 +1396,11 @@ fn pnpm_global_auth_ini_not_read_when_gate_disabled() {
         "//registry.example.com/:_authToken=npmrc-token\n",
     )
     .unwrap();
-    let auth_ini = home_dir.path().join(".config/pnpm/auth.ini");
+    // Per-OS config dir (no XDG override), so the fixture matches where
+    // `pnpm_global_auth_ini_path` looks on the test host.
+    let auth_ini = aube_util::env::pnpm_config_dir_with(Some(home_dir.path()), None)
+        .unwrap()
+        .join("auth.ini");
     std::fs::create_dir_all(auth_ini.parent().unwrap()).unwrap();
     std::fs::write(
         &auth_ini,

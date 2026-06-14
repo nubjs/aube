@@ -20,9 +20,30 @@
 #   sources.cli   = CLI flags that set this setting (list, may be empty)
 #   sources.env   = env vars that set this setting (list, may be empty;
 #                   later aliases have higher priority; npm-compat aliases
-#                   come before AUBE_* so tool-specific env can override)
+#                   come before AUBE_* so tool-specific env can override).
+#                   build.rs auto-synthesizes the pnpm-compat family from
+#                   each declared npm_config_* / NPM_CONFIG_* alias:
+#                   pnpm_config_* and PNPM_CONFIG_* (pnpm v11's general
+#                   settings env), ranked above the npm_config_* family.
+#                   The pnpm-named family rides the existing
+#                   read_branded_pnpm_config posture: on-by-default for
+#                   standalone aube (a pnpm-compatible PM), gated to the
+#                   pnpm-incumbent check under the nub profile.
 #   sources.npmrc = .npmrc keys (list, may be empty)
-#   sources.workspaceYaml = pnpm-workspace.yaml keys (list, may be empty)
+#   sources.workspaceYaml = pnpm-workspace.yaml keys (list, may be empty).
+#                   The SAME keys are also read from pnpm's GLOBAL
+#                   config.yaml (<configDir>/config.yaml, pnpm v11), which
+#                   resolves through the workspace-yaml helpers but slots
+#                   below the project pnpm-workspace.yaml and above user
+#                   .npmrc. configDir is pnpm's per-OS dir
+#                   ($XDG_CONFIG_HOME/pnpm, macOS ~/Library/Preferences/pnpm,
+#                   Windows %LOCALAPPDATA%\pnpm\config, Linux ~/.config/pnpm).
+#                   Rides the read_branded_pnpm_config posture (on-by-default
+#                   for standalone aube, pnpm-incumbent-gated under nub).
+#                   NOTE: pnpm's BUILTIN npmrc (baked
+#                   into a customized pnpm binary) is an accepted divergence
+#                   — aube's compiled-in defaults (npmjs registry + @jsr)
+#                   are its equivalent of that layer.
 #   examples      = optional list of concrete invocations
 #   npmShared     = bool. Marks a key that npm (and yarn) also read
 #                   from `.npmrc`. Set on settings where aube's

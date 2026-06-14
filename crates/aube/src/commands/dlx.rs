@@ -603,6 +603,7 @@ mod tests {
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &empty_workspace,
+            global_config_yaml: &empty_workspace,
             env: &empty_env,
             cli: &opts.cli_flags,
             embedder_defaults: &[],

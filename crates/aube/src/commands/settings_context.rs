@@ -110,15 +110,19 @@ pub(crate) fn global_output_flags() -> GlobalOutputFlags {
     GLOBAL_OUTPUT.get().copied().unwrap_or_default()
 }
 
-/// Owned bundle of the four file-source slices that feed a
-/// [`aube_settings::ResolveCtx`]: project + user `.npmrc`, and project +
-/// user `~/.config/aube/config.toml`. Construct once with
-/// `FileSources::load`, borrow into a `ResolveCtx` via `FileSources::ctx`.
+/// Owned bundle of the file-source inputs that feed a
+/// [`aube_settings::ResolveCtx`]: project + user `.npmrc`, project +
+/// user `~/.config/aube/config.toml`, and pnpm's global `config.yaml`.
+/// Construct once with `FileSources::load`, borrow into a `ResolveCtx`
+/// via `FileSources::ctx`.
 pub(crate) struct FileSources {
     pub user_npmrc: Vec<(String, String)>,
     pub project_npmrc: Vec<(String, String)>,
     pub user_aube_config: Vec<(String, String)>,
     pub project_aube_config: Vec<(String, String)>,
+    /// pnpm's global `config.yaml` (`<configDir>/config.yaml`, pnpm v11),
+    /// or an empty map when pnpm isn't the incumbent / no file exists.
+    pub global_config_yaml: std::collections::BTreeMap<String, yaml_serde::Value>,
 }
 
 impl FileSources {
@@ -129,6 +133,7 @@ impl FileSources {
             project_npmrc: npmrc.project,
             user_aube_config: config::load_user_aube_config_entries(),
             project_aube_config: config::load_project_aube_config_entries(cwd),
+            global_config_yaml: load_global_config_yaml(),
         }
     }
 
@@ -144,11 +149,45 @@ impl FileSources {
             user_aube_config: &self.user_aube_config,
             user_npmrc: &self.user_npmrc,
             workspace_yaml,
+            global_config_yaml: &self.global_config_yaml,
             env,
             cli,
             embedder_defaults: aube_settings::embedder_defaults(),
         }
     }
+}
+
+/// Load pnpm's global `config.yaml` (`<configDir>/config.yaml`, pnpm
+/// v11) into the raw `pnpm-workspace.yaml`-shaped map the settings
+/// resolver reads through its `*_from_workspace_yaml` helpers.
+///
+/// `configDir` is pnpm's per-OS config directory
+/// ([`aube_util::env::pnpm_config_dir`]) — `$XDG_CONFIG_HOME/pnpm`, else
+/// macOS `~/Library/Preferences/pnpm`, Windows
+/// `%LOCALAPPDATA%\pnpm\config`, Linux `~/.config/pnpm`.
+///
+/// `config.yaml` is a pnpm-NAMED global file, so the pnpm-named-paths
+/// hard gate applies: it is read ONLY when pnpm is the provable
+/// incumbent (`engine_context().read_branded_pnpm_config`). Under any
+/// non-pnpm incumbent it's another tool's state and an empty map is
+/// returned. A missing/empty/unparseable file is also an empty map —
+/// global config is best-effort and must never fail a command.
+pub(crate) fn load_global_config_yaml() -> std::collections::BTreeMap<String, yaml_serde::Value> {
+    let empty = std::collections::BTreeMap::new;
+    if !aube_util::engine_context().read_branded_pnpm_config {
+        return empty();
+    }
+    let Some(config_dir) = aube_util::env::pnpm_config_dir() else {
+        return empty();
+    };
+    let path = config_dir.join("config.yaml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return empty();
+    };
+    if content.trim().is_empty() {
+        return empty();
+    }
+    aube_manifest::parse_yaml(&path, content).unwrap_or_else(|_| empty())
 }
 
 /// Compute the `FrozenMode` a chained install (`add`, `remove`,
@@ -628,6 +667,7 @@ mod resolve_virtual_store_dir_tests {
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: ws,
+            global_config_yaml: aube_settings::values::empty_yaml_map(),
             env,
             cli: &[],
             embedder_defaults: &[],
@@ -702,6 +742,7 @@ mod default_lockfile_kind_tests {
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: ws,
+            global_config_yaml: aube_settings::values::empty_yaml_map(),
             env: &[],
             cli: &[],
             embedder_defaults: &[],

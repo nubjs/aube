@@ -32,6 +32,22 @@ pub fn branded_env_alias_enabled(alias: &str) -> bool {
     if alias.starts_with("npm_config_") || alias.starts_with("NPM_CONFIG_") {
         return true;
     }
+    // pnpm-compat family (`pnpm_config_*` / `PNPM_CONFIG_*`). pnpm v11
+    // reads its general settings from this env family, and an embedder
+    // whose active package manager IS pnpm mirrors that — reading the
+    // active PM's own env is faithful mirroring, not a brand leak. But
+    // the family is pnpm-NAMED, so the pnpm-named-paths hard gate
+    // applies: it rides the existing `read_branded_pnpm_config` posture
+    // — on-by-default for standalone aube (which IS a pnpm-compatible
+    // PM), gated to the pnpm-incumbent check under the nub profile. Under
+    // a non-pnpm incumbent these vars are another tool's state and are
+    // skipped —
+    // and `looks_branded` would otherwise misclassify the lowercase
+    // form as a neutral var and always read it, so the gate must live
+    // here, ahead of that check.
+    if alias.starts_with("pnpm_config_") || alias.starts_with("PNPM_CONFIG_") {
+        return crate::engine_context().read_branded_pnpm_config;
+    }
     // Bare external/neutral vars — not part of any tool's brand family.
     if !looks_branded(alias) {
         return true;
@@ -132,13 +148,14 @@ pub fn parse_primer_ttl(value: Option<&str>) -> Option<Option<std::time::Duratio
         return None;
     }
     let lower = raw.to_ascii_lowercase();
-    if matches!(lower.as_str(), "0" | "unlimited" | "inf" | "infinite" | "never") {
+    if matches!(
+        lower.as_str(),
+        "0" | "unlimited" | "inf" | "infinite" | "never"
+    ) {
         return Some(None);
     }
     // Split a trailing alphabetic unit off the leading numeric magnitude.
-    let split = raw
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(raw.len());
+    let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
     let (num, unit) = raw.split_at(split);
     let n: u64 = num.parse().ok()?;
     let secs = match unit.trim().to_ascii_lowercase().as_str() {
@@ -185,6 +202,113 @@ pub fn xdg_data_home() -> Option<PathBuf> {
 
 pub fn xdg_cache_home() -> Option<PathBuf> {
     non_empty_path_var("XDG_CACHE_HOME")
+}
+
+/// Read `%LOCALAPPDATA%` (the Windows per-user, machine-local app-data
+/// root, e.g. `C:\Users\me\AppData\Local`). Empty/whitespace values are
+/// treated as unset. pnpm's directory layout uses this as the base for
+/// its config / cache / data / state dirs on Windows when no XDG
+/// override is present; mirror that here so [`pnpm_config_dir`] resolves
+/// to the same place pnpm itself does.
+pub fn local_app_data() -> Option<PathBuf> {
+    non_empty_path_var("LOCALAPPDATA")
+}
+
+/// Resolve pnpm's per-user *config* directory the same way pnpm's
+/// `getConfigDir` does (`@pnpm/config.reader`'s `dirs.ts`):
+///
+/// 1. `$XDG_CONFIG_HOME/pnpm` when `XDG_CONFIG_HOME` is set (every OS);
+/// 2. macOS → `~/Library/Preferences/pnpm`;
+/// 3. non-Windows (Linux/other) → `~/.config/pnpm`;
+/// 4. Windows → `%LOCALAPPDATA%\pnpm\config` when `LOCALAPPDATA` is set,
+///    else `~/.config/pnpm`.
+///
+/// This is the directory that holds pnpm's global `config.yaml` (pnpm
+/// v11) and its global `auth.ini`. The platform branches matter: a flat
+/// `~/.config/pnpm` is correct only on Linux — on a stock macOS or
+/// Windows box pnpm's config lives elsewhere, so reading the flat path
+/// there silently misses the user's real global config.
+///
+/// Returns `None` only when neither an XDG override nor a home directory
+/// can be determined — callers then have no global config dir to read.
+///
+/// `home` and `xdg_config_home` are injected (not read from the
+/// environment here) so tests can pin a tempdir without mutating
+/// process-wide env; production callers pass [`home_dir`] /
+/// [`xdg_config_home`]. Only `LOCALAPPDATA` is read env-direct — it has
+/// no per-call override site today and a defined non-env fallback
+/// (`~/.config/pnpm`).
+pub fn pnpm_config_dir_with(
+    home: Option<&std::path::Path>,
+    xdg_config_home: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home {
+        return Some(xdg.join("pnpm"));
+    }
+    let home = home?;
+    if cfg!(target_os = "macos") {
+        return Some(home.join("Library").join("Preferences").join("pnpm"));
+    }
+    if cfg!(windows) {
+        if let Some(local) = local_app_data() {
+            return Some(local.join("pnpm").join("config"));
+        }
+        return Some(home.join(".config").join("pnpm"));
+    }
+    Some(home.join(".config").join("pnpm"))
+}
+
+/// [`pnpm_config_dir_with`] using the process `$HOME` /
+/// `$XDG_CONFIG_HOME` (via [`home_dir`] / [`xdg_config_home`]).
+/// Production entry point; tests prefer the `_with` form to stay
+/// hermetic.
+pub fn pnpm_config_dir() -> Option<PathBuf> {
+    pnpm_config_dir_with(home_dir().as_deref(), xdg_config_home().as_deref())
+}
+
+#[cfg(test)]
+mod pnpm_config_dir_tests {
+    use super::*;
+    use std::path::Path;
+
+    // These tests assert the *non-XDG* platform branch, so they must run
+    // with `XDG_CONFIG_HOME` unset. The suite runs serially
+    // (RUST_TEST_THREADS=1), and no other test in this crate sets
+    // `XDG_CONFIG_HOME`, so reading it env-direct is safe here. Guard
+    // anyway: if a developer's shell exports it, skip the platform-branch
+    // assertion rather than fail spuriously.
+    #[test]
+    fn xdg_override_wins_on_every_platform() {
+        let xdg = Path::new("/custom/xdg");
+        assert_eq!(
+            pnpm_config_dir_with(Some(Path::new("/home/tester")), Some(xdg)),
+            Some(xdg.join("pnpm")),
+            "an explicit XDG_CONFIG_HOME points the config dir at <xdg>/pnpm regardless of OS"
+        );
+    }
+
+    #[test]
+    fn resolves_per_os_config_dir_without_xdg() {
+        let home = Path::new("/home/tester");
+        let got = pnpm_config_dir_with(Some(home), None).expect("home given");
+        let expected = if cfg!(target_os = "macos") {
+            home.join("Library").join("Preferences").join("pnpm")
+        } else if cfg!(windows) {
+            // On a Windows test host LOCALAPPDATA is normally set; accept
+            // either the LOCALAPPDATA-rooted path or the `~/.config`
+            // fallback so the assertion holds regardless.
+            let local = local_app_data().map(|l| l.join("pnpm").join("config"));
+            local.unwrap_or_else(|| home.join(".config").join("pnpm"))
+        } else {
+            home.join(".config").join("pnpm")
+        };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn none_when_no_home_and_no_xdg() {
+        assert_eq!(pnpm_config_dir_with(None, None), None);
+    }
 }
 
 #[cfg(test)]
@@ -273,13 +397,68 @@ mod tests {
         assert_eq!(parse_primer_ttl(Some("INF")), Some(None));
         assert_eq!(parse_primer_ttl(Some("never")), Some(None));
         // Finite durations.
-        assert_eq!(parse_primer_ttl(Some("90")), Some(Some(Duration::from_secs(90))));
-        assert_eq!(parse_primer_ttl(Some("45m")), Some(Some(Duration::from_secs(45 * 60))));
-        assert_eq!(parse_primer_ttl(Some("720h")), Some(Some(Duration::from_secs(720 * 3600))));
-        assert_eq!(parse_primer_ttl(Some("30d")), Some(Some(Duration::from_secs(30 * 86_400))));
-        assert_eq!(parse_primer_ttl(Some(" 2w ")), Some(Some(Duration::from_secs(2 * 604_800))));
+        assert_eq!(
+            parse_primer_ttl(Some("90")),
+            Some(Some(Duration::from_secs(90)))
+        );
+        assert_eq!(
+            parse_primer_ttl(Some("45m")),
+            Some(Some(Duration::from_secs(45 * 60)))
+        );
+        assert_eq!(
+            parse_primer_ttl(Some("720h")),
+            Some(Some(Duration::from_secs(720 * 3600)))
+        );
+        assert_eq!(
+            parse_primer_ttl(Some("30d")),
+            Some(Some(Duration::from_secs(30 * 86_400)))
+        );
+        assert_eq!(
+            parse_primer_ttl(Some(" 2w ")),
+            Some(Some(Duration::from_secs(2 * 604_800)))
+        );
         // 30d and 720h are the same window.
-        assert_eq!(parse_primer_ttl(Some("30d")), parse_primer_ttl(Some("720h")));
+        assert_eq!(
+            parse_primer_ttl(Some("30d")),
+            parse_primer_ttl(Some("720h"))
+        );
+    }
+
+    /// The pnpm-compat env family (`pnpm_config_*` / `PNPM_CONFIG_*`) is
+    /// pnpm-NAMED, so the pnpm-named-paths hard gate applies: it rides the
+    /// existing `read_branded_pnpm_config` posture — on-by-default for
+    /// standalone aube, gated to the pnpm-incumbent check under the nub
+    /// profile (`engine_context().read_branded_pnpm_config`). Flips the
+    /// process-global engine context and restores it; the suite runs
+    /// serially via `RUST_TEST_THREADS=1`, so the temporary flip can't
+    /// bleed into a sibling test.
+    ///
+    /// Note the lowercase form would otherwise read as a *neutral* var
+    /// (its head `pnpm` isn't all-uppercase), so without the explicit
+    /// gate it would be honored unconditionally — this guards that the
+    /// gate, not `looks_branded`, decides the pnpm family.
+    #[test]
+    fn pnpm_config_env_family_gated_on_pnpm_incumbent() {
+        let restore = crate::engine_context().read_branded_pnpm_config;
+
+        crate::update_engine_context(|c| c.read_branded_pnpm_config = true);
+        assert!(branded_env_alias_enabled("pnpm_config_node_linker"));
+        assert!(branded_env_alias_enabled("PNPM_CONFIG_NODE_LINKER"));
+
+        crate::update_engine_context(|c| c.read_branded_pnpm_config = false);
+        assert!(
+            !branded_env_alias_enabled("pnpm_config_node_linker"),
+            "lowercase pnpm_config_* must be skipped under a non-pnpm incumbent"
+        );
+        assert!(
+            !branded_env_alias_enabled("PNPM_CONFIG_NODE_LINKER"),
+            "uppercase PNPM_CONFIG_* must be skipped under a non-pnpm incumbent"
+        );
+        // The npm-compat family is never gated on the incumbent.
+        assert!(branded_env_alias_enabled("npm_config_node_linker"));
+        assert!(branded_env_alias_enabled("NPM_CONFIG_NODE_LINKER"));
+
+        crate::update_engine_context(|c| c.read_branded_pnpm_config = restore);
     }
 
     /// `looks_branded` separates the tool-branded `<UPPER>_<NAME>` shape from

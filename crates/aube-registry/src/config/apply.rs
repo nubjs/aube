@@ -17,6 +17,22 @@ impl NpmConfig {
     /// which lets `jsr:` specs work without the user touching `.npmrc`.
     /// User-provided `.npmrc` entries win — `apply` has already run by
     /// the time we get here, so we only fill in gaps.
+    ///
+    /// ACCEPTED DIVERGENCE — pnpm's *builtin* npmrc (the `npmrc` file
+    /// shipped inside the pnpm/npm install prefix, npm's
+    /// `BUILTIN_CONFIG`/`pnpmrc`): aube does NOT read it. These
+    /// compiled-in defaults (the npmjs default registry, the `@jsr`
+    /// scope above) ARE aube's equivalent of that builtin layer. The
+    /// on-disk builtin file only carries non-default values when someone
+    /// customizes a pnpm *binary distribution* (e.g. a corporate repack
+    /// that bakes an internal registry into the shipped binary) — a
+    /// vanishingly rare case, and one where the user is running that
+    /// repacked pnpm, not aube. Reading it would also mean probing a
+    /// path inside the active pnpm install prefix, which aube has no
+    /// reliable way to locate when embedded. The user-facing
+    /// global/user/project npmrc cascade, pnpm's global `config.yaml`,
+    /// and `auth.ini` are all honored; only this binary-baked builtin
+    /// layer is out of scope. (GAP #2 in the pnpm config-compat audit.)
     pub(super) fn apply_builtin_scoped_defaults(&mut self) {
         self.scoped_registries
             .entry(crate::jsr::JSR_NPM_SCOPE.to_string())

@@ -113,7 +113,8 @@ fn main() {
         writeln!(out, "        default: {},", lit(&def.default)).unwrap();
         writeln!(out, "        docs: {},", lit(&def.docs)).unwrap();
         writeln!(out, "        cli_flags: {},", slice_lit(&def.sources.cli)).unwrap();
-        writeln!(out, "        env_vars: {},", slice_lit(&def.sources.env)).unwrap();
+        let env_vars = merged_env_vars(&def.sources.env);
+        writeln!(out, "        env_vars: {},", slice_lit(&env_vars)).unwrap();
         let npmrc_keys = merged_npmrc_keys(&def.sources.npmrc);
         writeln!(out, "        npmrc_keys: {},", slice_lit(&npmrc_keys)).unwrap();
         writeln!(
@@ -301,6 +302,11 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
                 "userAubeConfig" => (npmrc_call, "ctx.user_aube_config"),
                 "userNpmrc" => (npmrc_call, "ctx.user_npmrc"),
                 "workspaceYaml" => (ws_call, "ctx.workspace_yaml"),
+                // pnpm's global `config.yaml` is YAML-shaped (camelCase
+                // keys), so it resolves through the same workspace-yaml
+                // helper as `workspaceYaml` — just against a different
+                // ctx field.
+                "globalConfigYaml" => (ws_call, "ctx.global_config_yaml"),
                 "embedderDefaults" => (npmrc_call, "ctx.embedder_defaults"),
                 other => panic!("{name}: unknown source `{other}` in precedence"),
             };
@@ -565,6 +571,13 @@ fn resolve_precedence(declared: &[String]) -> Vec<String> {
         "projectAubeConfig",
         "projectNpmrc",
         "workspaceYaml",
+        // pnpm's global `config.yaml` (pnpm v11) is a GLOBAL/user-scope
+        // source: it ranks below the project-root workspace yaml (a
+        // project `pnpm-workspace.yaml` overrides the user's global
+        // config.yaml, matching pnpm v11) and above the user-scope
+        // `.npmrc` / aube config. Empty unless pnpm is the provable
+        // incumbent (the pnpm-named-paths hard gate).
+        "globalConfigYaml",
         "userAubeConfig",
         "userNpmrc",
         // Embedder-supplied defaults sit at the very bottom: below every
@@ -639,6 +652,52 @@ fn is_case_convertible_key(key: &str) -> bool {
     // and bracketed patterns aren't identifier-style config keys.
     // Leave them untouched.
     !(key.starts_with('/') || key.starts_with('@') || key.contains(':'))
+}
+
+/// Auto-synthesize the pnpm-compat env family from each declared
+/// `npm_config_*` / `NPM_CONFIG_*` alias. pnpm v11 reads its general
+/// settings from `pnpm_config_<name>` (lowercase) and `PNPM_CONFIG_<NAME>`
+/// (uppercase, the v11 migration-guide spelling that replaces
+/// `NPM_CONFIG_*`), so a setting that already declares the npm spelling
+/// gets the matching pnpm spellings for free — no per-setting edit in
+/// `settings.toml`, mirroring how [`merged_npmrc_keys`] synthesizes
+/// kebab/camel aliases.
+///
+/// Ordering matters: [`crate::values::raw_from_env`] walks `env_vars` in
+/// reverse, so a later alias outranks an earlier one. We insert each
+/// pnpm alias immediately *after* the npm alias it derives from, which
+/// places the whole pnpm family above the npm family in priority
+/// (pnpm's own resolution prefers `pnpm_config_*` over the npm-compat
+/// `npm_config_*` fallback) while leaving any tool-branded `{PREFIX}_*`
+/// alias declared last as the highest-priority entry, exactly as before.
+///
+/// The pnpm family rides the existing `read_branded_pnpm_config`
+/// posture — on-by-default for standalone aube (which IS a
+/// pnpm-compatible PM), gated to the pnpm-incumbent check under the nub
+/// profile. That gate lives in
+/// [`aube_util::env::branded_env_alias_enabled`], not here; this only
+/// makes the metadata aware of the spellings. Registry/auth-style keys
+/// (`@scope:registry`, `//host/:_authToken`) are pnpm's `.npmrc` syntax
+/// carried in an env name and are already handled URL-scoped by the
+/// registry client, so they're left untouched here.
+fn merged_env_vars(declared: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(declared.len() * 2);
+    for alias in declared {
+        out.push(alias.clone());
+        let pnpm_alias = if let Some(rest) = alias.strip_prefix("npm_config_") {
+            Some(format!("pnpm_config_{rest}"))
+        } else {
+            alias
+                .strip_prefix("NPM_CONFIG_")
+                .map(|rest| format!("PNPM_CONFIG_{rest}"))
+        };
+        if let Some(pnpm_alias) = pnpm_alias
+            && !out.contains(&pnpm_alias)
+        {
+            out.push(pnpm_alias);
+        }
+    }
+    out
 }
 
 fn to_kebab_case(s: &str) -> String {

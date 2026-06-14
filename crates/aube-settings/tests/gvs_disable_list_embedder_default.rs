@@ -18,9 +18,7 @@
 //! Lives in its own integration-test binary because `set_embedder_defaults` is
 //! once-per-process; registering this list elsewhere would leak.
 
-use aube_settings::{
-    ResolveCtx, embedder_defaults, resolved, set_embedder_defaults,
-};
+use aube_settings::{ResolveCtx, embedder_defaults, resolved, set_embedder_defaults};
 use std::collections::BTreeMap;
 
 const SETTING: &str = "disableGlobalVirtualStoreForPackages";
@@ -45,6 +43,7 @@ fn ctx<'a>(
         user_aube_config: &[],
         user_npmrc: &[],
         workspace_yaml: ws,
+        global_config_yaml: aube_settings::values::empty_yaml_map(),
         env: &[],
         cli: &[],
         embedder_defaults: embedder,
@@ -69,7 +68,10 @@ fn gvs_list_default_unchanged_and_embedder_overridable() {
     let plain = ctx(&ws, &[], &[]);
     assert_eq!(
         resolved::disable_global_virtual_store_for_packages(&plain),
-        AUBE_DEFAULT.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        AUBE_DEFAULT
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
         "with no embedder default, aube's built-in GVS list must be unchanged"
     );
 
