@@ -287,8 +287,7 @@ impl<'a> ResolveDriver<'a> {
                 continue;
             }
             if !self.resolver.cache.contains_key(task.name.as_str()) {
-                self.fetcher
-                    .ensure_fetch(task.name.as_str(), self.published_by.as_deref());
+                self.fetcher.ensure_fetch(task.name.as_str());
             }
         }
     }
@@ -310,8 +309,7 @@ impl<'a> ResolveDriver<'a> {
     /// `existing_names` explicitly before invoking this.
     fn ensure_fetch(&mut self, name: &str) {
         if !self.resolver.cache.contains_key(name) && !self.failed_fetches.contains_key(name) {
-            self.fetcher
-                .ensure_fetch(name, self.published_by.as_deref());
+            self.fetcher.ensure_fetch(name);
         }
     }
 
@@ -383,9 +381,9 @@ impl<'a> ResolveDriver<'a> {
 
 impl<'a> ResolveDriver<'a> {
     /// Decide whether a primer-seeded `Found` pick must be refetched
-    /// live before we trust it, under the `AUBE_PRIMER_PICK_GATE`
-    /// pick-site freshness gate. Only consulted when the gate is on and
-    /// the pick came from the bundled primer (both checked by the caller).
+    /// live before we trust it (the always-on pick-site freshness gate).
+    /// Only consulted when the pick came from the bundled primer (checked
+    /// by the caller).
     ///
     /// Returns `true` (refetch) when the pick is at the live frontier
     /// (`Current`) and the offline seed is stale for the active cutoff,
@@ -634,16 +632,20 @@ impl<'a> ResolveDriver<'a> {
                     self.packument_fetch_count += 1;
                     self.resolver.cache.insert(registry_name.clone(), live);
                 }
-                // Pick-site freshness gate (coexistence flag
-                // `AUBE_PRIMER_PICK_GATE`, OFF by default → this arm is
-                // a no-op and the next arm `break`s exactly as before).
+                // Pick-site freshness gate — the always-on correctness
+                // layer beneath the primer TTL. Only the top-level TTL
+                // (`primer_within_ttl`, unlimited by default) decides
+                // whether the primer is consulted at all; once a name is
+                // primer-seeded, *this* arm decides per-pick whether the
+                // offline pick must be refetched live, keyed on the
+                // picked version's regime.
                 //
                 // This is the fix for the cold-install regression: the
-                // legacy fetch-time `covers_cutoff` gate keys freshness
+                // legacy fetch-time `covers_cutoff` gate keyed freshness
                 // on the primer *build date*, so once the moving
-                // `published_by` cutoff overtakes it (~24h post-build),
-                // every primer hit is suppressed and a cold install
-                // goes all-network. The regime of the *picked version*
+                // `published_by` cutoff overtook it (~24h post-build),
+                // every primer hit was suppressed and a cold install
+                // went all-network. The regime of the *picked version*
                 // is the right key instead:
                 //
                 //  - FROZEN (a higher minor in the same major exists →
@@ -679,8 +681,7 @@ impl<'a> ResolveDriver<'a> {
                 //    refetch rather than trust the sparse offline seed.
                 //    Security posture is never weakened by the new path.
                 PickResult::Found(meta)
-                    if crate::primer::pick_gate_enabled()
-                        && self.fetcher.is_primer_seeded(&registry_name)
+                    if self.fetcher.is_primer_seeded(&registry_name)
                         && self.primer_pick_needs_refetch(
                             packument,
                             &meta.version,

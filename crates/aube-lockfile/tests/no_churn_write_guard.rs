@@ -33,6 +33,7 @@ static NO_CHURN_TOOL: Embedder = Embedder {
     workspace_yaml: Some("nochurn-workspace.yaml"),
     manifest_namespace: "nochurn",
     env_prefix: Some("NOCHURN"),
+    config_env_prefix: Some("NOCHURN"),
     cache_namespace: "nochurn",
     data_namespace: "nochurn",
     canonical_lockfile_always_wins: true,
@@ -42,7 +43,7 @@ static NO_CHURN_TOOL: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: true,
     read_branded_settings_env: true,
-    primer_evergreen: false,
+    primer_ttl: None,
 };
 
 fn pkg(name: &str, version: &str, integrity: &str) -> LockedPackage {

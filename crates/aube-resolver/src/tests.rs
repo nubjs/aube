@@ -1016,25 +1016,25 @@ async fn primer_seeded_pick_records_publish_time_for_the_age_floor() {
     let _ = std::fs::remove_dir_all(base);
 }
 
-/// Empirical proof of the cold-install "24h self-disable" regression and
-/// the `AUBE_PRIMER_PICK_GATE` fix, both observed via *registry hit count*
-/// against a request-counting mock registry. The bundled primer's
-/// `AUBE_PRIMER_GENERATED_AT` is baked at build time (the primer data
-/// file's mtime); `covers_cutoff(c)` is true iff `generated_at >= c`. The
-/// active `minimumReleaseAge` cutoff is `now - minutes`, so:
+/// Empirical proof that the cold-install "24h self-disable" regression is
+/// fixed by the always-on pick-site gate + default-unlimited primer TTL,
+/// observed via *registry hit count* against a request-counting mock
+/// registry. The bundled primer's `AUBE_PRIMER_GENERATED_AT` is baked at
+/// build time (the primer data file's mtime). The active `minimumReleaseAge`
+/// cutoff is `now - minutes`, so:
 ///
-///   - a LARGE window (cutoff far in the past) → `covers_cutoff` true →
-///     simulates a freshly-built binary (cutoff predates the build);
+///   - a LARGE window (cutoff far in the past) → simulates a freshly-built
+///     binary (cutoff predates the build);
 ///   - a 24h window (cutoff = now - 1 day) → once the binary is older than
-///     ~24h, `now - 1day` lands AFTER `generated_at`, so `covers_cutoff`
-///     is FALSE for every name → simulates the aged binary.
+///     ~24h, `now - 1day` lands AFTER `generated_at` → simulates the aged
+///     binary, the case the legacy fetch-site gate used to self-disable on.
 ///
-/// With the legacy gate (flag off), the aged-binary case must SKIP the
-/// primer (a registry hit). With `AUBE_PRIMER_PICK_GATE` on, a frozen pick
-/// must be served from the primer even with the aged cutoff (NO registry
-/// hit) — the evergreen fix.
+/// Both cases must now serve a FROZEN pick from the primer with NO registry
+/// hit: the pick-site gate is the always-on correctness layer, and the
+/// default primer TTL is unlimited, so an aged binary's frozen picks stay
+/// offline (evergreen) — the cold-install fix.
 #[tokio::test]
-async fn primer_self_disables_past_the_build_age_cutoff_unless_pick_gate() {
+async fn primer_serves_frozen_pick_offline_even_on_an_aged_binary() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1198,10 +1198,11 @@ async fn primer_self_disables_past_the_build_age_cutoff_unless_pick_gate() {
     );
     let fresh_hits = hits_a.load(Ordering::Relaxed);
 
-    // (B) Aged-binary simulation, legacy gate (pick-gate OFF — the default
-    // in the test process unless AUBE_PRIMER_PICK_GATE is set): 24h window
-    // → cutoff is AFTER generated_at → covers_cutoff FALSE → primer
-    // SKIPPED → a registry hit. This is the self-disable.
+    // (B) Aged-binary simulation: 24h window → cutoff is AFTER generated_at.
+    // Under the old legacy fetch-site gate this would self-disable the primer
+    // and hit the registry; under the always-on pick-site gate with the
+    // default unlimited TTL, a FROZEN pick is served from the primer offline
+    // even on an aged binary — no registry hit.
     let (reg_b, hits_b, srv_b) = spawn_counting_registry(make_full());
     let (graph_b, base_b) = run(1440, temp_base("aged"), reg_b).await;
     srv_b.abort();
@@ -1214,32 +1215,20 @@ async fn primer_self_disables_past_the_build_age_cutoff_unless_pick_gate() {
     let _ = std::fs::remove_dir_all(base_a);
     let _ = std::fs::remove_dir_all(base_b);
 
-    if crate::primer::pick_gate_enabled() {
-        // Evergreen path: with the pick-gate on, a FROZEN pick is served
-        // from the primer even under the aged cutoff — no registry hit,
-        // same as the fresh case.
-        assert_eq!(
-            fresh_hits, 0,
-            "fresh window should serve the frozen pick from the primer"
-        );
-        assert_eq!(
-            aged_hits, 0,
-            "AUBE_PRIMER_PICK_GATE on: aged binary must STILL serve the \
-             frozen pick offline (evergreen), but the registry was hit"
-        );
-    } else {
-        // Legacy path: the fresh case is offline; the aged case falls
-        // back to the network — the regression, proven by hit count.
-        assert_eq!(
-            fresh_hits, 0,
-            "fresh window should serve the pick from the primer (0 hits)"
-        );
-        assert!(
-            aged_hits >= 1,
-            "legacy gate: aged binary (>24h) must self-disable the primer \
-             and hit the registry, but saw {aged_hits} hits"
-        );
-    }
+    // Evergreen-by-default: the pick-site gate is always on and the default
+    // primer TTL is unlimited, so a FROZEN pick is served from the primer in
+    // BOTH the fresh and aged cases — no registry hit either way. This is the
+    // cold-install fix; the old "aged binary self-disables to the network"
+    // regression is gone.
+    assert_eq!(
+        fresh_hits, 0,
+        "fresh window should serve the frozen pick from the primer"
+    );
+    assert_eq!(
+        aged_hits, 0,
+        "evergreen default: aged binary must STILL serve the frozen pick \
+         offline (unlimited TTL + always-on pick-gate), but the registry was hit"
+    );
 }
 
 /// Measurement (not a regression — `#[ignore]` so CI skips it): of the

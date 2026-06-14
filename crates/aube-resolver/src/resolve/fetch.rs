@@ -2,7 +2,6 @@ use crate::{Error, FxHashSet, Resolver};
 use aube_registry::Packument;
 use aube_registry::client::RegistryClient;
 use aube_util::adaptive::AdaptiveLimit;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -28,7 +27,6 @@ pub(super) struct FetchScheduler {
     client: Arc<RegistryClient>,
     cache_dir: Option<PathBuf>,
     full_cache_dir: Option<PathBuf>,
-    mra_exclude: HashSet<String>,
     force_metadata_primer: bool,
     needs_time: bool,
 }
@@ -46,11 +44,6 @@ impl FetchScheduler {
             client: resolver.client.clone(),
             cache_dir: resolver.packument_cache_dir.clone(),
             full_cache_dir: resolver.packument_full_cache_dir.clone(),
-            mra_exclude: resolver
-                .minimum_release_age
-                .as_ref()
-                .map(|m| m.exclude.clone())
-                .unwrap_or_default(),
             force_metadata_primer: resolver.force_metadata_primer,
             needs_time,
         }
@@ -65,26 +58,25 @@ impl FetchScheduler {
     /// The caller is responsible for the resolver-cache gate — passing
     /// a name that's already in the cache wastes a spawn but is
     /// otherwise harmless.
-    pub(super) fn ensure_fetch(&mut self, name: &str, published_by: Option<&str>) {
+    pub(super) fn ensure_fetch(&mut self, name: &str) {
         if self.in_flight_names.contains(name) {
             return;
         }
         self.in_flight_names.insert(name.to_string());
-        // Legacy (flag OFF): gate the primer per-NAME at fetch time on
-        // the build-mtime freshness check. This is the path that
-        // self-disables ~24h after the build date once the moving
-        // `published_by` cutoff overtakes `AUBE_PRIMER_GENERATED_AT`.
-        //
-        // Pick-gate (flag ON): always let the primer serve at fetch
-        // time (`primer_covers_cutoff = true`); the freshness decision
-        // moves to the version-pick site, which keys it on the picked
-        // version's *regime* instead of the build date — a frozen pick
-        // is served offline indefinitely, a live-edge pick refetches
-        // when stale. See `primer::pick_gate_enabled` and the
-        // `PickResult::Found` arm in driver.rs.
-        let primer_covers_cutoff = crate::primer::pick_gate_enabled()
-            || self.mra_exclude.contains(name)
-            || published_by.is_none_or(crate::primer::covers_cutoff);
+        // Top-level TTL gate: while the binary is within the primer's TTL
+        // (unlimited by default), always let the primer serve at fetch
+        // time. The freshness decision lives at the version-pick site,
+        // which keys it on the picked version's *regime* (not the build
+        // date) — a frozen pick is served offline, a live-edge pick
+        // refetches when stale (see `primer_pick_needs_refetch` + the
+        // `PickResult::Found` arm in driver.rs). Once the binary ages past
+        // a finite TTL, `primer_within_ttl()` is false and the primer is
+        // skipped entirely (all-network resolve). The old fetch-site
+        // build-date gate (`covers_cutoff`) is no longer the seeding
+        // decision — that build-date keying was the self-disable bug; it
+        // survives only as the per-regime staleness signal at the pick
+        // site.
+        let primer_covers_cutoff = crate::primer::primer_within_ttl();
         self.in_flight.spawn(fetch_one_packument(FetchInputs {
             name: name.to_string(),
             client: self.client.clone(),

@@ -34,6 +34,7 @@ static MYTOOL_NO_BRANDED_ENV: Embedder = Embedder {
     // `env_prefix`. Even AUBE_* (aube's own brand) is gated off, let alone a
     // MYTOOL_* var: with the family disabled, no branded settings var is read.
     env_prefix: Some("MYTOOL"),
+    config_env_prefix: Some("MYTOOL"),
     cache_namespace: "mytool",
     data_namespace: "mytool",
     canonical_lockfile_always_wins: true,
@@ -43,7 +44,7 @@ static MYTOOL_NO_BRANDED_ENV: Embedder = Embedder {
     warm_store_verify: true,
     read_branded_settings_env: false,
     no_churn_lockfile_write: false,
-    primer_evergreen: false,
+    primer_ttl: None,
 };
 
 fn ctx<'a>(

@@ -707,7 +707,9 @@ impl Linker {
             // escape hatch. Read once per process.
             {
                 static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *DISABLED.get_or_init(|| std::env::var_os("AUBE_DISABLE_CLONEDIR").is_some()) {
+                if *DISABLED
+                    .get_or_init(|| aube_util::env::embedder_env("DISABLE_CLONEDIR").is_some())
+                {
                     return Ok(false);
                 }
             }

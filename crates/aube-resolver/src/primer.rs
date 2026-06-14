@@ -147,6 +147,7 @@ fn deterministic_tarball_url(name: &str, version: &str) -> String {
 }
 
 static GENERATED_AT: OnceLock<Option<String>> = OnceLock::new();
+static GENERATED_AT_SECS: OnceLock<Option<u64>> = OnceLock::new();
 static AUTO_PRUNED: OnceLock<()> = OnceLock::new();
 
 pub(crate) fn get(name: &str) -> Option<Seed> {
@@ -165,54 +166,57 @@ pub(crate) fn covers_cutoff(cutoff: &str) -> bool {
     generated_at().is_some_and(|generated_at| generated_at.as_str() >= cutoff)
 }
 
-/// Coexistence switch for the redesigned primer pick-site freshness
-/// gate. OFF by default — the legacy fetch-time `covers_cutoff` gate
-/// (computed per-NAME in `fetch.rs`) stays the shipping behavior, so a
-/// build with the flag unset behaves byte-for-byte as before and a
-/// standalone aube is completely unaffected. When ON, the freshness
-/// decision moves to the version *pick* site (see
-/// `driver.rs` PickResult::Found arm): a frozen-regime pick is served
-/// from the offline primer indefinitely (immutable history; cooling
-/// still applied via the primer's own `time` map), while a live-edge
-/// pick keeps the freshness gate and refetches when the seed is stale.
+/// Top-level primer-TTL gate: is the bundled primer young enough (relative to
+/// its build date) to be consulted at all?
 ///
-/// This is the load-bearing fix for the cold-install regression where
-/// the primer self-disables ~24h after the build date: with time-aware
-/// resolution active (`minimumReleaseAge` / `--resolution-mode=time-based`
-/// / `trustPolicy=NoDowngrade`), the moving `published_by` cutoff
-/// eventually passes `AUBE_PRIMER_GENERATED_AT`, the fetch-time gate
-/// returns false for *every* name, and the primer goes dark — turning
-/// a warm cold-install into an all-network one.
+/// The per-pick *regime* logic — a FROZEN pick is served from the offline
+/// primer, a live-frontier pick keeps the freshness refetch (see
+/// `primer_pick_needs_refetch` + the `PickResult::Found` arm in `driver.rs`) —
+/// is the always-on correctness layer beneath this gate. This function only
+/// decides whether the primer is alive *at all*: while `now − generated_at <
+/// TTL` (or the TTL is unlimited) the primer is consulted and the regime logic
+/// runs; once the binary ages past a finite TTL the primer is fully disabled
+/// and resolution goes all-network.
 ///
-/// The default is the active embedder's `primer_evergreen` posture
-/// (`false` = legacy fetch-site gate for standalone aube; `true` for an
-/// embedder shipping an evergreen primer, e.g. nub). `AUBE_PRIMER_PICK_GATE`
-/// overrides it in *either* direction — `1`/`true`/`yes`/`on` force on,
-/// `0`/`false`/`no`/`off` force off — so the opt-out survives an
-/// embedder that defaults it on. An unrecognized value is ignored (falls
-/// back to the embedder default). Read once and memoized.
-pub(crate) fn pick_gate_enabled() -> bool {
+/// The effective TTL is the active embedder's [`primer_ttl`] default, overridden
+/// by the `{config_env_prefix}_PRIMER_TTL` env var (`AUBE_PRIMER_TTL` /
+/// `NUB_PRIMER_TTL`) when set to a recognized value (`0`/`unlimited`/… →
+/// unlimited; `30d`/`720h`/… → finite). The default for both standalone aube and
+/// nub is *unlimited* (frozen resolution data is immutable, so an aged binary's
+/// frozen picks are still correct — "evergreen" is just an ∞ TTL). Read once and
+/// memoized.
+///
+/// [`primer_ttl`]: aube_util::identity::Embedder::primer_ttl
+pub(crate) fn primer_within_ttl() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        resolve_pick_gate(
-            std::env::var("AUBE_PRIMER_PICK_GATE").ok().as_deref(),
-            aube_util::embedder().primer_evergreen,
+        let ttl = aube_util::env::parse_primer_ttl(
+            aube_util::env::config_env("PRIMER_TTL")
+                .as_deref()
+                .and_then(|s| s.to_str()),
         )
+        .unwrap_or(aube_util::embedder().primer_ttl);
+        within_ttl(ttl, generated_at_secs(), now_secs())
     })
 }
 
-/// Pure pick-gate decision: an explicit `AUBE_PRIMER_PICK_GATE` value wins in
-/// either direction; an unset or unrecognized value defers to the embedder's
-/// `primer_evergreen` default. Split out from [`pick_gate_enabled`]'s memoized,
-/// env-reading wrapper so the override precedence is unit-testable without the
-/// process-global `OnceLock` / env var.
-fn resolve_pick_gate(env_value: Option<&str>, embedder_default: bool) -> bool {
-    match env_value {
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
-        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
-        // Unset or unrecognized → the embedder's fixed posture.
-        _ => embedder_default,
-    }
+/// Pure TTL decision, split out so it's unit-testable without the process-global
+/// `OnceLock` / env var / build clock. Unlimited TTL (`None`) → always consult.
+/// A finite TTL consults only while `now − generated_at < ttl`; an unknown build
+/// date (`generated_at = None`, e.g. an empty primer or a build without the
+/// `AUBE_PRIMER_GENERATED_AT` stamp) is treated as *not expired* so a finite TTL
+/// never silently disables a primer whose age can't be computed.
+fn within_ttl(ttl: Option<Duration>, generated_at: Option<u64>, now: u64) -> bool {
+    let Some(ttl) = ttl else { return true };
+    let Some(built) = generated_at else { return true };
+    now.saturating_sub(built) < ttl.as_secs()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 /// The names carried by the bundled primer, in index order. Used by the
@@ -225,10 +229,18 @@ pub(crate) fn names() -> impl Iterator<Item = &'static str> {
 fn generated_at() -> Option<&'static String> {
     GENERATED_AT
         .get_or_init(|| {
-            let secs = option_env!("AUBE_PRIMER_GENERATED_AT")?.parse().ok()?;
+            let secs = generated_at_secs()?;
             Some(crate::types::format_iso8601_utc(secs))
         })
         .as_ref()
+}
+
+/// The primer's build date as epoch seconds (the mtime of the source primer at
+/// compile time, stamped into `AUBE_PRIMER_GENERATED_AT` by `build.rs`). `None`
+/// when the stamp is absent — an empty primer, or a build that didn't set it.
+/// Used by the TTL gate; `generated_at()` formats the same value as ISO-8601.
+fn generated_at_secs() -> Option<u64> {
+    *GENERATED_AT_SECS.get_or_init(|| option_env!("AUBE_PRIMER_GENERATED_AT")?.parse().ok())
 }
 
 fn auto_prune_once() {
@@ -320,7 +332,10 @@ fn random_byte() -> u8 {
 }
 
 fn primer_cache_dir() -> Option<PathBuf> {
-    if let Some(base) = std::env::var_os("AUBE_CACHE_DIR") {
+    // First-class config knob, read under the active embedder's brand
+    // (`AUBE_CACHE_DIR` for standalone aube, `NUB_CACHE_DIR` for nub) via the
+    // `config_env` prefix — never the branded `AUBE_*` form under nub.
+    if let Some(base) = aube_util::env::config_env("CACHE_DIR") {
         return Some(PathBuf::from(base).join("primer"));
     }
     // Active embedder's `cache_namespace` (standalone aube → "aube"), not a literal,
@@ -344,6 +359,28 @@ fn cache_base_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pure TTL gate: unlimited always consults; a finite TTL consults only
+    /// while the binary is younger than the TTL; an unknown build date is never
+    /// treated as expired (so a finite TTL can't silently kill a primer whose
+    /// age can't be computed).
+    #[test]
+    fn within_ttl_gates_on_age_relative_to_build_date() {
+        let day = 86_400;
+        let built = 1_000_000_000; // arbitrary fixed build epoch
+        // Unlimited (None) → always consult, regardless of age.
+        assert!(within_ttl(None, Some(built), built + 10 * 365 * day));
+        // Finite 30d TTL: young binary consults, aged binary does not.
+        let ttl = Some(Duration::from_secs(30 * day));
+        assert!(within_ttl(ttl, Some(built), built + 29 * day)); // within
+        assert!(within_ttl(ttl, Some(built), built)); // same instant
+        assert!(!within_ttl(ttl, Some(built), built + 31 * day)); // expired
+        assert!(!within_ttl(ttl, Some(built), built + 30 * day)); // boundary: not < ttl
+        // Unknown build date → never expired even under a finite TTL.
+        assert!(within_ttl(ttl, None, built + 10 * 365 * day));
+        // Clock skew (now < built) saturates to 0 elapsed → still within.
+        assert!(within_ttl(ttl, Some(built), built - day));
+    }
 
     #[test]
     fn bundled_primer_loads() {
@@ -439,28 +476,5 @@ mod tests {
 
         assert_eq!(stats.files, 0);
         assert!(primer_file.exists());
-    }
-
-    #[test]
-    fn pick_gate_default_follows_embedder_and_env_overrides_both_ways() {
-        // Unset → the embedder's posture: standalone aube (default `false`)
-        // keeps the legacy fetch-site gate; an evergreen embedder (`true`)
-        // serves frozen picks offline.
-        assert!(!resolve_pick_gate(None, false));
-        assert!(resolve_pick_gate(None, true));
-
-        // An explicit value wins over either embedder default — the opt-out
-        // (`0`) survives an evergreen embedder, and the opt-in (`1`) survives
-        // a legacy one.
-        assert!(!resolve_pick_gate(Some("0"), true));
-        assert!(!resolve_pick_gate(Some("false"), true));
-        assert!(!resolve_pick_gate(Some("off"), true));
-        assert!(resolve_pick_gate(Some("1"), false));
-        assert!(resolve_pick_gate(Some("true"), false));
-        assert!(resolve_pick_gate(Some("on"), false));
-
-        // An unrecognized value is ignored — falls back to the embedder default.
-        assert!(resolve_pick_gate(Some("maybe"), true));
-        assert!(!resolve_pick_gate(Some(""), false));
     }
 }

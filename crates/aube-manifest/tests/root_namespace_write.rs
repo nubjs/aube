@@ -27,6 +27,7 @@ static ROOT_TOOL: Embedder = Embedder {
     workspace_yaml: None,
     manifest_namespace: "",
     env_prefix: None,
+    config_env_prefix: None,
     cache_namespace: "roottool",
     data_namespace: "roottool",
     canonical_lockfile_always_wins: true,
@@ -36,7 +37,7 @@ static ROOT_TOOL: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: false,
     read_branded_settings_env: true,
-    primer_evergreen: false,
+    primer_ttl: None,
 };
 
 fn read_manifest(dir: &std::path::Path) -> serde_json::Value {

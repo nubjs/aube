@@ -29,6 +29,7 @@ static MYTOOL: Embedder = Embedder {
     workspace_yaml: Some("mytool-workspace.yaml"),
     manifest_namespace: "mytool",
     env_prefix: Some("MYTOOL"),
+    config_env_prefix: Some("MYTOOL"),
     cache_namespace: "mytool",
     data_namespace: "mytool",
     canonical_lockfile_always_wins: false,
@@ -38,7 +39,7 @@ static MYTOOL: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: false,
     read_branded_settings_env: true,
-    primer_evergreen: false,
+    primer_ttl: None,
 };
 
 fn project(files: &[(&str, &str)]) -> tempfile::TempDir {

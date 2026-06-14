@@ -91,9 +91,26 @@ pub struct Embedder {
     /// manifest **root** as top-level `package.json` keys — never under a
     /// foreign brand's namespace, and never as a literal `""` key.
     pub manifest_namespace: &'static str,
-    /// Env-var prefix for tool-specific variables, e.g. `Some("AUBE")` →
-    /// `AUBE_*`. `None` means the tool reads no branded env family.
+    /// Env-var prefix for the tool's *internal* debug / diagnostic / perf-bisect
+    /// toggles, read through [`embedder_env`](crate::env::embedder_env), e.g.
+    /// `Some("AUBE")` → `AUBE_DISABLE_CLONEDIR`, `AUBE_DIAG_PRINT`, … `None`
+    /// means the tool exposes *no* branded debug-toggle family — every such
+    /// toggle is simply unreadable, so an embedding host's brand never sprouts a
+    /// dozen `<HOST>_DISABLE_*` perf switches. This gates the non-settings,
+    /// non-user-facing toggle family only; user-facing config knobs go through
+    /// [`config_env_prefix`](Self::config_env_prefix) (the three first-class
+    /// vars) or the settings table (`read_branded_settings_env` /
+    /// `branded_env_alias_enabled`).
     pub env_prefix: Option<&'static str>,
+    /// Env-var prefix for the tool's small set of *first-class config* knobs —
+    /// the cache dir, the fetch concurrency, the primer TTL — read through
+    /// [`config_env`](crate::env::config_env), e.g. `Some("AUBE")` →
+    /// `AUBE_CACHE_DIR` / `AUBE_CONCURRENCY` / `AUBE_PRIMER_TTL`, `Some("NUB")`
+    /// → `NUB_CACHE_DIR` / `NUB_CONCURRENCY` / `NUB_PRIMER_TTL`. Distinct from
+    /// [`env_prefix`](Self::env_prefix): these few knobs ARE legitimate config
+    /// the host wants under its own brand, whereas the debug toggles vanish
+    /// under an embedder that hides them. `None` reads no first-class config env.
+    pub config_env_prefix: Option<&'static str>,
     /// Leaf directory name under the OS cache root, e.g. `"aube"` →
     /// `<XDG_CACHE_HOME>/aube`.
     pub cache_namespace: &'static str,
@@ -170,22 +187,31 @@ pub struct Embedder {
     ///
     /// [`read_branded_pnpm_config`]: crate::engine_context::EngineContext::read_branded_pnpm_config
     pub read_branded_settings_env: bool,
-    /// When `true`, the offline metadata primer's freshness is gated at the
-    /// *pick* site (per resolved-version regime) instead of the legacy
-    /// per-name *fetch* site. The legacy fetch-time gate keys freshness on the
-    /// primer's build date, so under time-aware resolution (`minimumReleaseAge`
-    /// / `trustPolicy=NoDowngrade`) the moving cutoff overtakes the build date
-    /// ~24h post-build and the primer self-disables — turning a warm
-    /// cold-install all-network. The pick-site gate serves a *frozen* pick
-    /// (settled, immutable history) from the primer indefinitely while keeping
-    /// the freshness refetch for a *live-frontier* pick; cooling is still
-    /// enforced inside `pick_version` against the primer's own `time` map, so
-    /// security posture is unchanged. `false` (aube's default) is the legacy
-    /// fetch-site behavior, byte-for-byte. An embedder that ships an "evergreen
-    /// primer" (nub) sets this `true`. The `AUBE_PRIMER_PICK_GATE` env var
-    /// overrides this default in either direction. Embedder-fixed: it's the
-    /// host's call, not the user's, and it doesn't vary per project.
-    pub primer_evergreen: bool,
+    /// How long after the bundled primer's build date (`generated_at`) the
+    /// offline metadata primer is consulted at all. `None` = unlimited (the
+    /// primer never expires); `Some(d)` = consult the primer only while
+    /// `now − generated_at < d`, and once the binary ages past `d` skip the
+    /// primer entirely and resolve all-network.
+    ///
+    /// This *replaces* the old `primer_evergreen` boolean. The per-pick regime
+    /// logic — a FROZEN pick (settled, immutable history) is served from the
+    /// offline primer, a live-frontier pick keeps the freshness refetch — is now
+    /// the always-on correctness layer beneath this TTL, not a thing the TTL
+    /// switches on and off. Cooling (`minimumReleaseAge` / `trustPolicy`) is
+    /// still enforced inside `pick_version` against the primer's own `time` map
+    /// regardless of TTL, so the TTL is a staleness bound on the *bundled data*,
+    /// never a security lever. The default `None` (unlimited) is correct because
+    /// frozen resolution data is immutable: an aged binary's frozen picks are
+    /// still right, so there is no reason for the primer to self-disable —
+    /// "evergreen" is just an ∞ TTL, not a separate flag.
+    ///
+    /// Both standalone aube ([`AUBE`]) and nub default to `None` (unlimited).
+    /// The `{config_env_prefix}_PRIMER_TTL` env var (`AUBE_PRIMER_TTL` /
+    /// `NUB_PRIMER_TTL`) overrides it: `0`/`unlimited`/`inf`/`infinite`/`never`
+    /// → unlimited; a duration like `30d` / `720h` / `45m` → finite. Embedder-
+    /// fixed: it's the host's call, not the user's, and it doesn't vary per
+    /// project.
+    pub primer_ttl: Option<std::time::Duration>,
 }
 
 /// Standalone aube's embedder profile. Reproduces every hardcoded branding
@@ -203,6 +229,7 @@ pub const AUBE: Embedder = Embedder {
     workspace_yaml: Some("aube-workspace.yaml"),
     manifest_namespace: "aube",
     env_prefix: Some("AUBE"),
+    config_env_prefix: Some("AUBE"),
     cache_namespace: "aube",
     data_namespace: "aube",
     canonical_lockfile_always_wins: true,
@@ -212,7 +239,7 @@ pub const AUBE: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: false,
     read_branded_settings_env: true,
-    primer_evergreen: false,
+    primer_ttl: None,
 };
 
 static ACTIVE: OnceLock<&'static Embedder> = OnceLock::new();
@@ -304,6 +331,7 @@ mod tests {
         assert!(id.warm_store_verify);
         assert!(!id.no_churn_lockfile_write);
         assert!(id.read_branded_settings_env);
-        assert!(!id.primer_evergreen);
+        assert_eq!(id.config_env_prefix, Some("AUBE"));
+        assert_eq!(id.primer_ttl, None);
     }
 }
