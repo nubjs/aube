@@ -140,9 +140,11 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
     //     resolutions land at distinct paths.
     // The `defaultTrust` floor can allow builds even when the policy
     // itself has no allow rules, so it keeps the phase alive too.
-    if !ignore_scripts
-        && (build_policy.has_any_allow_rule() || default_trust_floor.may_allow_any())
-        && !virtual_store_only
+    if super::default_trust::dep_build_scripts_may_run(
+        ignore_scripts,
+        build_policy.has_any_allow_rule(),
+        default_trust_floor.may_allow_any(),
+    ) && !virtual_store_only
     {
         let phase_start = std::time::Instant::now();
         let side_effects_cache_root =

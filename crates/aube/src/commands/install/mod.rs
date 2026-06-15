@@ -2000,6 +2000,20 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         crate::progress::safe_eprintln(&format!("warn: {w}"));
     }
 
+    // Built here (before linking) — the link phase needs it too: the
+    // `defaultTrust` floor can authorize a package's build scripts even
+    // with no explicit allow rule, and those scripts must see their own
+    // deps' bins on PATH, so the per-dep `.bin` linking pass
+    // (`link_dep_bins`) has to fire whenever scripts *might* run, not
+    // only when an allow rule exists. Same gate the lifecycle phase
+    // uses in `finalize.rs`. `from_settings` is pure (reads settings,
+    // no I/O), so constructing it early is free.
+    let default_trust_floor = default_trust::DefaultTrustFloor::from_settings(
+        &settings_ctx,
+        opts.minimum_release_age_override,
+        osv_gate_active,
+        lockfile_vetted,
+    );
     let link::LinkPhaseOutput {
         stats,
         node_linker,
@@ -2029,15 +2043,10 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         dep_selection_filtered: opts.dep_selection.is_filtered(),
         workspace_filter_empty: opts.workspace_filter.is_empty(),
         ignore_scripts: opts.ignore_scripts,
+        floor_may_allow_any: default_trust_floor.may_allow_any(),
         prog_ref,
         phase_timings: &mut phase_timings,
     })?;
-    let default_trust_floor = default_trust::DefaultTrustFloor::from_settings(
-        &settings_ctx,
-        opts.minimum_release_age_override,
-        osv_gate_active,
-        lockfile_vetted,
-    );
     finalize::run_finalize_phase(finalize::FinalizePhaseInput {
         cwd: &cwd,
         settings_ctx: &settings_ctx,

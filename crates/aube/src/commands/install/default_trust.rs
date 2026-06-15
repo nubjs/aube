@@ -194,6 +194,32 @@ pub(crate) fn decide_with_floor(
     }
 }
 
+/// Whether dependency build scripts may run on this install — and thus
+/// whether the per-dep `.bin` linking pass (`link_dep_bins`) must fire
+/// so those scripts can call binaries declared in their own
+/// `dependencies`.
+///
+/// Single source of truth for two call sites that previously open-coded
+/// the predicate and drifted apart: the link phase (`link.rs`, the write
+/// side that shims each dep's children into its `.bin`) and the
+/// lifecycle phase (`finalize.rs`, the read side that runs the scripts
+/// with those `.bin` dirs on PATH). They MUST agree — when they didn't,
+/// a pure trust-floor install (no explicit `allowBuilds`) ran a dep's
+/// postinstall but never linked the dep's own deps' bins, so a script
+/// calling a dep-provided CLI (e.g. lmdb's
+/// `node-gyp-build-optional-packages`) failed with exit 127.
+///
+/// `--ignore-scripts` skips scripts entirely, so it forces this off.
+/// Otherwise scripts run when the policy has an explicit allow rule OR
+/// the `defaultTrust` floor could authorize something.
+pub(crate) fn dep_build_scripts_may_run(
+    ignore_scripts: bool,
+    has_any_allow_rule: bool,
+    floor_may_allow_any: bool,
+) -> bool {
+    !ignore_scripts && (has_any_allow_rule || floor_may_allow_any)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +474,34 @@ mod tests {
             AllowDecision::Allow,
             "allow-all still wins above the floor for everything not denied"
         );
+    }
+
+    /// THE TRANSITIVE-BIN FIX: the per-dep `.bin` linking pass
+    /// (`link.rs`'s `link_dep_bins`) and the lifecycle-script phase
+    /// (`finalize.rs`'s `run_dep_lifecycle_scripts`) MUST gate on the
+    /// same predicate. They drifted: bin-linking checked only
+    /// `has_any_allow_rule`, while scripts also ran on the
+    /// `defaultTrust` floor. So on a pure trust-floor install (no
+    /// explicit `allowBuilds`) a dep's postinstall ran but its own
+    /// deps' bins were never shimmed onto PATH — a script calling a
+    /// dep-provided CLI (lmdb's `node-gyp-build-optional-packages`)
+    /// died with exit 127. `dep_build_scripts_may_run` is now the
+    /// single source of truth both sites consume.
+    #[test]
+    fn bin_linking_gate_fires_on_a_pure_trust_floor_install() {
+        // No allow rule, but the floor could authorize a build (the
+        // exact lmdb/Gatsby shape). Scripts will run, so the bins
+        // their scripts need MUST be linked.
+        assert!(
+            dep_build_scripts_may_run(false, false, true),
+            "trust-floor-only install must still link dep bins — \
+             scripts run on the floor and need their own deps' CLIs on PATH"
+        );
+        // Symmetric: an explicit allow rule with the floor closed still fires.
+        assert!(dep_build_scripts_may_run(false, true, false));
+        // Both off → nothing to run, skip the pass (fast path preserved).
+        assert!(!dep_build_scripts_may_run(false, false, false));
+        // `--ignore-scripts` forces the whole thing off regardless.
+        assert!(!dep_build_scripts_may_run(true, true, true));
     }
 }

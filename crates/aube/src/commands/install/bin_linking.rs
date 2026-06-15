@@ -284,6 +284,49 @@ pub(super) fn link_bins_for_workspace_dep(
 /// root's `node_modules/` and generally relies on the single top-level
 /// `.bin`; nested transitive bins under hoisted are a known rough edge
 /// and out of scope here.
+/// Gate + run the per-dep `.bin` linking pass.
+///
+/// The link site in `run_link_phase` and the lifecycle site in
+/// `run_finalize_phase` MUST agree on whether dep build scripts may run:
+/// the link side shims each dep's children into its `.bin`, the lifecycle
+/// side runs the dep's scripts with that `.bin` on PATH. The shared
+/// [`super::default_trust::dep_build_scripts_may_run`] predicate is the
+/// single source of truth — keeping the *gate decision itself* in this
+/// function (rather than open-coded at the `run_link_phase` call site)
+/// is what makes it directly testable against a real fixture graph: a
+/// trust-floor-only install (`floor_may_allow_any && !has_any_allow_rule`)
+/// must still link the bins, because the scripts run on the floor and
+/// need their own deps' CLIs (e.g. lmdb's
+/// `node-gyp-build-optional-packages`) on PATH.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn maybe_link_dep_bins(
+    ignore_scripts: bool,
+    has_any_allow_rule: bool,
+    floor_may_allow_any: bool,
+    aube_dir: &std::path::Path,
+    graph: &aube_lockfile::LockfileGraph,
+    virtual_store_dir_max_length: usize,
+    placements: Option<&aube_linker::HoistedPlacements>,
+    shim_opts: aube_linker::BinShimOptions,
+    cache: &mut PkgJsonCache,
+) -> miette::Result<()> {
+    if !super::default_trust::dep_build_scripts_may_run(
+        ignore_scripts,
+        has_any_allow_rule,
+        floor_may_allow_any,
+    ) {
+        return Ok(());
+    }
+    link_dep_bins(
+        aube_dir,
+        graph,
+        virtual_store_dir_max_length,
+        placements,
+        shim_opts,
+        cache,
+    )
+}
+
 pub(crate) fn link_dep_bins(
     aube_dir: &std::path::Path,
     graph: &aube_lockfile::LockfileGraph,
@@ -516,6 +559,134 @@ mod tests {
             bin,
             ..Default::default()
         }
+    }
+
+    /// Materialize a parent dep that declares one child dep shipping a
+    /// `bin`, then return everything `maybe_link_dep_bins` needs plus the
+    /// path where the child's shim must land. The shape mirrors lmdb (the
+    /// parent, whose postinstall shells out to a dep CLI) depending on
+    /// `node-gyp-build-optional-packages` (the child that ships the CLI).
+    fn fixture_parent_with_bin_bearing_child(
+        aube_dir: &std::path::Path,
+    ) -> (LockfileGraph, std::path::PathBuf) {
+        let parent_dep_path = "lmdb@3.0.0";
+        let child_dep_path = "node-gyp-build-optional-packages@5.2.0";
+
+        // Parent on disk (must exist or `link_dep_bins` skips it).
+        let parent_dir =
+            materialized_pkg_dir(aube_dir, parent_dep_path, "lmdb", 120, None);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(
+            parent_dir.join("package.json"),
+            r#"{"name":"lmdb","version":"3.0.0"}"#,
+        )
+        .unwrap();
+
+        // Child on disk, declaring a bin + the target file the shim points at.
+        let child_dir = materialized_pkg_dir(
+            aube_dir,
+            child_dep_path,
+            "node-gyp-build-optional-packages",
+            120,
+            None,
+        );
+        std::fs::create_dir_all(child_dir.join("bin")).unwrap();
+        std::fs::write(
+            child_dir.join("package.json"),
+            r#"{"name":"node-gyp-build-optional-packages","version":"5.2.0","bin":{"node-gyp-build-optional-packages":"bin/build.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(child_dir.join("bin/build.js"), "#!/usr/bin/env node\n").unwrap();
+
+        let mut parent = locked("lmdb", "3.0.0", BTreeMap::new());
+        parent
+            .dependencies
+            .insert("node-gyp-build-optional-packages".to_string(), "5.2.0".to_string());
+
+        let mut packages = BTreeMap::new();
+        packages.insert(parent_dep_path.to_string(), parent);
+        packages.insert(
+            child_dep_path.to_string(),
+            locked("node-gyp-build-optional-packages", "5.2.0", {
+                let mut b = BTreeMap::new();
+                b.insert(
+                    "node-gyp-build-optional-packages".to_string(),
+                    "bin/build.js".to_string(),
+                );
+                b
+            }),
+        );
+
+        let graph = LockfileGraph {
+            packages,
+            ..Default::default()
+        };
+
+        // Where the child's shim must land: in the PARENT's per-dep `.bin`,
+        // so lmdb's postinstall finds it on PATH.
+        let expected_shim = dep_modules_dir_for(&parent_dir, "lmdb")
+            .join(".bin")
+            .join("node-gyp-build-optional-packages");
+        (graph, expected_shim)
+    }
+
+    /// THE LINK-SITE TRANSITIVE-BIN REGRESSION. `maybe_link_dep_bins` is
+    /// the gate `run_link_phase` calls — it must shim a dep's child bins
+    /// whenever those scripts *may* run, which on a pure trust-floor
+    /// install means `floor_may_allow_any && !has_any_allow_rule`. The
+    /// pre-fix gate checked `has_any_allow_rule` only, so this exact
+    /// shape (lmdb on the `defaultTrust` floor, no explicit `allowBuilds`)
+    /// ran lmdb's postinstall but never linked
+    /// `node-gyp-build-optional-packages` into lmdb's `.bin` → exit 127.
+    ///
+    /// Load-bearing against re-drift: reverting the call-site gate to
+    /// `has_any_allow_rule()`-only flips the floor-only case below from
+    /// "shim present" to "shim absent" and FAILS this test. (The helper-
+    /// in-isolation test in `default_trust.rs` does NOT — it never reaches
+    /// `link_dep_bins`.)
+    #[test]
+    fn maybe_link_dep_bins_links_transitive_bins_on_a_pure_trust_floor() {
+        // Trust-floor-only: no allow rule, but the floor could authorize a
+        // build → scripts run → their deps' bins MUST be linked.
+        let dir = tempfile::tempdir().unwrap();
+        let aube_dir = dir.path().join("node_modules/.aube");
+        let (graph, expected_shim) = fixture_parent_with_bin_bearing_child(&aube_dir);
+        maybe_link_dep_bins(
+            /* ignore_scripts */ false,
+            /* has_any_allow_rule */ false,
+            /* floor_may_allow_any */ true,
+            &aube_dir,
+            &graph,
+            120,
+            None,
+            aube_linker::BinShimOptions::default(),
+            &mut PkgJsonCache::new(),
+        )
+        .unwrap();
+        assert!(
+            expected_shim.exists(),
+            "trust-floor-only install must link the dep's transitive bin \
+             into the parent's .bin so its postinstall finds it on PATH; \
+             expected shim at {}",
+            expected_shim.display()
+        );
+
+        // Fast-path: nothing may run (no allow rule, floor closed,
+        // scripts not ignored) → the pass is skipped, no shim written.
+        let dir2 = tempfile::tempdir().unwrap();
+        let aube_dir2 = dir2.path().join("node_modules/.aube");
+        let (graph2, expected_shim2) = fixture_parent_with_bin_bearing_child(&aube_dir2);
+        maybe_link_dep_bins(
+            false, false, false, &aube_dir2, &graph2, 120, None,
+            aube_linker::BinShimOptions::default(),
+            &mut PkgJsonCache::new(),
+        )
+        .unwrap();
+        assert!(
+            !expected_shim2.exists(),
+            "with no allow rule and the floor closed, no scripts run, so the \
+             dep-bin pass must be skipped (fast path) — no shim should appear"
+        );
     }
 
     #[test]

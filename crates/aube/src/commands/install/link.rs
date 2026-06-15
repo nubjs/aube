@@ -1,4 +1,4 @@
-use super::bin_linking::{link_bin_entries, link_bins, link_bins_for_dep, link_dep_bins};
+use super::bin_linking::{link_bin_entries, link_bins, link_bins_for_dep};
 use super::sweep::invalidate_changed_aube_entries;
 use super::{InstallPhaseTimings, lifecycle::resolve_link_strategy};
 use super::{bin_linking, delta};
@@ -30,6 +30,12 @@ pub(super) struct LinkPhaseInput<'a> {
     pub(super) dep_selection_filtered: bool,
     pub(super) workspace_filter_empty: bool,
     pub(super) ignore_scripts: bool,
+    /// Whether the `defaultTrust` floor could authorize *any* build
+    /// script on this install. When true, dep lifecycle scripts may run
+    /// even with no explicit allow rule, so their own deps' bins must be
+    /// linked into each dep's `.bin` (see `link_dep_bins`). Mirrors the
+    /// lifecycle-phase gate in `finalize.rs`.
+    pub(super) floor_may_allow_any: bool,
     pub(super) prog_ref: Option<&'a crate::progress::InstallProgress>,
     pub(super) phase_timings: &'a mut InstallPhaseTimings,
 }
@@ -66,6 +72,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         dep_selection_filtered,
         workspace_filter_empty,
         ignore_scripts,
+        floor_may_allow_any,
         prog_ref,
         phase_timings,
     } = input;
@@ -421,16 +428,29 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
                 }
             }
         }
-        if !ignore_scripts && build_policy.has_any_allow_rule() {
-            link_dep_bins(
-                aube_dir,
-                graph_for_link,
-                virtual_store_dir_max_length,
-                placements_ref,
-                shim_opts,
-                &mut pkg_json_cache,
-            )?;
-        }
+        // Gate matches the lifecycle phase's (`finalize.rs`) via the
+        // shared `dep_build_scripts_may_run` predicate, threaded through
+        // `maybe_link_dep_bins` (single, testable home for the decision):
+        // the `defaultTrust` floor can authorize a package's build
+        // scripts with no explicit allow rule, and those scripts call
+        // binaries declared in the package's own `dependencies` — which
+        // must be shimmed into the dep's `.bin` and put on PATH. Gating
+        // only on `has_any_allow_rule()` skipped this whole pass on a
+        // pure trust-floor install, so a postinstall calling a
+        // dep-provided CLI (e.g. lmdb's
+        // `node-gyp-build-optional-packages`) failed with exit 127 even
+        // though the script itself ran.
+        bin_linking::maybe_link_dep_bins(
+            ignore_scripts,
+            build_policy.has_any_allow_rule(),
+            floor_may_allow_any,
+            aube_dir,
+            graph_for_link,
+            virtual_store_dir_max_length,
+            placements_ref,
+            shim_opts,
+            &mut pkg_json_cache,
+        )?;
         tracing::debug!("phase:link_bins {:.1?}", phase_start.elapsed());
         phase_timings.record("link_bins", phase_start.elapsed());
     }
