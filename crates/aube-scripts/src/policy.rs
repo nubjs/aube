@@ -313,6 +313,23 @@ impl BuildPolicy {
             || !self.allowed_wildcards.is_empty()
     }
 
+    /// Stable fingerprint of the resolved policy shape. Used by the
+    /// install-state delta path: if approvals/denials changed, the
+    /// next install must fall back to the full eligible build scan so
+    /// newly approved unchanged packages still get a chance to run.
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"build-policy-v1");
+        hasher.update(if self.allow_all { b"\x01" } else { b"\x00" });
+        hash_set(&mut hasher, b"allowed", &self.allowed);
+        hash_set(&mut hasher, b"denied", &self.denied);
+        hash_set(&mut hasher, b"allowed_sources", &self.allowed_sources);
+        hash_set(&mut hasher, b"denied_sources", &self.denied_sources);
+        hash_vec(&mut hasher, b"allowed_wildcards", &self.allowed_wildcards);
+        hash_vec(&mut hasher, b"denied_wildcards", &self.denied_wildcards);
+        hasher.finalize().to_hex().to_string()
+    }
+
     /// Merge another resolved policy into this one. Denies from either
     /// policy still win at decision time.
     pub fn merge(&mut self, other: &Self) {
@@ -333,6 +350,28 @@ fn merge_unique(target: &mut Vec<String>, source: &[String]) {
         if !target.iter().any(|existing| existing == value) {
             target.push(value.clone());
         }
+    }
+}
+
+fn hash_set(hasher: &mut blake3::Hasher, tag: &[u8], set: &HashSet<String>) {
+    let mut values: Vec<&String> = set.iter().collect();
+    values.sort();
+    hash_iter(hasher, tag, values.into_iter().map(String::as_str));
+}
+
+fn hash_vec(hasher: &mut blake3::Hasher, tag: &[u8], values: &[String]) {
+    let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
+    values.sort();
+    hash_iter(hasher, tag, values.into_iter());
+}
+
+fn hash_iter<'a>(hasher: &mut blake3::Hasher, tag: &[u8], values: impl Iterator<Item = &'a str>) {
+    let values: Vec<&str> = values.collect();
+    hasher.update(tag);
+    hasher.update(&(values.len() as u64).to_le_bytes());
+    for value in values {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
     }
 }
 

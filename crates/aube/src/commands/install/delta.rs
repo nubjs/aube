@@ -7,7 +7,7 @@
 //!
 //! Fix. blake3 each package over the fields that actually change
 //! what hits disk. name, version, integrity, sorted dependencies,
-//! os, cpu, libc, tarball_url, alias_of, local_source. Diff the
+//! os, cpu, libc, alias_of, local_source. Diff the
 //! old and new maps. Emit [`DeltaPlan`] with added, removed,
 //! changed.
 //!
@@ -22,8 +22,13 @@
 //! already folded into dependencies by the resolver. engines is
 //! advisory. bin reads at link time from the extracted tarball.
 //! bundled_dependencies ride inside the tarball so any change moves
-//! the sha512 integrity. yarn_checksum and deprecated are metadata,
-//! not content. has_bin is a flag derived from bin.
+//! the sha512 integrity. tarball_url is usually registry metadata
+//! when integrity is present (and may disappear on a lockfile-derived
+//! graph when `lockfileIncludeTarballUrl=false`), but it is content
+//! identity for no-integrity, hosted-git, and non-derivable registry
+//! URLs. remote tarball sources still include their URL through
+//! `local_source`. yarn_checksum and deprecated are metadata, not
+//! content. has_bin is a flag derived from bin.
 
 use aube_lockfile::{LocalSource, LockedPackage, LockfileGraph};
 use blake3::Hasher;
@@ -242,8 +247,9 @@ pub fn compute_subtree_hashes_from_leaf(
         let Some(&from) = scc_index.get(dep_path) else {
             continue;
         };
-        for child in pkg.dependencies.values() {
-            if let Some(&to) = scc_index.get(child)
+        for (child_name, child_tail) in &pkg.dependencies {
+            let child_dep_path = dependency_dep_path(child_name, child_tail);
+            if let Some(&to) = scc_index.get(&child_dep_path)
                 && to != from
             {
                 condensed[from].insert(to);
@@ -322,8 +328,11 @@ fn tarjan_scc(graph: &LockfileGraph) -> Vec<Vec<String>> {
         .map(|i| {
             let pkg = graph.packages.get(nodes[i]).unwrap();
             pkg.dependencies
-                .values()
-                .filter_map(|child| index_of.get(child).copied())
+                .iter()
+                .filter_map(|(child_name, child_tail)| {
+                    let child_dep_path = dependency_dep_path(child_name, child_tail);
+                    index_of.get(&child_dep_path).copied()
+                })
                 .collect()
         })
         .collect();
@@ -374,6 +383,10 @@ fn tarjan_scc(graph: &LockfileGraph) -> Vec<Vec<String>> {
         }
     }
     out
+}
+
+fn dependency_dep_path(name: &str, tail: &str) -> String {
+    format!("{name}@{tail}")
 }
 
 fn dfs_post(start: usize, edges: &[BTreeSet<usize>], seen: &mut [bool], order: &mut Vec<usize>) {
@@ -437,9 +450,13 @@ fn fingerprint(pkg: &LockedPackage, patch_hash: Option<&str>, project_root: &Pat
     update_field(&mut h, b"version", pkg.version.as_bytes());
     update_field(&mut h, b"dep_path", pkg.dep_path.as_bytes());
     update_optional(&mut h, b"integrity", pkg.integrity.as_deref());
-    update_optional(&mut h, b"tarball_url", pkg.tarball_url.as_deref());
     update_optional(&mut h, b"alias_of", pkg.alias_of.as_deref());
     update_optional(&mut h, b"patch", patch_hash);
+    if let Some(tarball_url) = pkg.tarball_url.as_deref()
+        && tarball_url_affects_content_identity(pkg, tarball_url)
+    {
+        update_field(&mut h, b"tarball_url", tarball_url.as_bytes());
+    }
     // BTreeMap iteration is canonical. Length-prefix every entry so
     // "a" -> "bc" cannot collide with "ab" -> "c".
     h.update(b"deps");
@@ -503,6 +520,24 @@ fn fingerprint(pkg: &LockedPackage, patch_hash: Option<&str>, project_root: &Pat
     h.finalize().to_hex().to_string()
 }
 
+fn tarball_url_affects_content_identity(pkg: &LockedPackage, tarball_url: &str) -> bool {
+    pkg.integrity.is_none()
+        || pkg.registry_git_hosted
+        || registry_tarball_url_is_not_derivable(pkg.registry_name(), &pkg.version, tarball_url)
+}
+
+fn registry_tarball_url_is_not_derivable(name: &str, version: &str, tarball_url: &str) -> bool {
+    let basename = name.rsplit('/').next().unwrap_or(name);
+    let expected_suffix = format!("/-/{basename}-{version}.tgz");
+    let path_only = tarball_url
+        .split_once('?')
+        .map_or(tarball_url, |(path, _)| path);
+    let path_only = path_only
+        .split_once('#')
+        .map_or(path_only, |(path, _)| path);
+    !path_only.ends_with(&expected_suffix)
+}
+
 fn update_field(h: &mut Hasher, tag: &[u8], bytes: &[u8]) {
     h.update(tag);
     h.update(&(bytes.len() as u64).to_le_bytes());
@@ -547,7 +582,7 @@ mod tests {
         let mut pkg = pkg(name, version);
         for (dep_name, dep_version) in deps {
             pkg.dependencies
-                .insert((*dep_name).to_string(), format!("{dep_name}@{dep_version}"));
+                .insert((*dep_name).to_string(), (*dep_version).to_string());
         }
         pkg
     }
@@ -724,6 +759,21 @@ mod tests {
     }
 
     #[test]
+    fn changed_subtree_roots_uses_dependency_tail_values() {
+        let app = pkg_with_deps("app", "1", &[("dep", "1")]);
+        let mut before_dep = pkg("dep", "1");
+        let mut after_dep = before_dep.clone();
+        before_dep.integrity = Some("sha512-before".into());
+        after_dep.integrity = Some("sha512-after".into());
+
+        let before = csh(&graph_of(&[app.clone(), before_dep]));
+        let after = csh(&graph_of(&[app, after_dep]));
+        let changed = changed_subtree_roots(&before, &after);
+
+        assert_eq!(changed, vec!["app@1".to_string(), "dep@1".to_string()]);
+    }
+
+    #[test]
     fn patch_hash_change_lands_in_changed_bucket() {
         // Same lockfile, same integrity. Only `pnpm.patchedDependencies`
         // moved. Without folding patch hash into the fingerprint this
@@ -772,9 +822,40 @@ mod tests {
     fn tarball_url_edit_changes_fingerprint() {
         let mut a = pkg("a", "1");
         let mut b = a.clone();
-        a.tarball_url = Some("https://a.example/a-1.tgz".into());
-        b.tarball_url = Some("https://b.example/a-1.tgz".into());
+        a.tarball_url = Some("https://cdn-a.example/downloads/a-1.tgz".into());
+        b.tarball_url = Some("https://cdn-b.example/downloads/a-1.tgz".into());
         assert_ne!(fp(&a), fp(&b));
+    }
+
+    #[test]
+    fn no_integrity_tarball_url_changes_fingerprint() {
+        let mut a = pkg("a", "1");
+        let mut b = a.clone();
+        a.integrity = None;
+        b.integrity = None;
+        a.tarball_url = Some("https://registry-a.example/a/-/a-1.tgz".into());
+        b.tarball_url = Some("https://registry-b.example/a/-/a-1.tgz".into());
+        assert_ne!(fp(&a), fp(&b));
+    }
+
+    #[test]
+    fn hosted_git_tarball_url_changes_fingerprint() {
+        let mut a = pkg("a", "1");
+        let mut b = a.clone();
+        a.registry_git_hosted = true;
+        b.registry_git_hosted = true;
+        a.tarball_url = Some("https://codeload.github.com/org/a/tar.gz/aaa".into());
+        b.tarball_url = Some("https://codeload.github.com/org/a/tar.gz/bbb".into());
+        assert_ne!(fp(&a), fp(&b));
+    }
+
+    #[test]
+    fn derivable_registry_tarball_url_with_integrity_is_not_identity() {
+        let mut a = pkg("a", "1");
+        let mut b = a.clone();
+        a.tarball_url = Some("https://registry-a.example/a/-/a-1.tgz?cache=a".into());
+        b.tarball_url = Some("https://registry-b.example/a/-/a-1.tgz#cache-b".into());
+        assert_eq!(fp(&a), fp(&b));
     }
 
     #[test]
@@ -868,7 +949,7 @@ mod tests {
         // child's subtree hash AND parent's.
         let mut child = pkg("leaf", "1");
         let mut parent = pkg("root", "1");
-        parent.dependencies.insert("leaf".into(), "leaf@1".into());
+        parent.dependencies.insert("leaf".into(), "1".into());
         let g_before = graph_of(&[parent.clone(), child.clone()]);
         child.integrity = Some("sha512-tampered".into());
         let g_after = graph_of(&[parent, child]);
@@ -884,9 +965,9 @@ mod tests {
         // they sit at the same depth. Edits to sibling A must not
         // ripple into sibling B's subtree hash.
         let mut pa = pkg("pa", "1");
-        pa.dependencies.insert("leaf-a".into(), "leaf-a@1".into());
+        pa.dependencies.insert("leaf-a".into(), "1".into());
         let mut pb = pkg("pb", "1");
-        pb.dependencies.insert("leaf-b".into(), "leaf-b@1".into());
+        pb.dependencies.insert("leaf-b".into(), "1".into());
         let la = pkg("leaf-a", "1");
         let lb = pkg("leaf-b", "1");
         let g1 = graph_of(&[pa.clone(), pb.clone(), la.clone(), lb.clone()]);
@@ -907,8 +988,8 @@ mod tests {
         // hash without infinite recursion.
         let mut a = pkg("a", "1");
         let mut b = pkg("b", "1");
-        a.dependencies.insert("b".into(), "b@1".into());
-        b.dependencies.insert("a".into(), "a@1".into());
+        a.dependencies.insert("b".into(), "1".into());
+        b.dependencies.insert("a".into(), "1".into());
         let g = graph_of(&[a, b]);
         let hashes = csh(&g);
         assert_eq!(hashes.len(), 2);

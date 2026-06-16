@@ -19,6 +19,7 @@ include = ["src/**/*.rs"]
 aube-codes = { workspace = true }
 aube-manifest = { workspace = true }
 aube-util = { workspace = true }
+blake3 = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }

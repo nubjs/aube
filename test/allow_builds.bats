@@ -17,6 +17,23 @@ teardown() {
 	_common_teardown
 }
 
+disable_delta_build_caches() {
+	cat >>.npmrc <<'RC'
+sideEffectsCache=false
+enableGlobalVirtualStore=false
+RC
+}
+
+poison_installed_marker_build() {
+	rm -f aube-builds-marker.txt
+	pkg_json="$(find . -path '*/node_modules/aube-test-builds-marker/package.json' -print | head -n 1)"
+	[ -n "$pkg_json" ]
+	# Break any hardlink to the store before mutating the installed copy.
+	cp "$pkg_json" "$pkg_json.tmp"
+	mv "$pkg_json.tmp" "$pkg_json"
+	node -e 'const fs = require("fs"); const file = process.argv[1]; const pkg = JSON.parse(fs.readFileSync(file, "utf8")); pkg.scripts.postinstall = `node -e "process.exit(42)"`; fs.writeFileSync(file, JSON.stringify(pkg));' "$pkg_json"
+}
+
 @test "dep lifecycle scripts are skipped by default" {
 	cat >package.json <<'JSON'
 {
@@ -52,6 +69,158 @@ JSON
 	assert_file_exists aube-builds-marker.txt
 	run cat aube-builds-marker.txt
 	assert_output "ran:aube-test-builds-marker@1.0.0"
+}
+
+@test "aube add does not rerun unchanged allowlisted dep build scripts" {
+	disable_delta_build_caches
+	cat >package.json <<'JSON'
+{
+  "name": "allow-builds-delta-add-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "aube-test-builds-marker": "^1.0.0"
+  },
+  "pnpm": {
+    "allowBuilds": {
+      "aube-test-builds-marker": true
+    }
+  }
+}
+JSON
+	run aube install
+	assert_success
+	assert_file_exists aube-builds-marker.txt
+	run cat aube-builds-marker.txt
+	assert_output "ran:aube-test-builds-marker@1.0.0"
+
+	poison_installed_marker_build
+
+	run aube add abbrev@4.0.0
+	assert_success
+	assert_file_not_exists aube-builds-marker.txt
+}
+
+@test "aube remove does not rerun unchanged allowlisted dep build scripts" {
+	disable_delta_build_caches
+	cat >package.json <<'JSON'
+{
+  "name": "allow-builds-delta-remove-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "aube-test-builds-marker": "^1.0.0",
+    "abbrev": "4.0.0"
+  },
+  "pnpm": {
+    "allowBuilds": {
+      "aube-test-builds-marker": true
+    }
+  }
+}
+JSON
+	run aube install
+	assert_success
+	assert_file_exists aube-builds-marker.txt
+
+	poison_installed_marker_build
+
+	run aube remove abbrev
+	assert_success
+	assert_file_not_exists aube-builds-marker.txt
+}
+
+@test "--ignore-scripts install does not seed lifecycle delta state" {
+	disable_delta_build_caches
+	cat >package.json <<'JSON'
+{
+  "name": "allow-builds-ignore-scripts-delta-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "aube-test-builds-marker": "^1.0.0"
+  },
+  "pnpm": {
+    "allowBuilds": {
+      "aube-test-builds-marker": true
+    }
+  }
+}
+JSON
+	run aube install --ignore-scripts
+	assert_success
+	assert_file_not_exists aube-builds-marker.txt
+
+	run aube add abbrev@4.0.0
+	assert_success
+	assert_file_exists aube-builds-marker.txt
+}
+
+@test "--ignore-scripts install does not make a later plain install look fresh" {
+	disable_delta_build_caches
+	cat >package.json <<'JSON'
+{
+  "name": "allow-builds-ignore-scripts-noop-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "aube-test-builds-marker": "^1.0.0"
+  },
+  "pnpm": {
+    "allowBuilds": {
+      "aube-test-builds-marker": true
+    }
+  }
+}
+JSON
+	run aube install --ignore-scripts
+	assert_success
+	assert_file_not_exists aube-builds-marker.txt
+
+	run aube install
+	assert_success
+	assert_file_exists aube-builds-marker.txt
+}
+
+@test "filtered workspace add does not rerun unchanged allowlisted dep build scripts" {
+	disable_delta_build_caches
+	cat >pnpm-workspace.yaml <<'YAML'
+packages:
+  - "packages/*"
+YAML
+	cat >package.json <<'JSON'
+{
+  "name": "allow-builds-filtered-root",
+  "version": "1.0.0",
+  "private": true,
+  "pnpm": {
+    "allowBuilds": {
+      "aube-test-builds-marker": true
+    }
+  }
+}
+JSON
+	mkdir -p packages/app packages/api
+	cat >packages/app/package.json <<'JSON'
+{
+  "name": "@scope/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "aube-test-builds-marker": "^1.0.0"
+  }
+}
+JSON
+	cat >packages/api/package.json <<'JSON'
+{
+  "name": "@scope/api",
+  "version": "1.0.0"
+}
+JSON
+	run aube install
+	assert_success
+	assert_file_exists aube-builds-marker.txt
+
+	poison_installed_marker_build
+
+	run aube --filter '@scope/app' add abbrev@4.0.0
+	assert_success
+	assert_file_not_exists aube-builds-marker.txt
 }
 
 @test "pnpm.allowBuilds with false explicitly denies a package" {

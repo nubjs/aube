@@ -203,6 +203,7 @@ pub async fn run(
                     })
                     .unwrap_or(super::install::SideEffectsCacheConfig::Disabled),
                 &jail_policy,
+                None,
                 selected.as_ref(),
             )
             .await?;

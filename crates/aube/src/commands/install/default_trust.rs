@@ -88,6 +88,16 @@ impl DefaultTrustFloor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_enabled(age_cutoff: &str) -> Self {
+        Self {
+            enabled: true,
+            osv_gate_active: true,
+            lockfile_vetted: false,
+            age_cutoff: Some(age_cutoff.to_string()),
+        }
+    }
+
     /// Resolve the floor from settings. `mra_cli_minutes` is the same
     /// CLI override the resolver's `minimumReleaseAge` receives so the
     /// floor and the resolver agree on the window.
@@ -122,6 +132,33 @@ impl DefaultTrustFloor {
     /// fast path when the floor can't fire anyway.
     pub(crate) fn may_allow_any(&self) -> bool {
         self.enabled && self.has_advisory_vetting() && self.age_cutoff.is_some()
+    }
+
+    /// Stable fragment for install-state lifecycle scheduling. If
+    /// the floor's effective trust posture changes between installs,
+    /// the delta build path must fall back to the full eligible scan
+    /// so packages that just became trusted are not skipped merely
+    /// because their package bytes are unchanged.
+    pub(crate) fn fingerprint(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"default-trust-floor-v1");
+        hasher.update(if self.enabled { b"\x01" } else { b"\x00" });
+        hasher.update(if self.osv_gate_active {
+            b"\x01"
+        } else {
+            b"\x00"
+        });
+        hasher.update(if self.lockfile_vetted {
+            b"\x01"
+        } else {
+            b"\x00"
+        });
+        hasher.update(if self.age_cutoff.is_some() {
+            b"\x01"
+        } else {
+            b"\x00"
+        });
+        hasher.finalize().to_hex().to_string()
     }
 
     /// The advisory-vetting precondition for trusting the allowlist:

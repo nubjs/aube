@@ -64,6 +64,14 @@ pub struct InstallState {
     pub section_filtered: bool,
     #[serde(default)]
     pub settings_hash: String,
+    /// Resolved dependency-build scheduling policy. This is separate
+    /// from `settings_hash` and `package_json_hashes`: add/remove
+    /// legitimately changes the root manifest, but an unchanged
+    /// `allowBuilds` / default-trust posture can still use package
+    /// delta scheduling. Missing or changed values fall back to the
+    /// full eligible build scan.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dep_build_policy_hash: String,
     /// Per-package content fingerprints from the last install,
     /// keyed by dep_path. Drives delta installs. Next install diffs
     /// these against the new lockfile's hashes and only re-fetches
@@ -123,6 +131,8 @@ struct FreshnessState {
     section_filtered: bool,
     #[serde(default)]
     settings_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    dep_build_policy_hash: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     package_json_shape_digests: BTreeMap<String, String>,
     #[serde(default)]
@@ -182,6 +192,7 @@ impl From<&InstallState> for FreshnessState {
             package_json_meta: state.package_json_meta.clone(),
             section_filtered: state.section_filtered,
             settings_hash: state.settings_hash.clone(),
+            dep_build_policy_hash: state.dep_build_policy_hash.clone(),
             package_json_shape_digests: state.package_json_shape_digests.clone(),
             layout: state.layout.clone(),
             unreviewed_builds: state.unreviewed_builds.clone(),
@@ -290,6 +301,9 @@ fn check_needs_install_inner(
             "previous install omitted dependency sections; auto-installing full graph".into(),
         );
     }
+    if state.dep_build_policy_hash.is_empty() {
+        return Some("dependency build policy state is missing".into());
+    }
 
     let _diag_layout =
         aube_util::diag::Span::new(aube_util::diag::Category::Frozen, "verify_install_layout");
@@ -337,6 +351,7 @@ pub fn restore_missing_lockfile_if_fresh(
     };
     if package_jsons_stale(project_dir, &state).is_some()
         || state.section_filtered
+        || state.dep_build_policy_hash.is_empty()
         || verify_install_layout(project_dir, state.layout.as_ref()).is_some()
         || hash_settings(project_dir, cli_flags) != state.settings_hash
     {
@@ -417,6 +432,7 @@ pub struct WriteStateInput<'a> {
     pub package_content_hashes: BTreeMap<String, String>,
     pub graph_lthash: String,
     pub package_subtree_hashes: BTreeMap<String, String>,
+    pub dep_build_policy_hash: String,
     pub layout: WriteStateLayout<'a>,
     pub unreviewed_builds: Vec<String>,
 }
@@ -429,6 +445,7 @@ pub fn write_state(project_dir: &Path, input: WriteStateInput<'_>) -> Result<(),
         package_content_hashes,
         graph_lthash,
         package_subtree_hashes,
+        dep_build_policy_hash,
         layout,
         unreviewed_builds,
     } = input;
@@ -488,6 +505,7 @@ pub fn write_state(project_dir: &Path, input: WriteStateInput<'_>) -> Result<(),
         aube_version: env!("CARGO_PKG_VERSION").to_string(),
         section_filtered,
         settings_hash,
+        dep_build_policy_hash,
         package_content_hashes,
         graph_lthash,
         package_subtree_hashes,
@@ -553,6 +571,17 @@ pub fn read_state_subtree_hashes(project_dir: &Path) -> Option<BTreeMap<String, 
         return None;
     }
     Some(state.package_subtree_hashes)
+}
+
+/// Read the resolved dependency-build policy hash from the last
+/// install. Missing field means the install predates lifecycle delta
+/// scheduling, so callers fall back to the full eligible build scan.
+pub fn read_state_dep_build_policy_hash(project_dir: &Path) -> Option<String> {
+    let state = read_state(&state_dir(project_dir))?;
+    if state.dep_build_policy_hash.is_empty() {
+        return None;
+    }
+    Some(state.dep_build_policy_hash)
 }
 
 /// Read the unreviewed-builds spec keys recorded by the last
@@ -1137,6 +1166,7 @@ mod tests {
             aube_version: String::new(),
             section_filtered: false,
             settings_hash: String::new(),
+            dep_build_policy_hash: String::new(),
             package_content_hashes: BTreeMap::new(),
             graph_lthash: String::new(),
             package_subtree_hashes: BTreeMap::new(),
@@ -1208,6 +1238,7 @@ mod tests {
             aube_version: env!("CARGO_PKG_VERSION").to_string(),
             section_filtered: false,
             settings_hash: "blake3:settings".to_string(),
+            dep_build_policy_hash: "blake3:dep-build-policy".to_string(),
             package_content_hashes: BTreeMap::from([(
                 "is-odd@3.0.1".to_string(),
                 "blake3:content".to_string(),
@@ -1261,6 +1292,7 @@ mod tests {
             aube_version: env!("CARGO_PKG_VERSION").to_string(),
             section_filtered: false,
             settings_hash: String::new(),
+            dep_build_policy_hash: String::new(),
             package_content_hashes: BTreeMap::new(),
             graph_lthash: String::new(),
             package_subtree_hashes: BTreeMap::new(),
@@ -1358,6 +1390,7 @@ mod tests {
             aube_version: env!("CARGO_PKG_VERSION").to_string(),
             section_filtered: false,
             settings_hash: String::new(),
+            dep_build_policy_hash: String::new(),
             package_content_hashes: BTreeMap::new(),
             graph_lthash: String::new(),
             package_subtree_hashes: BTreeMap::new(),

@@ -9,7 +9,7 @@ use super::workspace::importer_project_dir;
 use super::{InstallPhaseTimings, delta, unreviewed_builds};
 use crate::state;
 use miette::{Context, IntoDiagnostic, miette};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct FinalizePhaseInput<'a> {
     pub(super) cwd: &'a std::path::Path,
@@ -48,6 +48,95 @@ pub(super) struct FinalizePhaseInput<'a> {
     pub(super) start: std::time::Instant,
     pub(super) prog_ref: Option<&'a crate::progress::InstallProgress>,
     pub(super) phase_timings: &'a mut InstallPhaseTimings,
+}
+
+fn dep_build_policy_hash(
+    build_policy: &aube_scripts::BuildPolicy,
+    default_trust_floor: &super::default_trust::DefaultTrustFloor,
+) -> String {
+    let policy = build_policy.fingerprint();
+    let floor = default_trust_floor.fingerprint();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dep-build-policy-v1");
+    hasher.update(&(policy.len() as u64).to_le_bytes());
+    hasher.update(policy.as_bytes());
+    hasher.update(&(floor.len() as u64).to_le_bytes());
+    hasher.update(floor.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn lifecycle_delta_filter(
+    cwd: &std::path::Path,
+    graph_for_link: &aube_lockfile::LockfileGraph,
+    patch_hashes: &BTreeMap<String, String>,
+    build_policy: &aube_scripts::BuildPolicy,
+    default_trust_floor: &super::default_trust::DefaultTrustFloor,
+    dep_build_policy_hash: &str,
+    virtual_store_only: bool,
+) -> Option<BTreeSet<String>> {
+    if virtual_store_only {
+        return None;
+    }
+    let prior_policy_hash = state::read_state_dep_build_policy_hash(cwd)?;
+    if prior_policy_hash != dep_build_policy_hash {
+        tracing::debug!("delta: dep build policy changed; running full eligible build scan");
+        return None;
+    }
+    let prior_leaf_hashes = state::read_state_package_content_hashes(cwd)?;
+    let prior_subtree_hashes = state::read_state_subtree_hashes(cwd)?;
+    let (current_leaf_hashes, current_subtree_hashes) =
+        delta::compute_leaf_and_subtree_hashes(graph_for_link, patch_hashes, cwd);
+    let plan = delta::diff(&prior_leaf_hashes, &current_leaf_hashes);
+    let mut selected = plan.touched_set().clone();
+    selected.extend(delta::changed_subtree_roots(
+        &prior_subtree_hashes,
+        &current_subtree_hashes,
+    ));
+    let prior_unreviewed: BTreeSet<String> = state::read_state_unreviewed_builds(cwd)
+        .into_iter()
+        .collect();
+    select_previously_unreviewed_now_allowed(
+        &mut selected,
+        graph_for_link,
+        build_policy,
+        default_trust_floor,
+        &prior_unreviewed,
+    );
+    tracing::debug!(
+        "delta: dep lifecycle selected {} package(s) (leaf touched {}, graph total {})",
+        selected.len(),
+        plan.touched(),
+        current_leaf_hashes.len(),
+    );
+    Some(selected)
+}
+
+fn select_previously_unreviewed_now_allowed(
+    selected: &mut BTreeSet<String>,
+    graph_for_link: &aube_lockfile::LockfileGraph,
+    build_policy: &aube_scripts::BuildPolicy,
+    default_trust_floor: &super::default_trust::DefaultTrustFloor,
+    prior_unreviewed: &BTreeSet<String>,
+) {
+    if prior_unreviewed.is_empty() {
+        return;
+    }
+    for (dep_path, pkg) in &graph_for_link.packages {
+        if !prior_unreviewed.contains(&pkg.spec_key()) {
+            continue;
+        }
+        if matches!(
+            super::default_trust::decide_with_floor(
+                build_policy,
+                default_trust_floor,
+                pkg,
+                &graph_for_link.times,
+            ),
+            aube_scripts::AllowDecision::Allow
+        ) {
+            selected.insert(dep_path.clone());
+        }
+    }
 }
 
 pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette::Result<()> {
@@ -125,6 +214,22 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
         }
     }
 
+    let filtered_install = !workspace_filter_empty || dep_selection.is_filtered();
+    let dep_build_policy_hash = dep_build_policy_hash(build_policy, default_trust_floor);
+    let lifecycle_delta_filter = if ignore_scripts {
+        None
+    } else {
+        lifecycle_delta_filter(
+            cwd,
+            graph_for_link,
+            &patch_hashes,
+            build_policy,
+            default_trust_floor,
+            &dep_build_policy_hash,
+            virtual_store_only,
+        )
+    };
+
     // 7a. Dependency lifecycle scripts (allowBuilds).
     //     Every dep that the `BuildPolicy` explicitly allows runs its
     //     `preinstall` / `install` / `postinstall` scripts from inside
@@ -171,6 +276,7 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             placements_ref,
             side_effects_cache,
             jail_policy,
+            lifecycle_delta_filter.as_ref(),
             None,
         )
         .await?;
@@ -216,8 +322,6 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
     //    the warm path while unfiltered importers are still empty.
     //    Observed via `aube add <pkg> --filter <ws>` leaving the new
     //    dep unmaterialized.
-    let filtered_install = !workspace_filter_empty || dep_selection.is_filtered();
-
     // Walk the linked graph once for the unreviewed-builds set; reused
     // by both the state writer (so warm-path repeats keep nudging) and
     // the post-install warning emission below. The walk does a stat per
@@ -371,6 +475,11 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
                 package_content_hashes,
                 graph_lthash,
                 package_subtree_hashes,
+                dep_build_policy_hash: if ignore_scripts {
+                    String::new()
+                } else {
+                    dep_build_policy_hash
+                },
                 layout: state::WriteStateLayout {
                     graph: graph_for_link,
                     node_linker,
@@ -483,4 +592,50 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aube_lockfile::{LockedPackage, LockfileGraph};
+
+    fn policy() -> aube_scripts::BuildPolicy {
+        let (policy, warnings) =
+            aube_scripts::BuildPolicy::from_config(&BTreeMap::new(), &[], &[], false);
+        assert!(
+            warnings.is_empty(),
+            "unexpected policy warnings: {warnings:?}"
+        );
+        policy
+    }
+
+    #[test]
+    fn lifecycle_delta_selects_prior_unreviewed_now_allowed_by_default_trust() {
+        let mut graph = LockfileGraph::default();
+        let pkg = LockedPackage {
+            name: "esbuild".into(),
+            version: "1.0.0".into(),
+            dep_path: "esbuild@1.0.0".into(),
+            integrity: Some("sha512-esbuild".into()),
+            ..Default::default()
+        };
+        graph
+            .times
+            .insert("esbuild@1.0.0".into(), "2000-01-01T00:00:00.000Z".into());
+        graph.packages.insert(pkg.dep_path.clone(), pkg);
+
+        let mut selected = BTreeSet::new();
+        let prior_unreviewed = BTreeSet::from(["esbuild@1.0.0".to_string()]);
+        select_previously_unreviewed_now_allowed(
+            &mut selected,
+            &graph,
+            &policy(),
+            &super::super::default_trust::DefaultTrustFloor::test_enabled(
+                "2100-01-01T00:00:00.000Z",
+            ),
+            &prior_unreviewed,
+        );
+
+        assert_eq!(selected, BTreeSet::from(["esbuild@1.0.0".to_string()]));
+    }
 }

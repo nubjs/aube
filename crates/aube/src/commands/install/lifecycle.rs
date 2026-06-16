@@ -377,6 +377,12 @@ pub(crate) async fn run_dep_lifecycle_scripts(
     placements: Option<&aube_linker::HoistedPlacements>,
     side_effects_cache: SideEffectsCacheConfig<'_>,
     jail_policy: &JailBuildPolicy,
+    // `Some` enables install-delta mode: only current graph entries
+    // whose dep_path changed since the prior install are eligible.
+    // Policy still gates those packages below. This differs from
+    // `selected_names`, which is rebuild's explicit user selection
+    // and intentionally bypasses policy.
+    selected_dep_paths: Option<&std::collections::BTreeSet<String>>,
     // `Some` enables selective mode: only deps whose in-tree `name`
     // (the alias when one is configured) is in the set are eligible,
     // and the policy is bypassed for those deps. `None` is the
@@ -410,6 +416,11 @@ pub(crate) async fn run_dep_lifecycle_scripts(
     let mut jobs: Vec<BuildJob> = Vec::new();
     let mut floor_trusted: Vec<String> = Vec::new();
     for (dep_path, pkg) in &graph.packages {
+        if let Some(selected) = selected_dep_paths
+            && !selected.contains(dep_path)
+        {
+            continue;
+        }
         // True when this package runs only because the `defaultTrust`
         // floor vouched for it (policy said `Unspecified`). Recorded
         // alongside the job so the floor is never silent about what

@@ -458,6 +458,7 @@ dependencies = [
  "aube-codes",
  "aube-manifest",
  "aube-util",
+ "blake3",
  "landlock",
  "libc",
  "miette",
