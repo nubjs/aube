@@ -1092,6 +1092,125 @@ pub fn has_dep_lifecycle_work(package_dir: &Path, manifest: &PackageJson) -> boo
     default_install_script(package_dir, manifest).is_some()
 }
 
+/// Break any content-addressed-store hardlinks under a freshly
+/// materialized package directory before a lifecycle script is allowed
+/// to mutate it in place.
+///
+/// On a copy-on-write filesystem (APFS clonefile, btrfs/xfs FICLONE)
+/// the linker reflinks store blobs into the package directory, so every
+/// materialized file already has its own inode and an in-place write
+/// touches only the project copy. On a hardlink filesystem (the
+/// ext4/most-Linux/CI default) the linker hard-links the store blob
+/// into the package directory instead: the materialized file *shares*
+/// the store inode. A dependency's `install`/`postinstall` runs with
+/// its `current_dir` set to this directory, and a build step that
+/// rewrites a file in place (node-gyp emitting `build/Release/*.node`, a
+/// postinstall patching its own sources) writes *through* the shared
+/// inode and corrupts the machine-wide store blob — poisoning every
+/// other project on the machine whose content hash matches.
+///
+/// This walks `package_dir` and, for every regular file whose hard-link
+/// count is greater than one (i.e. it still shares an inode with the
+/// store, or with a sibling project's materialized copy), replaces it
+/// with a private copy on a fresh inode: copy the bytes to a sibling
+/// temp file, restore the mode, then atomically rename it over the
+/// original. After this the build script can only ever write to inodes
+/// this project owns.
+///
+/// It is a deliberate no-op on reflink/copy filesystems: a reflinked or
+/// copied file has `nlink == 1`, so the link count gate skips it and
+/// behavior is byte-for-byte unchanged from before this pass existed.
+/// The scope is one package directory — only the dep about to build —
+/// never the whole store. Symlinks are left as-is (they are recreated
+/// by the linker, not shared with the store) and directories are
+/// recursed into. Errors are surfaced so a half-broken copy never
+/// silently leaves a script writing through a live store link.
+///
+/// Cheap on the common path: the walk only `lstat`s each entry and acts
+/// solely on the (few) files that are still store-linked. The byte copy
+/// cost is bounded by the size of the one package being built, and only
+/// paid on hardlink filesystems for packages that actually run a build.
+#[cfg(unix)]
+pub fn break_cas_hardlinks(package_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut stack = vec![package_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // A missing dir is nothing to unshare; surface anything else.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            // `symlink_metadata` does not follow symlinks: a symlink's
+            // own nlink is irrelevant (the linker recreates these; they
+            // never share a store inode), and following it could walk
+            // out of the package or deref a store path we must not edit.
+            let meta = std::fs::symlink_metadata(&path)?;
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            // nlink == 1 means this file already owns its inode (reflink
+            // or copy strategy, or already unshared): leave it untouched
+            // so reflink/copy filesystems stay byte-for-byte unchanged.
+            if meta.nlink() <= 1 {
+                continue;
+            }
+            unshare_one_file(&path, meta.permissions().mode())?;
+        }
+    }
+    Ok(())
+}
+
+/// Replace a single hardlinked file with a private copy on a fresh
+/// inode, preserving its mode (notably the +x bit). Copy the bytes to a
+/// sibling temp file on the same directory, fix its mode, then
+/// atomically rename it over the original — the rename drops the old
+/// name's reference to the shared store inode without ever opening that
+/// inode for writing, so the store blob is never touched. A plain
+/// unlink+rewrite would also work but leaves a window where the file is
+/// absent; the temp+rename keeps the path continuously present.
+#[cfg(unix)]
+fn unshare_one_file(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bytes = std::fs::read(path)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(
+        ".aube-unshare-{}-{}.tmp",
+        std::process::id(),
+        file_name
+    ));
+    // Best-effort cleanup of a leftover temp from a crashed prior run.
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(&tmp, &bytes)?;
+    // Restore the original mode, including the +x bit, so executables
+    // stay executable. The fresh inode owner is always us, so it is
+    // owner-writable enough for the build to overwrite it (the store
+    // blobs are 0o644 / 0o755, both owner-writable).
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Run a lifecycle hook against an installed dependency's package
 /// directory. Mirrors [`run_root_hook`] but spawns inside `package_dir`
 /// (the actual linked package directory, e.g.
@@ -1547,5 +1666,156 @@ mod non_zero_exit_display_tests {
             !msg.contains("Some("),
             "exit code leaked Option Debug form: {msg}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod break_cas_hardlinks_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "aube-unshare-test-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    // The core invariant: when a materialized package file is hardlinked
+    // to the content-addressed store (nlink > 1), breaking the link gives
+    // the package file a private inode so a later in-place write can never
+    // reach the store blob. This is what stops a dep's build script from
+    // corrupting the machine-wide store on a hardlink filesystem.
+    #[test]
+    fn in_place_write_after_break_does_not_reach_the_store_blob() {
+        let root = unique_dir("repro");
+        let store_blob = root.join("store-blob");
+        let pkg_dir = root.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(&store_blob, b"PRISTINE-STORE-CONTENT").unwrap();
+        let materialized = pkg_dir.join("payload.txt");
+        // Simulate the linker's hardlink strategy: the package file shares
+        // the store blob's inode.
+        std::fs::hard_link(&store_blob, &materialized).unwrap();
+        assert_eq!(
+            std::fs::metadata(&materialized).unwrap().nlink(),
+            2,
+            "precondition: materialized file shares the store inode"
+        );
+
+        break_cas_hardlinks(&pkg_dir).unwrap();
+
+        // After unsharing, both files have their own inode.
+        assert_eq!(
+            std::fs::metadata(&materialized).unwrap().nlink(),
+            1,
+            "materialized file should own a private inode after the break"
+        );
+        assert_eq!(
+            std::fs::metadata(&store_blob).unwrap().nlink(),
+            1,
+            "store blob should no longer be shared"
+        );
+        // Content survived the unshare.
+        assert_eq!(
+            std::fs::read(&materialized).unwrap(),
+            b"PRISTINE-STORE-CONTENT"
+        );
+
+        // The decisive check: an in-place rewrite of the package file (what
+        // a build script does) leaves the store blob untouched.
+        std::fs::write(&materialized, b"BUILT-IN-PLACE").unwrap();
+        assert_eq!(
+            std::fs::read(&store_blob).unwrap(),
+            b"PRISTINE-STORE-CONTENT",
+            "store blob was corrupted through a shared inode"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // On a reflink/copy filesystem the linker produces private inodes
+    // (nlink == 1), so the pass must be a no-op: it must not touch the
+    // file's inode identity, contents, or mode.
+    #[test]
+    fn nlink_one_files_are_left_untouched() {
+        let root = unique_dir("noop");
+        let pkg_dir = root.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let f = pkg_dir.join("private.txt");
+        std::fs::write(&f, b"already-private").unwrap();
+        let inode_before = std::fs::metadata(&f).unwrap().ino();
+
+        break_cas_hardlinks(&pkg_dir).unwrap();
+
+        let meta_after = std::fs::metadata(&f).unwrap();
+        assert_eq!(
+            meta_after.ino(),
+            inode_before,
+            "an nlink==1 file must keep its inode (reflink/copy path is byte-for-byte unchanged)"
+        );
+        assert_eq!(std::fs::read(&f).unwrap(), b"already-private");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The +x bit and nested-directory structure must survive the copy:
+    // CLIs shipped via npm depend on their executable mode.
+    #[test]
+    fn preserves_executable_mode_and_recurses_into_subdirs() {
+        let root = unique_dir("mode");
+        let store_bin = root.join("store-bin");
+        let pkg_dir = root.join("pkg");
+        let nested = pkg_dir.join("bin");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&store_bin, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&store_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exe = nested.join("cli");
+        std::fs::hard_link(&store_bin, &exe).unwrap();
+        assert_eq!(std::fs::metadata(&exe).unwrap().nlink(), 2);
+
+        break_cas_hardlinks(&pkg_dir).unwrap();
+
+        let meta = std::fs::metadata(&exe).unwrap();
+        assert_eq!(meta.nlink(), 1, "nested file should be unshared");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o755,
+            "executable bit must survive the unshare"
+        );
+        // The store binary is untouched by an in-place edit of the package copy.
+        std::fs::write(&exe, b"overwritten").unwrap();
+        assert_eq!(std::fs::read(&store_bin).unwrap(), b"#!/bin/sh\necho hi\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Symlinks must be left exactly as-is — they are recreated by the
+    // linker and never share a store inode; following them could deref a
+    // store path we must not edit or walk out of the package.
+    #[test]
+    fn leaves_symlinks_in_place() {
+        let root = unique_dir("symlink");
+        let pkg_dir = root.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let real = pkg_dir.join("real.txt");
+        std::fs::write(&real, b"data").unwrap();
+        let link = pkg_dir.join("link.txt");
+        std::os::unix::fs::symlink("real.txt", &link).unwrap();
+
+        break_cas_hardlinks(&pkg_dir).unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "symlink must still be a symlink after the pass"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::Path::new("real.txt")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

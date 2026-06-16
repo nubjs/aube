@@ -610,6 +610,37 @@ pub(crate) async fn run_dep_lifecycle_scripts(
                     SideEffectsCacheRestore::Miss => {}
                 }
             }
+            // Before the lifecycle script runs in-place inside the
+            // materialized package directory, break any hardlinks that
+            // still share an inode with the content-addressed store. On a
+            // hardlink filesystem (ext4, most Linux/CI) the linker
+            // hard-links store blobs into the package dir, so an in-place
+            // build write (node-gyp emitting `build/Release/*.node`, a
+            // postinstall rewriting its own files) would otherwise write
+            // *through* the shared inode and corrupt the machine-wide
+            // store — poisoning every project that shares that content
+            // hash. On reflink/copy filesystems (APFS, btrfs/xfs) the
+            // materialized files already have private inodes (nlink == 1),
+            // so this is a no-op and the default path is unchanged.
+            // (The side-effects-cache restore branch above returns early;
+            // its `copy_dir` removes and recreates the package dir, so a
+            // restored package never reaches a live store link here.)
+            #[cfg(unix)]
+            {
+                let package_dir = job.package_dir.clone();
+                let name = job.name.clone();
+                let version = job.version.clone();
+                tokio::task::spawn_blocking(move || {
+                    aube_scripts::break_cas_hardlinks(&package_dir)
+                })
+                .await
+                .map_err(|e| miette!("store-unshare task panicked for {name}@{version}: {e}"))?
+                .map_err(|e| {
+                    miette!(
+                        "failed to break store hardlinks for {name}@{version} before build: {e}"
+                    )
+                })?;
+            }
             let tool_dirs: Vec<&std::path::Path> = node_gyp_bin_dir
                 .as_ref()
                 .as_deref()
