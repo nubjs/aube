@@ -20,11 +20,11 @@ fn pnpm_auth_ini_enabled() -> bool {
 }
 
 impl NpmConfig {
-    /// Load config by reading .npmrc files in priority order:
-    /// 1. ~/.npmrc (user)
-    /// 2. .npmrc in project dir (project)
+    /// Load config by reading npmrc-style sources in priority order:
+    /// builtin, global, user, project, auth sidecars, supported incumbent
+    /// adapters, environment.
     ///
-    /// Project-level values override user-level values. Shares file
+    /// Higher-precedence sources override lower-precedence values. Shares file
     /// discovery with [`load_npmrc_entries`] so the registry client and
     /// the generic settings resolver (`aube_cli::settings_values`) can
     /// never disagree on precedence.
