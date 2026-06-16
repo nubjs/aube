@@ -1,5 +1,6 @@
 use super::{
-    ListLocation, is_protected_key, read_merged, read_single, resolve_aliases, user_npmrc_path,
+    ListLocation, is_protected_key, read_merged, read_project_entries, read_user_entries,
+    resolve_aliases,
 };
 use clap::Args;
 use miette::miette;
@@ -25,9 +26,9 @@ pub struct GetArgs {
 
     /// Which config location(s) to read.
     ///
-    /// Defaults to `merged` — the last-write-wins view of user aube
-    /// config, `~/.npmrc`, then `./.npmrc`, matching what install
-    /// actually sees. Use `user` or `project` to restrict the lookup.
+    /// Defaults to `merged` — the last-write-wins view of the same
+    /// file-source precedence install uses. Use `user` or `project`
+    /// to restrict the lookup.
     #[arg(long, value_enum, default_value_t = ListLocation::Merged)]
     pub location: ListLocation,
 }
@@ -57,34 +58,27 @@ pub fn run(args: GetArgs) -> miette::Result<()> {
     let cwd = crate::dirs::project_root_or_cwd()?;
     let entries: Vec<(String, String)> = match args.effective_location() {
         ListLocation::Merged => read_merged(&cwd)?,
-        ListLocation::User | ListLocation::Global => {
-            // `aube_config` outranks `~/.npmrc`, so emit it last — the
-            // reversed-iteration lookup below returns the first match,
-            // i.e. the highest-precedence source for the requested key.
-            let mut entries = read_single(&user_npmrc_path()?)?;
-            entries.extend(super::aube_config::load_user_entries());
-            entries
-        }
-        ListLocation::Project => {
-            // Project-scope precedence (low → high): workspace yaml,
-            // project `.npmrc`, project `config.toml`.
-            let mut entries = super::read_workspace_yaml_flat(&cwd);
-            entries.extend(read_single(&cwd.join(".npmrc"))?);
-            entries.extend(super::aube_config::load_project_entries(&cwd));
-            entries
-        }
+        ListLocation::User | ListLocation::Global => read_user_entries(&cwd)?,
+        ListLocation::Project => read_project_entries(&cwd)?,
     };
 
-    for (k, v) in entries.iter().rev() {
-        if aliases.iter().any(|a| a == k) {
-            if args.json {
-                println!("{}", serde_json::Value::String(v.clone()));
-            } else {
-                println!("{v}");
-            }
-            return Ok(());
+    if let Some(v) = find_value(&entries, &aliases) {
+        if args.json {
+            println!("{}", serde_json::Value::String(v));
+        } else {
+            println!("{v}");
         }
+        return Ok(());
     }
     println!("undefined");
     Ok(())
+}
+
+pub(super) fn find_value(entries: &[(String, String)], aliases: &[String]) -> Option<String> {
+    for (k, v) in entries.iter().rev() {
+        if aliases.iter().any(|a| a == k) {
+            return Some(v.clone());
+        }
+    }
+    None
 }

@@ -23,6 +23,7 @@ use crate::commands::npmrc::{NpmrcEdit, user_npmrc_path};
 use aube_settings::meta as settings_meta;
 use clap::{Args, Subcommand, ValueEnum};
 use miette::miette;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Args)]
@@ -101,12 +102,12 @@ pub enum Location {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ListLocation {
-    /// Merge `~/.npmrc`, user aube config, and project `.npmrc`,
-    /// last-write-wins (same precedence install uses).
+    /// Merge every runtime settings source, last-write-wins (same
+    /// precedence install uses).
     Merged,
-    /// Only user config (`~/.config/aube/config.toml` + `~/.npmrc`)
+    /// User/global config sources.
     User,
-    /// Only `<cwd>/.npmrc`
+    /// Project config sources.
     Project,
     /// Alias for `user`.
     Global,
@@ -335,40 +336,118 @@ fn search_text_matches(haystack: &str, term: &str) -> bool {
 }
 
 /// Walk every config source in low-to-high precedence order so a later
-/// duplicate wins. Mirrors the chain the install pipeline applies via
-/// [`aube_settings::resolved`]:
-/// `userNpmrc < userAubeConfig < workspaceYaml < projectNpmrc <
-/// projectAubeConfig`. `workspaceYaml` sits above user-scope sources
-/// because it lives at the project root (scope locality). Per-setting
-/// `precedence` overrides in `settings.toml` can reorder file sources
-/// (e.g. `minimumReleaseAge` puts `workspaceYaml` first); `aube config
-/// get` shows the default-precedence view, which is accurate for the
-/// common cases.
+/// duplicate wins. Mirrors the default file-source chain generated for
+/// install/runtime settings in [`aube_settings::resolved`]:
+/// `embedderDefaults < userNpmrc < userAubeConfig < projectNpmrc <
+/// projectAubeConfig < globalConfigYaml < workspaceYaml`.
 pub(super) fn read_merged(cwd: &Path) -> miette::Result<Vec<(String, String)>> {
+    let files = crate::commands::FileSources::load(cwd);
+    let workspace_yaml = read_workspace_yaml_raw(cwd);
     let mut out = Vec::new();
-    if let Ok(user) = user_npmrc_path() {
-        out.extend(read_single(&user)?);
-    }
-    out.extend(aube_config::load_user_entries());
-    out.extend(read_workspace_yaml_flat(cwd));
-    out.extend(read_single(&cwd.join(".npmrc"))?);
-    out.extend(aube_config::load_project_entries(cwd));
+    out.extend(aube_settings::embedder_defaults().iter().cloned());
+    out.extend(files.user_npmrc);
+    out.extend(files.user_aube_config);
+    out.extend(files.project_npmrc);
+    out.extend(files.project_aube_config);
+    out.extend(read_yaml_flat(&files.global_config_yaml));
+    out.extend(read_yaml_flat(&workspace_yaml));
     Ok(out)
 }
 
-/// Surface flat scalar entries from the project's workspace yaml so
-/// `aube config get/list` can report values aube actually reads from
-/// there (`autoInstallPeers`, `nodeLinker`, `minimumReleaseAge`, …).
-/// Nested mappings (`updateConfig.ignoreDependencies`, `catalog`,
-/// `allowBuilds`) are skipped — they don't round-trip through a simple
-/// `(key, raw)` view and aren't what `config get <bare-key>` asks for.
-pub(super) fn read_workspace_yaml_flat(cwd: &Path) -> Vec<(String, String)> {
+pub(super) fn read_user_entries(cwd: &Path) -> miette::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    out.extend(aube_registry::config::load_user_npmrc_entries(cwd));
+    out.extend(aube_config::load_user_entries());
+    out.extend(read_yaml_flat(&crate::commands::load_global_config_yaml()));
+    Ok(out)
+}
+
+pub(super) fn read_project_entries(cwd: &Path) -> miette::Result<Vec<(String, String)>> {
+    let workspace_yaml = read_workspace_yaml_raw(cwd);
+    let mut out = Vec::new();
+    out.extend(aube_registry::config::load_project_npmrc_entries(cwd));
+    out.extend(aube_config::load_project_entries(cwd));
+    out.extend(read_yaml_flat(&workspace_yaml));
+    Ok(out)
+}
+
+fn read_workspace_yaml_raw(cwd: &Path) -> BTreeMap<String, yaml_serde::Value> {
     let Ok(map) = aube_manifest::workspace::load_raw(cwd) else {
-        return Vec::new();
+        return BTreeMap::new();
     };
-    map.iter()
+    map
+}
+
+fn read_yaml_flat(
+    map: &std::collections::BTreeMap<String, yaml_serde::Value>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for meta in settings_meta::all() {
+        for key in meta.workspace_yaml_keys {
+            let Some(raw) = yaml_setting_string(meta, map, key) else {
+                continue;
+            };
+            if !out.iter().any(|(existing, _)| existing == key) {
+                out.push((key.to_string(), raw));
+            }
+        }
+    }
+    let scalar_entries: Vec<_> = map
+        .iter()
         .filter_map(|(k, v)| yaml_scalar_string(v).map(|raw| (k.clone(), raw)))
-        .collect()
+        .collect();
+    for (key, raw) in scalar_entries {
+        if !out.iter().any(|(existing, _)| existing == &key) {
+            out.push((key, raw));
+        }
+    }
+    out
+}
+
+fn yaml_setting_string(
+    meta: &settings_meta::SettingMeta,
+    map: &std::collections::BTreeMap<String, yaml_serde::Value>,
+    key: &str,
+) -> Option<String> {
+    let value = aube_settings::workspace_yaml_value(map, key)?;
+    match meta.type_ {
+        "bool" => match value {
+            yaml_serde::Value::Bool(b) => Some(b.to_string()),
+            yaml_serde::Value::String(s) => aube_settings::parse_bool(s).map(|b| b.to_string()),
+            _ => None,
+        },
+        "int" => match value {
+            yaml_serde::Value::Number(n) => n.as_u64().map(|u| u.to_string()),
+            yaml_serde::Value::String(s) => s.trim().parse::<u64>().ok().map(|u| u.to_string()),
+            _ => None,
+        },
+        "list<string>" => match value {
+            yaml_serde::Value::Sequence(items) => {
+                let strings: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect();
+                if strings.is_empty() {
+                    Some("[]".to_string())
+                } else {
+                    Some(strings.join(","))
+                }
+            }
+            yaml_serde::Value::String(s) => Some(s.clone()),
+            _ => None,
+        },
+        "object" => {
+            let json = serde_json::to_value(value).ok()?;
+            json.as_object()?;
+            serde_json::to_string(&json).ok()
+        }
+        ty if is_stringish_type(ty) => yaml_scalar_string(value),
+        _ => None,
+    }
+}
+
+fn is_stringish_type(ty: &str) -> bool {
+    matches!(ty, "string" | "path" | "url") || ty.starts_with('"')
 }
 
 fn yaml_scalar_string(value: &yaml_serde::Value) -> Option<String> {
@@ -384,6 +463,7 @@ fn yaml_scalar_string(value: &yaml_serde::Value) -> Option<String> {
     }
 }
 
+#[cfg(feature = "config-tui")]
 pub(super) fn read_single(path: &std::path::Path) -> miette::Result<Vec<(String, String)>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -395,6 +475,102 @@ pub(super) fn read_single(path: &std::path::Path) -> miette::Result<Vec<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn config_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let old = std::env::var_os(key);
+            // SAFETY: config tests that mutate process env hold
+            // `config_test_lock`, and they restore the prior value on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            // SAFETY: config tests that mutate process env hold
+            // `config_test_lock`, and they restore the prior value on drop.
+            unsafe { std::env::remove_var(key) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `EnvGuard::set`.
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    struct PnpmReadGateGuard {
+        old: bool,
+    }
+
+    impl PnpmReadGateGuard {
+        fn set(enabled: bool) -> Self {
+            let old = aube_util::engine_context().read_branded_pnpm_config;
+            aube_util::update_engine_context(|ctx| ctx.read_branded_pnpm_config = enabled);
+            Self { old }
+        }
+    }
+
+    impl Drop for PnpmReadGateGuard {
+        fn drop(&mut self) {
+            let old = self.old;
+            aube_util::update_engine_context(|ctx| ctx.read_branded_pnpm_config = old);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+    }
+
+    #[cfg(unix)]
+    fn assert_returns_quickly<F>(label: &'static str, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Ok(())) => {}
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{label} blocked while reading an unrelated scoped config source")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{label} worker disconnected before reporting")
+            }
+        }
+    }
 
     #[test]
     fn protected_key_matches_npm_auth_surface() {
@@ -536,5 +712,359 @@ mod tests {
             set_cmd::preferred_write_key("something-else", &aliases),
             "auto-install-peers"
         );
+    }
+
+    #[test]
+    fn config_get_and_list_prefer_workspace_yaml_over_project_npmrc() {
+        let _lock = config_test_lock();
+        let _gate = PnpmReadGateGuard::set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        fs::write(project.join(".npmrc"), "auto-install-peers=true\n").unwrap();
+        fs::write(
+            project.join("pnpm-workspace.yaml"),
+            "autoInstallPeers: false\n",
+        )
+        .unwrap();
+
+        let entries = read_merged(project).unwrap();
+        let aliases = resolve_aliases("autoInstallPeers");
+
+        assert_eq!(
+            get_cmd::find_value(&entries, &aliases).as_deref(),
+            Some("false"),
+            "config get must report the same workspace-yaml value runtime settings resolve"
+        );
+
+        let seen = list::collect_seen(entries);
+        assert_eq!(
+            seen.get("auto-install-peers").map(String::as_str),
+            Some("false"),
+            "config list must dedupe to the workspace-yaml value"
+        );
+    }
+
+    #[test]
+    fn config_get_and_list_prefer_global_config_yaml_over_project_npmrc() {
+        let _lock = config_test_lock();
+        let _gate = PnpmReadGateGuard::set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(xdg.join("pnpm")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(project.join(".npmrc"), "auto-install-peers=true\n").unwrap();
+        fs::write(
+            xdg.join("pnpm").join("config.yaml"),
+            "autoInstallPeers: false\n",
+        )
+        .unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+
+        let entries = read_merged(&project).unwrap();
+        let aliases = resolve_aliases("auto-install-peers");
+
+        assert_eq!(
+            get_cmd::find_value(&entries, &aliases).as_deref(),
+            Some("false"),
+            "config get must report the global config.yaml value runtime settings resolve"
+        );
+
+        let seen = list::collect_seen(entries);
+        assert_eq!(
+            seen.get("auto-install-peers").map(String::as_str),
+            Some("false"),
+            "config list must dedupe to the global config.yaml value"
+        );
+    }
+
+    #[test]
+    fn config_get_and_list_keep_pnpm_yaml_sources_gated_off() {
+        let _lock = config_test_lock();
+        let _gate = PnpmReadGateGuard::set(false);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(xdg.join("pnpm")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(project.join(".npmrc"), "auto-install-peers=true\n").unwrap();
+        fs::write(
+            project.join("pnpm-workspace.yaml"),
+            "autoInstallPeers: false\n",
+        )
+        .unwrap();
+        fs::write(
+            xdg.join("pnpm").join("config.yaml"),
+            "autoInstallPeers: false\n",
+        )
+        .unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+
+        let entries = read_merged(&project).unwrap();
+        let aliases = resolve_aliases("autoInstallPeers");
+
+        assert_eq!(
+            get_cmd::find_value(&entries, &aliases).as_deref(),
+            Some("true"),
+            "pnpm-named YAML sources must stay inert when the incumbent gate is off"
+        );
+
+        let seen = list::collect_seen(entries);
+        assert_eq!(
+            seen.get("auto-install-peers").map(String::as_str),
+            Some("true"),
+            "config list must preserve the same pnpm-source gate"
+        );
+    }
+
+    #[test]
+    fn config_get_and_list_honor_npm_config_userconfig() {
+        let _lock = config_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let custom_userconfig = dir.path().join("custom-user.npmrc");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&custom_userconfig, "auto-install-peers=false\n").unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _userconfig = EnvGuard::set("NPM_CONFIG_USERCONFIG", &custom_userconfig);
+
+        let entries = read_merged(&project).unwrap();
+        let aliases = resolve_aliases("auto-install-peers");
+
+        assert_eq!(
+            get_cmd::find_value(&entries, &aliases).as_deref(),
+            Some("false"),
+            "config get must use the same userconfig relocation runtime settings use"
+        );
+
+        let seen = list::collect_seen(entries);
+        assert_eq!(
+            seen.get("auto-install-peers").map(String::as_str),
+            Some("false"),
+            "config list must include values from NPM_CONFIG_USERCONFIG"
+        );
+    }
+
+    #[test]
+    fn config_get_and_list_include_nested_workspace_yaml_lists() {
+        let _lock = config_test_lock();
+        let _gate = PnpmReadGateGuard::set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        fs::write(
+            project.join("pnpm-workspace.yaml"),
+            "updateConfig:\n  ignoreDependencies:\n    - left-pad\n",
+        )
+        .unwrap();
+
+        let entries = read_merged(project).unwrap();
+        let aliases = resolve_aliases("updateConfig.ignoreDependencies");
+
+        assert_eq!(
+            get_cmd::find_value(&entries, &aliases).as_deref(),
+            Some("left-pad"),
+            "config get must flatten metadata-declared dotted workspace YAML paths"
+        );
+
+        let seen = list::collect_seen(entries);
+        assert_eq!(
+            seen.get("updateConfig.ignoreDependencies")
+                .map(String::as_str),
+            Some("left-pad"),
+            "config list must include metadata-declared dotted workspace YAML paths"
+        );
+    }
+
+    #[test]
+    fn config_get_and_list_include_embedder_defaults_at_lowest_precedence() {
+        let _lock = config_test_lock();
+        aube_settings::set_embedder_defaults(vec![(
+            "virtualStoreDir".to_string(),
+            "node_modules/.nub".to_string(),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        let entries = read_merged(project).unwrap();
+        let aliases = resolve_aliases("virtualStoreDir");
+
+        assert_eq!(
+            get_cmd::find_value(&entries, &aliases).as_deref(),
+            Some("node_modules/.nub"),
+            "config get must report embedder defaults when no higher source overrides them"
+        );
+
+        let seen = list::collect_seen(entries);
+        assert_eq!(
+            seen.get("virtualStoreDir")
+                .or_else(|| seen.get("virtual-store-dir"))
+                .map(String::as_str),
+            Some("node_modules/.nub"),
+            "config list must include embedder defaults"
+        );
+    }
+
+    #[test]
+    fn config_get_and_list_render_empty_yaml_string_lists_as_present() {
+        let _lock = config_test_lock();
+        let _gate = PnpmReadGateGuard::set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        fs::write(
+            project.join("pnpm-workspace.yaml"),
+            "updateConfig:\n  ignoreDependencies: []\n",
+        )
+        .unwrap();
+
+        let entries = read_merged(project).unwrap();
+        let aliases = resolve_aliases("updateConfig.ignoreDependencies");
+
+        assert_eq!(
+            get_cmd::find_value(&entries, &aliases).as_deref(),
+            Some("[]"),
+            "empty YAML lists are present runtime values, not absent config"
+        );
+
+        let seen = list::collect_seen(entries);
+        assert_eq!(
+            seen.get("updateConfig.ignoreDependencies")
+                .map(String::as_str),
+            Some("[]"),
+            "config list must preserve empty YAML list presence"
+        );
+    }
+
+    #[test]
+    fn config_get_and_list_render_object_workspace_yaml_as_json() {
+        let _lock = config_test_lock();
+        let _gate = PnpmReadGateGuard::set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        fs::write(
+            project.join("pnpm-workspace.yaml"),
+            "allowBuilds:\n  esbuild: true\n",
+        )
+        .unwrap();
+
+        let entries = read_merged(project).unwrap();
+        let aliases = resolve_aliases("allowBuilds");
+
+        assert_eq!(
+            get_cmd::find_value(&entries, &aliases).as_deref(),
+            Some("{\"esbuild\":true}"),
+            "object-shaped workspace YAML settings should be visible as JSON"
+        );
+
+        let seen = list::collect_seen(entries);
+        assert_eq!(
+            seen.get("allowBuilds").map(String::as_str),
+            Some("{\"esbuild\":true}"),
+            "config list must include object-shaped workspace YAML settings"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_get_and_list_user_location_does_not_touch_project_auth_file() {
+        let _lock = config_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let userconfig = dir.path().join("user.npmrc");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&userconfig, "registry=https://user.example/\n").unwrap();
+        let project_auth = project.join("project-auth.fifo");
+        mkfifo(&project_auth);
+        fs::write(
+            project.join(".npmrc"),
+            format!("npmrc-auth-file={}\n", project_auth.display()),
+        )
+        .unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _userconfig = EnvGuard::set("NPM_CONFIG_USERCONFIG", &userconfig);
+        let _lower_userconfig = EnvGuard::remove("npm_config_userconfig");
+        let _pnpm_userconfig = EnvGuard::remove("PNPM_CONFIG_USERCONFIG");
+        let _lower_pnpm_userconfig = EnvGuard::remove("pnpm_config_userconfig");
+
+        assert_returns_quickly("read_user_entries", move || {
+            let entries = read_user_entries(&project).unwrap();
+            let aliases = resolve_aliases("registry");
+            assert_eq!(
+                get_cmd::find_value(&entries, &aliases).as_deref(),
+                Some("https://user.example/"),
+                "user-scoped config must still include the selected user source"
+            );
+            let seen = list::collect_seen(entries);
+            assert_eq!(
+                seen.get("registry").map(String::as_str),
+                Some("https://user.example/"),
+                "user-scoped config list must report the selected user source"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_get_and_list_project_location_does_not_touch_user_auth_sources() {
+        let _lock = config_test_lock();
+        let _gate = PnpmReadGateGuard::set(true);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(xdg.join("pnpm")).unwrap();
+        fs::write(
+            project.join(".npmrc"),
+            "registry=https://project.example/\n",
+        )
+        .unwrap();
+
+        let user_auth = home.join("user-auth.fifo");
+        let auth_ini = xdg.join("pnpm").join("auth.ini");
+        mkfifo(&user_auth);
+        mkfifo(&auth_ini);
+        fs::write(
+            home.join(".npmrc"),
+            format!("npmrc-auth-file={}\n", user_auth.display()),
+        )
+        .unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+        let _userconfig = EnvGuard::remove("NPM_CONFIG_USERCONFIG");
+        let _lower_userconfig = EnvGuard::remove("npm_config_userconfig");
+        let _pnpm_userconfig = EnvGuard::remove("PNPM_CONFIG_USERCONFIG");
+        let _lower_pnpm_userconfig = EnvGuard::remove("pnpm_config_userconfig");
+
+        assert_returns_quickly("read_project_entries", move || {
+            let entries = read_project_entries(&project).unwrap();
+            let aliases = resolve_aliases("registry");
+            assert_eq!(
+                get_cmd::find_value(&entries, &aliases).as_deref(),
+                Some("https://project.example/"),
+                "project-scoped config must still include the project source"
+            );
+            let seen = list::collect_seen(entries);
+            assert_eq!(
+                seen.get("registry").map(String::as_str),
+                Some("https://project.example/"),
+                "project-scoped config list must report the project source"
+            );
+        });
     }
 }

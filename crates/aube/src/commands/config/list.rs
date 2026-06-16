@@ -1,6 +1,6 @@
 use super::{
-    ListLocation, literal_aliases, read_merged, read_single, resolve_aliases, settings_meta,
-    user_npmrc_path,
+    ListLocation, literal_aliases, read_merged, read_project_entries, read_user_entries,
+    resolve_aliases, settings_meta,
 };
 use clap::Args;
 use miette::miette;
@@ -34,9 +34,8 @@ pub struct ListArgs {
 
     /// Which config location(s) to list.
     ///
-    /// `merged` (default) walks `~/.npmrc`, user aube config, then
-    /// the project's `.npmrc` with last-write-wins precedence,
-    /// matching how install reads config.
+    /// `merged` (default) walks the same file-source precedence install
+    /// uses, with last-write-wins merging.
     #[arg(long, value_enum)]
     pub location: Option<ListLocation>,
 }
@@ -76,28 +75,11 @@ pub fn run(args: ListArgs) -> miette::Result<()> {
     let cwd = crate::dirs::project_root_or_cwd()?;
     let entries: Vec<(String, String)> = match location {
         ListLocation::Merged => read_merged(&cwd)?,
-        ListLocation::User | ListLocation::Global => {
-            // `aube_config` outranks `~/.npmrc`, so emit it last — the
-            // dedup loop below uses last-write-wins via `BTreeMap::insert`.
-            let mut entries = read_single(&user_npmrc_path()?)?;
-            entries.extend(super::aube_config::load_user_entries());
-            entries
-        }
-        ListLocation::Project => {
-            // Project-scope precedence (low → high): workspace yaml,
-            // project `.npmrc`, project `config.toml`.
-            let mut entries = super::read_workspace_yaml_flat(&cwd);
-            entries.extend(read_single(&cwd.join(".npmrc"))?);
-            entries.extend(super::aube_config::load_project_entries(&cwd));
-            entries
-        }
+        ListLocation::User | ListLocation::Global => read_user_entries(&cwd)?,
+        ListLocation::Project => read_project_entries(&cwd)?,
     };
 
-    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for (k, v) in entries {
-        let canonical = canonical_list_key(&k);
-        seen.insert(canonical, v);
-    }
+    let mut seen = collect_seen(entries);
 
     let mut defaults: std::collections::HashSet<String> = std::collections::HashSet::new();
     if args.all {
@@ -156,4 +138,15 @@ pub(super) fn canonical_list_key(key: &str) -> String {
         return key.to_string();
     }
     aliases.first().cloned().unwrap_or_else(|| key.to_string())
+}
+
+pub(super) fn collect_seen(
+    entries: Vec<(String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut seen = std::collections::BTreeMap::new();
+    for (k, v) in entries {
+        let canonical = canonical_list_key(&k);
+        seen.insert(canonical, v);
+    }
+    seen
 }

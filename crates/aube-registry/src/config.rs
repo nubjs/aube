@@ -7,12 +7,16 @@ mod token;
 mod types;
 mod url;
 mod util;
+mod yarnrc;
 
 #[cfg(test)]
 mod tests;
 
 pub use fetch::FetchPolicy;
-pub use load::{SplitNpmrcEntries, load_npmrc_entries, load_npmrc_entries_split};
+pub use load::{
+    SplitNpmrcEntries, load_npmrc_entries, load_npmrc_entries_split, load_project_npmrc_entries,
+    load_user_npmrc_entries,
+};
 pub use types::{AuthConfig, NpmConfig, TlsConfig};
 pub use url::{normalize_registry_url_pub, registry_uri_key_pub};
 
@@ -33,3 +37,7 @@ use npmrc::{parse_npmrc, parse_npmrc_untrusted, substitute_env};
 use token::sanitize_token_helper;
 #[cfg(test)]
 use url::{is_public_npmjs_url, normalize_registry_url, package_scope, registry_uri_key};
+#[cfg(test)]
+use yarnrc::{
+    load_yarnrc_entries_split_with_home, translate_yarnrc_content, yarn_env_entries_from,
+};

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use super::env::npm_config_env_entries_from;
 use super::npmrc::{parse_npmrc, parse_npmrc_untrusted};
 use super::types::{NpmConfig, NpmrcSource};
+use super::yarnrc;
 
 /// Whether the loader reads pnpm's global `~/.config/pnpm/auth.ini`
 /// (`<XDG_CONFIG_HOME>/pnpm/auth.ini`). Sourced from the engine context's
@@ -88,13 +89,21 @@ impl NpmConfig {
         let global_paths = resolve_global_npmrc_paths(|name| {
             env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
         });
-        let mut tagged = load_npmrc_entries_tagged_with_globals(
+        let tagged = load_npmrc_entries_tagged_with_globals(
             home.as_deref(),
             xdg.as_deref(),
             project_dir,
             user_rc_override.as_deref(),
             &global_paths,
         );
+        let mut tagged = merge_yarnrc_tagged_entries(tagged, home.as_deref(), project_dir);
+        if aube_util::engine_context().read_yarn_config {
+            tagged.extend(
+                yarnrc::yarn_env_entries_from(env)
+                    .into_iter()
+                    .map(|(k, v)| (NpmrcSource::Env, k, v)),
+            );
+        }
         // `npm_config_*` / `NPM_CONFIG_*` env vars beat file config in
         // npm/pnpm. Apply them after `.npmrc` so last-write-wins gives
         // env the higher slot, and tag them as `Env` so
@@ -123,11 +132,12 @@ impl NpmConfig {
 /// list as [`load_npmrc_entries`].
 pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
     use std::sync::{Mutex, OnceLock};
-    type CacheMap = std::collections::HashMap<PathBuf, SplitNpmrcEntries>;
+    type CacheMap = std::collections::HashMap<NpmrcCacheKey, SplitNpmrcEntries>;
     static CACHE: OnceLock<Mutex<CacheMap>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let key = npmrc_cache_key(project_dir);
     if let Ok(map) = cache.lock()
-        && let Some(hit) = map.get(project_dir)
+        && let Some(hit) = map.get(&key)
     {
         return hit.clone();
     }
@@ -143,6 +153,12 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
         user_rc_override.as_deref(),
         &global_paths,
     );
+    let tagged = merge_yarnrc_tagged_entries(tagged, home.as_deref(), project_dir);
+    let yarn_env = if aube_util::engine_context().read_yarn_config {
+        yarnrc::yarn_env_entries_from_std()
+    } else {
+        Vec::new()
+    };
     let mut split = SplitNpmrcEntries::default();
     for (src, k, v) in tagged {
         match src {
@@ -164,8 +180,9 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
             NpmrcSource::Env => continue,
         }
     }
+    split.project.extend(yarn_env);
     if let Ok(mut map) = cache.lock() {
-        map.insert(project_dir.to_path_buf(), split.clone());
+        map.insert(key, split.clone());
     }
     split
 }
@@ -174,6 +191,56 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
 pub struct SplitNpmrcEntries {
     pub user: Vec<(String, String)>,
     pub project: Vec<(String, String)>,
+}
+
+/// Load only non-project npmrc-shaped sources: builtin/global npmrc,
+/// synthetic user entries, user `.npmrc`/`NPM_CONFIG_USERCONFIG`,
+/// pnpm `auth.ini`, user-scoped `npmrc-auth-file`, and user `.yarnrc.yml`
+/// when Yarn mirroring is enabled. This is intentionally narrower than
+/// [`load_npmrc_entries_split`]: scoped config commands must not touch
+/// project files that can block or be attacker-controlled.
+pub fn load_user_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
+    let xdg = aube_util::env::xdg_config_home();
+    let home = home_dir();
+    let user_rc_override =
+        userconfig_env_value().and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
+    let global_paths = resolve_global_npmrc_paths_from_std_env();
+    let mut tagged = load_user_npmrc_entries_tagged(
+        home.as_deref(),
+        xdg.as_deref(),
+        project_dir,
+        user_rc_override.as_deref(),
+        &global_paths,
+    );
+    tagged.extend(
+        yarnrc::load_user_yarnrc_entries(home.as_deref())
+            .into_iter()
+            .map(|(k, v)| (NpmrcSource::User, k, v)),
+    );
+    tagged.into_iter().map(|(_, k, v)| (k, v)).collect()
+}
+
+/// Load only project-controlled npmrc-shaped sources: synthetic project
+/// entries, project `.npmrc`, a project-scoped `npmrc-auth-file`, project
+/// `.yarnrc.yml` files, and Yarn env entries when Yarn mirroring is enabled.
+/// It deliberately skips user/global npmrc, user auth sidecars, and pnpm's
+/// user/global `auth.ini`.
+pub fn load_project_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
+    let home = home_dir();
+    let mut tagged = load_project_npmrc_entries_tagged(home.as_deref(), project_dir);
+    tagged.extend(
+        yarnrc::load_project_yarnrc_entries(project_dir)
+            .into_iter()
+            .map(|(k, v)| (NpmrcSource::Project, k, v)),
+    );
+    if aube_util::engine_context().read_yarn_config {
+        tagged.extend(
+            yarnrc::yarn_env_entries_from_std()
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Env, k, v)),
+        );
+    }
+    tagged.into_iter().map(|(_, k, v)| (k, v)).collect()
 }
 
 /// Load raw `.npmrc` key/value pairs from the same file precedence as
@@ -193,11 +260,12 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     // repeatedly with the same path. Same pattern as
     // `aube_lockfile::aube_lock_filename`.
     use std::sync::{Mutex, OnceLock};
-    type CacheMap = std::collections::HashMap<PathBuf, Vec<(String, String)>>;
+    type CacheMap = std::collections::HashMap<NpmrcCacheKey, Vec<(String, String)>>;
     static CACHE: OnceLock<Mutex<CacheMap>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let key = npmrc_cache_key(project_dir);
     if let Ok(map) = cache.lock()
-        && let Some(hit) = map.get(project_dir)
+        && let Some(hit) = map.get(&key)
     {
         return hit.clone();
     }
@@ -219,20 +287,56 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     let user_rc_override =
         userconfig_env_value().and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
     let global_paths = resolve_global_npmrc_paths_from_std_env();
-    let entries = load_npmrc_entries_tagged_with_globals(
+    let tagged = load_npmrc_entries_tagged_with_globals(
         home.as_deref(),
         xdg.as_deref(),
         project_dir,
         user_rc_override.as_deref(),
         &global_paths,
-    )
-    .into_iter()
-    .map(|(_, k, v)| (k, v))
-    .collect::<Vec<_>>();
+    );
+    let mut tagged = merge_yarnrc_tagged_entries(tagged, home.as_deref(), project_dir);
+    if aube_util::engine_context().read_yarn_config {
+        tagged.extend(
+            yarnrc::yarn_env_entries_from_std()
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Env, k, v)),
+        );
+    }
+    let entries = tagged
+        .into_iter()
+        .map(|(_, k, v)| (k, v))
+        .collect::<Vec<_>>();
     if let Ok(mut map) = cache.lock() {
-        map.insert(project_dir.to_path_buf(), entries.clone());
+        map.insert(key, entries.clone());
     }
     entries
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NpmrcCacheKey {
+    project_dir: PathBuf,
+    read_branded_pnpm_config: bool,
+    read_yarn_config: bool,
+    synthetic_user_npmrc_entries: Vec<(String, String)>,
+    synthetic_project_npmrc_entries: Vec<(String, String)>,
+    yarn_env_entries: Vec<(String, String)>,
+}
+
+fn npmrc_cache_key(project_dir: &Path) -> NpmrcCacheKey {
+    let ctx = aube_util::engine_context();
+    let yarn_env_entries = if ctx.read_yarn_config {
+        yarnrc::yarn_env_entries_from_std()
+    } else {
+        Vec::new()
+    };
+    NpmrcCacheKey {
+        project_dir: project_dir.to_path_buf(),
+        read_branded_pnpm_config: ctx.read_branded_pnpm_config,
+        read_yarn_config: ctx.read_yarn_config,
+        synthetic_user_npmrc_entries: ctx.synthetic_user_npmrc_entries,
+        synthetic_project_npmrc_entries: ctx.synthetic_project_npmrc_entries,
+        yarn_env_entries,
+    }
 }
 
 /// The two system/admin-scoped npmrc files that sit *below* the user
@@ -318,6 +422,21 @@ pub(super) fn load_npmrc_entries_tagged_with_globals(
                 .map(|(k, v)| (NpmrcSource::Global, k, v)),
         );
     }
+    let engine_context = aube_util::engine_context();
+    out.extend(
+        engine_context
+            .synthetic_user_npmrc_entries
+            .iter()
+            .cloned()
+            .map(|(k, v)| (NpmrcSource::User, k, v)),
+    );
+    out.extend(
+        engine_context
+            .synthetic_project_npmrc_entries
+            .iter()
+            .cloned()
+            .map(|(k, v)| (NpmrcSource::Project, k, v)),
+    );
     // User-level rc: explicit override (from `NPM_CONFIG_USERCONFIG`)
     // wins over `$HOME/.npmrc`. Keeps the `User` source tag either
     // way — the user chose the file location, so `apply_tagged`'s
@@ -381,6 +500,153 @@ pub(super) fn load_npmrc_entries_tagged_with_globals(
     }
     out
 }
+
+fn load_user_npmrc_entries_tagged(
+    home: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    project_dir: &Path,
+    user_rc_override: Option<&Path>,
+    global_paths: &GlobalNpmrcPaths,
+) -> Vec<(NpmrcSource, String, String)> {
+    let mut out: Vec<(NpmrcSource, String, String)> = Vec::new();
+    if let Some(builtin_rc) = global_paths.builtin.as_deref()
+        && builtin_rc.exists()
+        && let Ok(entries) = parse_npmrc(builtin_rc)
+    {
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Builtin, k, v)),
+        );
+    }
+    if let Some(global_rc) = global_paths.global.as_deref()
+        && global_rc.exists()
+        && let Ok(entries) = parse_npmrc(global_rc)
+    {
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Global, k, v)),
+        );
+    }
+    out.extend(
+        aube_util::engine_context()
+            .synthetic_user_npmrc_entries
+            .iter()
+            .cloned()
+            .map(|(k, v)| (NpmrcSource::User, k, v)),
+    );
+    let user_rc = user_rc_override
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".npmrc")));
+    if let Some(user_rc) = user_rc
+        && user_rc.exists()
+        && let Ok(entries) = parse_npmrc(&user_rc)
+    {
+        out.extend(entries.into_iter().map(|(k, v)| (NpmrcSource::User, k, v)));
+    }
+    if let Some(home) = home
+        && pnpm_auth_ini_enabled()
+    {
+        let auth_ini = pnpm_global_auth_ini_path(home, xdg_config_home);
+        if auth_ini.exists()
+            && let Ok(entries) = parse_npmrc(&auth_ini)
+        {
+            out.extend(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (NpmrcSource::PnpmAuth, k, v)),
+            );
+        }
+    }
+    if let Some((auth_path, _auth_source)) = resolve_npmrc_auth_file_tagged(home, project_dir, &out)
+        && auth_path.exists()
+        && let Ok(entries) = parse_npmrc(&auth_path)
+    {
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::UserNpmrcAuthFile, k, v)),
+        );
+    }
+    out
+}
+
+fn load_project_npmrc_entries_tagged(
+    home: Option<&Path>,
+    project_dir: &Path,
+) -> Vec<(NpmrcSource, String, String)> {
+    let mut out: Vec<(NpmrcSource, String, String)> = Vec::new();
+    out.extend(
+        aube_util::engine_context()
+            .synthetic_project_npmrc_entries
+            .iter()
+            .cloned()
+            .map(|(k, v)| (NpmrcSource::Project, k, v)),
+    );
+    let project_rc = project_dir.join(".npmrc");
+    if project_rc.exists()
+        && let Ok(entries) = parse_npmrc_untrusted(&project_rc)
+    {
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Project, k, v)),
+        );
+    }
+    if let Some((auth_path, _auth_source)) = resolve_npmrc_auth_file_tagged(home, project_dir, &out)
+        && auth_path.exists()
+        && let Ok(entries) = parse_npmrc_untrusted(&auth_path)
+    {
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::ProjectNpmrcAuthFile, k, v)),
+        );
+    }
+    out
+}
+
+fn merge_yarnrc_tagged_entries(
+    tagged: Vec<(NpmrcSource, String, String)>,
+    home: Option<&Path>,
+    project_dir: &Path,
+) -> Vec<(NpmrcSource, String, String)> {
+    let yarnrc = yarnrc::load_yarnrc_entries_split(home, project_dir);
+    if yarnrc.user.is_empty() && yarnrc.project.is_empty() {
+        return tagged;
+    }
+    let mut out = Vec::with_capacity(tagged.len() + yarnrc.user.len() + yarnrc.project.len());
+    let mut inserted_user_yarn = false;
+    for (source, key, value) in tagged {
+        if !inserted_user_yarn && source.is_project_controlled() {
+            out.extend(
+                yarnrc
+                    .user
+                    .iter()
+                    .cloned()
+                    .map(|(k, v)| (NpmrcSource::User, k, v)),
+            );
+            inserted_user_yarn = true;
+        }
+        out.push((source, key, value));
+    }
+    if !inserted_user_yarn {
+        out.extend(
+            yarnrc
+                .user
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::User, k, v)),
+        );
+    }
+    out.extend(
+        yarnrc
+            .project
+            .into_iter()
+            .map(|(k, v)| (NpmrcSource::Project, k, v)),
+    );
+    out
+}
 /// Same as [`load_npmrc_entries`] but with an injectable user-home
 /// directory and XDG config-home override. Used by tests that need to
 /// isolate from the developer's real `~/.npmrc` and pnpm config dir
@@ -393,10 +659,14 @@ pub(super) fn load_npmrc_entries_with_home(
     project_dir: &Path,
     user_rc_override: Option<&Path>,
 ) -> Vec<(String, String)> {
-    load_npmrc_entries_tagged_with_home(home, xdg_config_home, project_dir, user_rc_override)
-        .into_iter()
-        .map(|(_, k, v)| (k, v))
-        .collect()
+    merge_yarnrc_tagged_entries(
+        load_npmrc_entries_tagged_with_home(home, xdg_config_home, project_dir, user_rc_override),
+        home,
+        project_dir,
+    )
+    .into_iter()
+    .map(|(_, k, v)| (k, v))
+    .collect()
 }
 
 /// Resolve an `npmrcAuthFile` / `npmrc-auth-file` value to an absolute

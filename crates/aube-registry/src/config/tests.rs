@@ -47,6 +47,393 @@ fn scoped_registry_lookup_is_case_insensitive() {
 }
 
 #[test]
+fn yarnrc_translates_registry_scope_auth_and_linker_subset() {
+    let entries = translate_yarnrc_content(
+        r#"
+npmRegistryServer: "https://registry.yarn.example"
+npmAuthToken: top-token
+npmRegistries:
+  "https://registry.yarn.example":
+    npmAuthIdent: "user:pass"
+npmScopes:
+  myorg:
+    npmRegistryServer: "https://npm.myorg.example"
+    npmAuthToken: scope-token
+nodeLinker: node-modules
+"#,
+    );
+
+    assert!(entries.contains(&(
+        "registry".to_string(),
+        "https://registry.yarn.example/".to_string()
+    )));
+    assert!(entries.contains(&(
+        "//registry.yarn.example/:_authToken".to_string(),
+        "top-token".to_string()
+    )));
+    assert!(entries.contains(&(
+        "//registry.yarn.example/:_auth".to_string(),
+        base64::engine::general_purpose::STANDARD.encode("user:pass")
+    )));
+    assert!(entries.contains(&(
+        "@myorg:registry".to_string(),
+        "https://npm.myorg.example/".to_string()
+    )));
+    assert!(entries.contains(&(
+        "//npm.myorg.example/:_authToken".to_string(),
+        "scope-token".to_string()
+    )));
+    assert!(entries.contains(&("nodeLinker".to_string(), "hoisted".to_string())));
+}
+
+#[test]
+fn yarnrc_does_not_widen_non_representable_scope_auth() {
+    let entries = translate_yarnrc_content(
+        r#"
+npmRegistryServer: "https://registry.yarn.example"
+npmScopes:
+  noCustomRegistry:
+    npmAuthToken: no-custom-token
+  first:
+    npmRegistryServer: "https://shared.example"
+    npmAuthToken: first-token
+  second:
+    npmRegistryServer: "https://shared.example"
+    npmAuthToken: second-token
+  third:
+    npmRegistryServer: "https://third-shared.example"
+  fourth:
+    npmRegistryServer: "https://third-shared.example"
+    npmAuthToken: fourth-token
+  registryConfigured:
+    npmRegistryServer: "https://registry-configured.example"
+    npmAuthToken: registry-configured-token
+npmRegistries:
+  "https://registry-configured.example":
+    npmAuthToken: registry-token
+"#,
+    );
+
+    assert!(entries.contains(&(
+        "@noCustomRegistry:registry".to_string(),
+        "https://registry.yarn.example/".to_string()
+    )));
+    assert!(entries.contains(&(
+        "@first:registry".to_string(),
+        "https://shared.example/".to_string()
+    )));
+    assert!(entries.contains(&(
+        "@second:registry".to_string(),
+        "https://shared.example/".to_string()
+    )));
+    assert!(entries.contains(&(
+        "@registryConfigured:registry".to_string(),
+        "https://registry-configured.example/".to_string()
+    )));
+
+    assert!(
+        !entries.iter().any(|(_, v)| v == "no-custom-token"
+            || v == "first-token"
+            || v == "second-token"
+            || v == "fourth-token"
+            || v == "registry-configured-token"),
+        "scope auth must not be converted to registry-wide auth unless the scope owns a unique custom registry"
+    );
+    assert!(entries.contains(&(
+        "//registry-configured.example/:_authToken".to_string(),
+        "registry-token".to_string()
+    )));
+}
+
+#[test]
+fn yarnrc_maps_pnpm_linker_to_existing_isolated_linker_and_leaves_pnp_untranslated() {
+    let entries = translate_yarnrc_content("nodeLinker: pnpm\n");
+    assert_eq!(
+        entries,
+        vec![("nodeLinker".to_string(), "isolated".to_string())]
+    );
+
+    let entries = translate_yarnrc_content("nodeLinker: pnp\n");
+    assert!(
+        entries.iter().all(|(k, _)| k != "nodeLinker"),
+        "PnP install generation is out of scope; the translator must leave it to nub's warning/refusal path"
+    );
+}
+
+#[test]
+fn yarnrc_project_overrides_global_yarnrc_entries() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".yarnrc.yml"),
+        "npmRegistryServer: https://global.yarn.example\nnodeLinker: pnpm\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".yarnrc.yml"),
+        "npmRegistryServer: https://project.yarn.example\nnodeLinker: node-modules\n",
+    )
+    .unwrap();
+
+    let split = load_yarnrc_entries_split_with_home(Some(home.path()), project.path());
+    let mut merged = split.user;
+    merged.extend(split.project);
+    let mut cfg = NpmConfig::default();
+    cfg.apply(merged);
+
+    assert_eq!(cfg.registry, "https://project.yarn.example/");
+}
+
+#[test]
+fn yarnrc_walks_ancestor_rc_files_with_nearest_file_winning() {
+    let root = tempfile::tempdir().unwrap();
+    let child = root.path().join("packages/app");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(
+        root.path().join(".yarnrc.yml"),
+        "npmRegistryServer: https://root.yarn.example\n",
+    )
+    .unwrap();
+    std::fs::write(
+        child.join(".yarnrc.yml"),
+        "npmRegistryServer: https://child.yarn.example\n",
+    )
+    .unwrap();
+
+    let split = load_yarnrc_entries_split_with_home(None, &child);
+    let mut cfg = NpmConfig::default();
+    cfg.apply(split.project);
+
+    assert_eq!(cfg.registry, "https://child.yarn.example/");
+}
+
+#[test]
+fn yarnrc_load_is_incumbent_gated_for_registry_config() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".yarnrc.yml"),
+        r#"
+npmRegistryServer: https://yarn-only.example
+npmScopes:
+  myorg:
+    npmRegistryServer: https://npm.myorg.example
+    npmAuthToken: scope-token
+"#,
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    let disabled = NpmConfig::load_with_env(project.path(), &[]);
+    assert_eq!(disabled.registry, "https://registry.npmjs.org/");
+    assert_eq!(
+        disabled.registry_for("@myorg/pkg"),
+        "https://registry.npmjs.org/"
+    );
+    assert_eq!(disabled.auth_token_for("https://npm.myorg.example/"), None);
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let enabled = NpmConfig::load_with_env(project.path(), &[]);
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+
+    assert_eq!(enabled.registry, "https://yarn-only.example/");
+    assert_eq!(
+        enabled.registry_for("@myorg/pkg"),
+        "https://npm.myorg.example/"
+    );
+    assert_eq!(
+        enabled.auth_token_for("https://npm.myorg.example/"),
+        Some("scope-token")
+    );
+}
+
+#[test]
+fn yarnrc_node_linker_reaches_split_settings_sources_only_when_gated_on() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let disabled_project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        disabled_project.path().join(".yarnrc.yml"),
+        "nodeLinker: node-modules\n",
+    )
+    .unwrap();
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    let disabled = load_npmrc_entries_split(disabled_project.path());
+    assert!(disabled.project.iter().all(|(key, _)| key != "nodeLinker"));
+
+    let enabled_project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        enabled_project.path().join(".yarnrc.yml"),
+        "nodeLinker: node-modules\n",
+    )
+    .unwrap();
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let enabled = load_npmrc_entries_split(enabled_project.path());
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    assert!(
+        enabled
+            .project
+            .contains(&("nodeLinker".to_string(), "hoisted".to_string()))
+    );
+}
+
+#[test]
+fn npm_config_env_still_outranks_yarnrc_file_config() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".yarnrc.yml"),
+        "npmRegistryServer: https://from-yarnrc.example\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let cfg = NpmConfig::load_with_env(
+        project.path(),
+        &[(
+            "NPM_CONFIG_REGISTRY".to_string(),
+            "https://from-env.example".to_string(),
+        )],
+    );
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+
+    assert_eq!(cfg.registry, "https://from-env.example/");
+}
+
+#[test]
+fn yarn_env_subset_is_translated_above_yarnrc_files() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".yarnrc.yml"),
+        "npmRegistryServer: https://from-yarnrc.example\nnodeLinker: node-modules\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let cfg = NpmConfig::load_with_env(
+        project.path(),
+        &[(
+            "YARN_NPM_REGISTRY_SERVER".to_string(),
+            "https://from-yarn-env.example".to_string(),
+        )],
+    );
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+
+    assert_eq!(cfg.registry, "https://from-yarn-env.example/");
+    assert!(
+        yarn_env_entries_from(&[("YARN_NODE_LINKER".to_string(), "pnpm".to_string())])
+            .contains(&("nodeLinker".to_string(), "isolated".to_string()))
+    );
+}
+
+#[test]
+fn mixed_yarnrc_npmrc_order_keeps_project_sources_above_user_global_sources() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".yarnrc.yml"),
+        "npmRegistryServer: https://global-yarn.example\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "registry=https://project-npmrc.example\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let mut cfg = NpmConfig::default();
+    cfg.apply(load_npmrc_entries_with_home(
+        Some(home.path()),
+        None,
+        project.path(),
+        None,
+    ));
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+
+    assert_eq!(cfg.registry, "https://project-npmrc.example/");
+}
+
+#[test]
+fn home_yarnrc_is_not_promoted_to_project_precedence_under_home() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("work/project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        home.path().join(".yarnrc.yml"),
+        "npmRegistryServer: https://home-yarn.example\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".npmrc"),
+        "registry=https://project-npmrc.example\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let mut cfg = NpmConfig::default();
+    cfg.apply(load_npmrc_entries_with_home(
+        Some(home.path()),
+        None,
+        &project,
+        None,
+    ));
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+
+    assert_eq!(cfg.registry, "https://project-npmrc.example/");
+}
+
+#[test]
+fn project_yarnrc_outranks_project_npmrc_for_supported_yarn_incumbent_subset() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "registry=https://project-npmrc.example\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".yarnrc.yml"),
+        "npmRegistryServer: https://project-yarnrc.example\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let loaded = NpmConfig::load_with_env(project.path(), &[]);
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+
+    assert_eq!(loaded.registry, "https://project-yarnrc.example/");
+}
+
+#[test]
+fn split_loader_cache_is_sensitive_to_yarn_gate() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".yarnrc.yml"),
+        "nodeLinker: node-modules\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    let disabled = load_npmrc_entries_split(project.path());
+    assert!(disabled.project.iter().all(|(key, _)| key != "nodeLinker"));
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let enabled = load_npmrc_entries_split(project.path());
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+
+    assert!(
+        enabled
+            .project
+            .contains(&("nodeLinker".to_string(), "hoisted".to_string())),
+        "same project_dir must not reuse a gate-disabled cached split"
+    );
+}
+
+#[test]
 fn test_parse_npmrc_basic() {
     let dir = tempfile::tempdir().unwrap();
     let rc = dir.path().join(".npmrc");
