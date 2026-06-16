@@ -86,12 +86,27 @@ fn print_direct_dependency_section(
     }
     deps.sort_by(|a, b| a.name.cmp(&b.name));
     let label = aube_lockfile::dep_type_label(dep_type);
+    // Resolve each dep's printable version up front so a section that turns
+    // out to hold only workspace-linked deps (no registry version to show)
+    // prints no header at all, matching pnpm — which omits workspace deps
+    // from the install summary entirely.
+    let rendered: Vec<(&aube_lockfile::DirectDep, &str)> = deps
+        .iter()
+        .filter_map(|dep| {
+            // A `workspace:` / `link:` dep resolves to a local importer, not a
+            // registry package, so it has no entry in `graph.packages`. pnpm
+            // leaves these out of the summary rather than printing a versionless
+            // `+ pkg@?` line, so skip them here too.
+            graph
+                .get_package(&dep.dep_path)
+                .map(|pkg| (*dep, pkg.version.as_str()))
+        })
+        .collect();
+    if rendered.is_empty() {
+        return;
+    }
     eprintln!("{}{}", style::ebold(label), style::edim(":"));
-    for dep in deps {
-        let version = graph
-            .get_package(&dep.dep_path)
-            .map(|pkg| pkg.version.as_str())
-            .unwrap_or("?");
+    for (dep, version) in rendered {
         let badges = render_direct_dep_badges(direct_dep_info.get(&dep.dep_path));
         eprintln!(
             "{} {}{}{}",

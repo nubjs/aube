@@ -146,3 +146,28 @@ EOF
 	refute_output --partial '"is-odd"'
 	refute_output --partial '"is-even"'
 }
+
+@test "aube remove --filter: keeps a surviving workspace:* dep resolvable" {
+	# Regression: a filtered remove re-resolves the target package, and a
+	# surviving `workspace:*` dependency must resolve to its local workspace
+	# sibling — not be looked up on the registry, where it would fail with
+	# ERR_AUBE_NO_MATCHING_VERSION. @test/app declares both `is-even`
+	# (registry) and `@test/lib` (workspace:*); removing the former must leave
+	# the latter intact and the lockfile updated in lockstep.
+	cp -r "$PROJECT_ROOT/fixtures/workspace/"* .
+
+	run aube install
+	assert_success
+
+	run aube remove is-even --filter @test/app
+	assert_success
+	refute_output --partial 'NO_MATCHING_VERSION'
+
+	run cat packages/app/package.json
+	refute_output --partial '"is-even"'
+	assert_output --partial 'workspace:*'
+
+	# Lockfile updated atomically: is-even gone, no stale entry left behind.
+	run cat aube-lock.yaml
+	refute_output --partial 'is-even'
+}

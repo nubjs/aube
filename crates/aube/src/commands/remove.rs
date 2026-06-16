@@ -156,22 +156,25 @@ pub async fn run(
     })?;
     eprintln!("Updated package.json");
 
-    // Re-resolve dependency tree without the removed packages
-    let existing = aube_lockfile::parse_lockfile(&cwd, &manifest).ok();
-    let workspace_catalogs = super::load_workspace_catalogs(&cwd)?;
-    let mut resolver = super::build_resolver(&cwd, &manifest, workspace_catalogs)?;
-    let graph = resolver
-        .resolve(&manifest, existing.as_ref())
-        .await
-        .map_err(miette::Report::new)
-        .wrap_err("failed to resolve dependencies")?;
-    eprintln!("Resolved {} packages", graph.packages.len());
-
-    super::write_and_log_lockfile(&cwd, &graph, &manifest)?;
-
-    // Reinstall to clean up node_modules
+    // Re-resolve + relink through the install pipeline, the same way
+    // `add` chains into `install::run` after mutating the manifest.
+    // The pipeline is the only path that seeds the resolver with the
+    // local workspace packages (`discover_workspace_plan` →
+    // `resolve_workspace` with `ws_package_versions`), so a sibling
+    // dep declared `workspace:*` resolves to its local copy instead of
+    // being looked up on the registry. The previous standalone
+    // `resolver.resolve(&manifest, …)` here passed a single `.`
+    // importer and an empty workspace map, which made any surviving
+    // `workspace:*` dependency fail with ERR_AUBE_NO_MATCHING_VERSION
+    // — and left the manifest edited but the lockfile stale.
+    //
+    // `Fix` (vs `Prefer`) re-resolves while seeding from the existing
+    // lockfile, so unchanged specs keep their pinned versions and only
+    // the removed entry (and anything that depended on it) drops out —
+    // matching `add`'s post-mutation contract. `with_mode()` already
+    // skips the root lifecycle hooks (chained-call contract).
     let mut opts =
-        install::InstallOptions::with_mode(super::chained_frozen_mode(install::FrozenMode::Prefer));
+        install::InstallOptions::with_mode(super::chained_frozen_mode(install::FrozenMode::Fix));
     opts.ignore_scripts = args.ignore_scripts;
     install::run(opts).await?;
 
