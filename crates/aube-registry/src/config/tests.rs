@@ -397,6 +397,81 @@ fn yarnrc_node_linker_reaches_split_settings_sources_only_when_gated_on() {
 }
 
 #[test]
+fn classic_yarnrc_translates_core_registry_scope_and_auth_fields() {
+    let entries = translate_classic_yarnrc_content(
+        r#"
+# a comment line
+registry "https://registry.yarnpkg.com"
+"@myscope:registry" "https://npm.pkg.github.com"
+"//npm.pkg.github.com/:_authToken" "GH_TOKEN"
+_authToken NPM_TOKEN
+network-timeout 60000
+--install.production true
+"#,
+    );
+
+    assert!(entries.contains(&(
+        "registry".to_string(),
+        "https://registry.yarnpkg.com/".to_string()
+    )));
+    assert!(entries.contains(&(
+        "@myscope:registry".to_string(),
+        "https://npm.pkg.github.com/".to_string()
+    )));
+    assert!(entries.contains(&(
+        "//npm.pkg.github.com/:_authToken".to_string(),
+        "GH_TOKEN".to_string()
+    )));
+    assert!(entries.contains(&("_authToken".to_string(), "NPM_TOKEN".to_string())));
+    // Out-of-scope keys and `--flag` arg lines are ignored.
+    assert!(entries.iter().all(|(key, _)| key != "network-timeout"));
+    assert!(entries.iter().all(|(key, _)| !key.starts_with("--")));
+}
+
+#[test]
+fn classic_yarnrc_load_is_incumbent_gated() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".yarnrc"),
+        "registry \"https://classic-yarn.example\"\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    let disabled = NpmConfig::load_with_env(project.path(), &[]);
+    assert_eq!(disabled.registry, "https://registry.npmjs.org/");
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let enabled = NpmConfig::load_with_env(project.path(), &[]);
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    assert_eq!(enabled.registry, "https://classic-yarn.example/");
+}
+
+#[test]
+fn classic_yarnrc_nearest_file_wins_along_ancestor_walk() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join(".yarnrc"),
+        "registry \"https://root.example\"\n",
+    )
+    .unwrap();
+    let child = root.path().join("packages").join("app");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(
+        child.join(".yarnrc"),
+        "registry \"https://child.example\"\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let cfg = NpmConfig::load_with_env(&child, &[]);
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    assert_eq!(cfg.registry, "https://child.example/");
+}
+
+#[test]
 fn npm_config_env_still_outranks_yarnrc_file_config() {
     let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();

@@ -39,5 +39,6 @@ use token::sanitize_token_helper;
 use url::{is_public_npmjs_url, normalize_registry_url, package_scope, registry_uri_key};
 #[cfg(test)]
 use yarnrc::{
-    load_yarnrc_entries_split_with_home, translate_yarnrc_content, yarn_env_entries_from,
+    load_yarnrc_entries_split_with_home, translate_classic_yarnrc_content,
+    translate_yarnrc_content, yarn_env_entries_from,
 };

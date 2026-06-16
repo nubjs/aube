@@ -42,7 +42,12 @@ fn load_user_yarnrc_entries_with_home(home: Option<&Path>) -> Vec<(String, Strin
     let Some(home) = home else {
         return Vec::new();
     };
-    load_yarnrc_entries_from_path(&home.join(".yarnrc.yml"))
+    let mut out = load_yarnrc_entries_from_path(&home.join(".yarnrc.yml"));
+    // Classic Yarn (v1) reads `~/.yarnrc` in addition to the Berry
+    // `.yarnrc.yml`. Core registry/auth fields only — see
+    // `translate_classic_yarnrc_content`.
+    out.extend(load_classic_yarnrc_entries_from_path(&home.join(".yarnrc")));
+    out
 }
 
 pub(super) fn load_project_yarnrc_entries(starting_dir: &Path) -> Vec<(String, String)> {
@@ -56,12 +61,23 @@ fn load_project_yarnrc_entries_with_home(
     home: Option<&Path>,
     starting_dir: &Path,
 ) -> Vec<(String, String)> {
-    let per_file: Vec<Vec<(String, String)>> = yarnrc_paths_from_root(starting_dir)
+    let per_file: Vec<Vec<(String, String)>> = yarnrc_paths_from_root(starting_dir, ".yarnrc.yml")
         .into_iter()
         .filter(|path| !home.is_some_and(|home| path == &home.join(".yarnrc.yml")))
         .map(|path| load_yarnrc_entries_from_path(&path))
         .collect();
-    merge_project_yarnrc_entries(per_file)
+    let mut out = merge_project_yarnrc_entries(per_file);
+    // Classic Yarn (v1) `.yarnrc` files along the same ancestor walk. Core
+    // registry/auth fields only; appended after the Berry `.yarnrc.yml`
+    // entries (root→child order so nearest still wins under the settings
+    // layer's last-one-wins read).
+    for path in yarnrc_paths_from_root(starting_dir, ".yarnrc")
+        .into_iter()
+        .filter(|path| home.is_none_or(|home| path != &home.join(".yarnrc")))
+    {
+        out.extend(load_classic_yarnrc_entries_from_path(&path));
+    }
+    out
 }
 
 /// Combine the per-file entry lists from the ancestor `.yarnrc.yml` walk
@@ -126,7 +142,7 @@ pub(super) fn yarn_env_entries_from_std() -> Vec<(String, String)> {
     yarn_env_entries_from(&env)
 }
 
-fn yarnrc_paths_from_root(starting_dir: &Path) -> Vec<PathBuf> {
+fn yarnrc_paths_from_root(starting_dir: &Path, filename: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut current = starting_dir.to_path_buf();
     loop {
@@ -137,7 +153,7 @@ fn yarnrc_paths_from_root(starting_dir: &Path) -> Vec<PathBuf> {
     }
     dirs.reverse();
     dirs.into_iter()
-        .map(|dir| dir.join(".yarnrc.yml"))
+        .map(|dir| dir.join(filename))
         .filter(|path| path.is_file())
         .collect()
 }
@@ -155,6 +171,128 @@ pub(super) fn translate_yarnrc_content(content: &str) -> Vec<(String, String)> {
         return Vec::new();
     };
     config.into_entries()
+}
+
+fn load_classic_yarnrc_entries_from_path(path: &Path) -> Vec<(String, String)> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    translate_classic_yarnrc_content(&content)
+}
+
+/// Translate a classic Yarn (v1) `.yarnrc` file to npmrc-shaped entries,
+/// limited to the core registry/auth fields.
+///
+/// Classic `.yarnrc` uses the lockfile grammar's `key value` line form, where a
+/// value is JSON-quoted when it contains characters that need escaping (so most
+/// real-world registry/token lines are `key "value"`). Its config keys are
+/// already npmrc-shaped — `registry`, `"@scope:registry"`,
+/// `"//host/:_authToken"`, `"//host/:_auth"`, plus bare `_authToken` / `_auth`
+/// — so translation is essentially identity over the supported subset: parse
+/// each flat line, keep only the core keys, and normalize registry URLs to
+/// match how the `.yarnrc.yml` path emits them.
+///
+/// Out of scope (and ignored): every other classic key (`network-timeout`,
+/// `save-prefix`, `yarn-offline-mirror`, `--flag` arg lines, nested object
+/// values, …). This is the same "basic core-field" level as the `.yarnrc.yml`
+/// support, not full Yarn Classic parity.
+pub(super) fn translate_classic_yarnrc_content(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let Some((key, value)) = parse_classic_yarnrc_line(line) else {
+            continue;
+        };
+        if !classic_yarnrc_key_is_supported(&key) {
+            continue;
+        }
+        if key == "registry" || key.ends_with(":registry") {
+            push(&mut out, key, normalize_registry_url(&value));
+        } else {
+            push(&mut out, key, value);
+        }
+    }
+    out
+}
+
+/// Core registry/auth keys we honor from a classic `.yarnrc`. Mirrors the
+/// `.yarnrc.yml` subset: default registry, scoped registry, and registry-keyed
+/// or top-level auth.
+fn classic_yarnrc_key_is_supported(key: &str) -> bool {
+    key == "registry"
+        || key.ends_with(":registry")
+        || key.ends_with(":_authToken")
+        || key.ends_with(":_auth")
+        || key == "_authToken"
+        || key == "_auth"
+}
+
+/// Parse one flat `key value` line of a classic `.yarnrc`. Returns `None` for
+/// blank lines, comments, indented (nested-object) lines, and `--flag` arg
+/// lines. Both the key and the value may be JSON-double-quoted; bare tokens are
+/// taken verbatim.
+fn parse_classic_yarnrc_line(line: &str) -> Option<(String, String)> {
+    // A leading space/tab marks an indented (nested-object) line in the
+    // lockfile grammar — not a flat core-field line, so skip it.
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("--") {
+        return None;
+    }
+    let (key_raw, rest) = split_classic_token(trimmed)?;
+    let key = unquote_classic_token(key_raw);
+    let value_raw = rest.trim();
+    if value_raw.is_empty() {
+        return None;
+    }
+    let (value_raw, _) = split_classic_token(value_raw)?;
+    Some((key, unquote_classic_token(value_raw)))
+}
+
+/// Split off the first whitespace-delimited token, respecting a surrounding
+/// pair of double quotes (so a quoted token containing spaces stays intact).
+/// Returns the token slice and the remainder of the line.
+fn split_classic_token(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(after_open) = s.strip_prefix('"') {
+        // Find the closing quote, honoring backslash escapes.
+        let bytes = after_open.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'"' => {
+                    let end = 1 + i + 1; // include both quotes
+                    let token = &s[..end];
+                    let remainder = &s[end..];
+                    return Some((token, remainder));
+                }
+                _ => i += 1,
+            }
+        }
+        // Unterminated quote — treat the rest as the token.
+        Some((s, ""))
+    } else {
+        match s.find(char::is_whitespace) {
+            Some(idx) => Some((&s[..idx], &s[idx..])),
+            None => Some((s, "")),
+        }
+    }
+}
+
+/// Strip a surrounding pair of double quotes and unescape, matching how the
+/// classic lockfile parser JSON-decodes a quoted token. Bare tokens pass
+/// through unchanged.
+fn unquote_classic_token(token: &str) -> String {
+    if token.len() >= 2 && token.starts_with('"') && token.ends_with('"') {
+        serde_json::from_str::<String>(token).unwrap_or_else(|_| token.to_string())
+    } else {
+        token.to_string()
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
