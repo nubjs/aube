@@ -641,6 +641,32 @@ impl PackageJson {
             .collect()
     }
 
+    /// Return the set of dependency names marked
+    /// `dependenciesMeta.<name>.built = false`. Yarn and pnpm read this
+    /// as a per-package directive to skip that dependency's lifecycle
+    /// (build) scripts — equivalent to a `neverBuiltDependencies` entry
+    /// for the named package. Only `false` is a directive: `true` and
+    /// absence both mean "build per the normal allow rules" (pnpm does
+    /// not treat `built: true` as a force-allow), so this reader returns
+    /// just the explicit `false` set, which the caller folds into the
+    /// `BuildPolicy` denylist. `dependenciesMeta` is a neutral
+    /// package.json field, so this applies for every incumbent.
+    pub fn dependencies_meta_built_false(&self) -> BTreeSet<String> {
+        let Some(meta) = self
+            .extra
+            .get("dependenciesMeta")
+            .and_then(|v| v.as_object())
+        else {
+            return BTreeSet::new();
+        };
+        meta.iter()
+            .filter_map(|(k, v)| {
+                let built_false = v.get("built").and_then(|b| b.as_bool()) == Some(false);
+                built_false.then(|| k.clone())
+            })
+            .collect()
+    }
+
     /// Return `{pnpm,aube}.supportedArchitectures.{os,cpu,libc}` as
     /// three string arrays. Missing fields become empty vecs. Used by
     /// the resolver to widen the set of platforms considered
@@ -1766,6 +1792,36 @@ mod tests {
             p.pnpm_allow_builds().get("esbuild"),
             Some(AllowBuildRaw::Bool(true)),
         ));
+    }
+
+    #[test]
+    fn dependencies_meta_built_false_collects_only_explicit_false() {
+        // Yarn/pnpm: `built: false` = skip that dep's build scripts;
+        // `built: true` and absence are the default (build normally) and
+        // must NOT appear in the deny set.
+        let p = parse(
+            r#"{
+                "name": "x",
+                "dependenciesMeta": {
+                    "esbuild": {"built": false},
+                    "sharp": {"built": true},
+                    "lodash": {"injected": true},
+                    "node-gyp": {}
+                }
+            }"#,
+        );
+        let denied = p.dependencies_meta_built_false();
+        assert!(denied.contains("esbuild"));
+        assert!(!denied.contains("sharp"));
+        assert!(!denied.contains("lodash"));
+        assert!(!denied.contains("node-gyp"));
+        assert_eq!(denied.len(), 1);
+        // No `dependenciesMeta` at all → empty set.
+        assert!(
+            parse(r#"{"name":"y"}"#)
+                .dependencies_meta_built_false()
+                .is_empty()
+        );
     }
 
     #[test]

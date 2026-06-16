@@ -45,6 +45,9 @@ pub(super) async fn run_root_lifecycle(
 ///   real-world pnpm project)
 /// - `package.json` / `pnpm-workspace.yaml` `pnpm.neverBuiltDependencies`
 ///   flat list (pnpm's canonical denylist)
+/// - `package.json` `dependenciesMeta.<pkg>.built: false` (yarn/pnpm's
+///   per-package "do not build this dependency" directive — folded into
+///   the same denylist; `true`/absent is the default, only `false` denies)
 /// - the `--dangerously-allow-all-builds` escape hatch
 ///
 /// Workspace-level entries in the `allowBuilds` map take precedence
@@ -86,6 +89,11 @@ pub(crate) fn build_policy_from_manifest_sources<'a>(
         only_built.extend(manifest.pnpm_only_built_dependencies());
         only_built.extend(manifest.trusted_dependencies());
         never_built.extend(manifest.pnpm_never_built_dependencies());
+        // `dependenciesMeta.<pkg>.built: false` (yarn/pnpm) is a
+        // per-package deny — fold it into the same denylist as
+        // `neverBuiltDependencies`. Neutral package.json field, so it
+        // applies for every incumbent.
+        never_built.extend(manifest.dependencies_meta_built_false());
     }
     for (k, v) in workspace.allow_builds_raw() {
         merged.insert(k, v);
@@ -1256,6 +1264,32 @@ mod tests {
             &workspace,
             false,
         );
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            policy.decide("native-dep", "1.0.0"),
+            aube_scripts::AllowDecision::Deny
+        );
+    }
+
+    #[test]
+    fn dependencies_meta_built_false_denies_even_when_allow_listed() {
+        // `dependenciesMeta.<pkg>.built: false` is a deny that must beat
+        // an explicit allow-build, identical to a `neverBuiltDependencies`
+        // entry — proving it routes into the denylist, not just leaving
+        // the package Unspecified.
+        let mut manifest = manifest_with_allow_build("native-dep", true);
+        let mut meta = serde_json::Map::new();
+        let mut entry = serde_json::Map::new();
+        entry.insert("built".to_string(), serde_json::Value::Bool(false));
+        meta.insert("native-dep".to_string(), serde_json::Value::Object(entry));
+        manifest.extra.insert(
+            "dependenciesMeta".to_string(),
+            serde_json::Value::Object(meta),
+        );
+
+        let workspace = aube_manifest::WorkspaceConfig::default();
+        let (policy, warnings) = build_policy_from_sources(&manifest, &workspace, false);
 
         assert!(warnings.is_empty());
         assert_eq!(
