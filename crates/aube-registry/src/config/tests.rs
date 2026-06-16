@@ -161,6 +161,56 @@ fn yarnrc_maps_pnpm_linker_to_existing_isolated_linker_and_leaves_pnp_untranslat
 }
 
 #[test]
+fn yarnrc_translates_package_extensions_to_a_json_object_entry() {
+    let entries = translate_yarnrc_content(
+        r#"
+packageExtensions:
+  "react-redux@1":
+    peerDependencies:
+      react-dom: "*"
+  "is-even@*":
+    dependencies:
+      is-odd: "^1.0.0"
+    peerDependenciesMeta:
+      is-odd:
+        optional: true
+"#,
+    );
+
+    let (_, raw) = entries
+        .iter()
+        .find(|(k, _)| k == "packageExtensions")
+        .expect("packageExtensions must be emitted as a settings entry");
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("emitted packageExtensions must be a JSON object string");
+
+    // The selector key is carried through verbatim (Yarn requires `name@range`),
+    // and the dependencies/peerDependencies/peerDependenciesMeta shapes mirror
+    // the resolver's PackageExtension model 1:1.
+    assert_eq!(
+        parsed["react-redux@1"]["peerDependencies"]["react-dom"],
+        serde_json::json!("*")
+    );
+    assert_eq!(
+        parsed["is-even@*"]["dependencies"]["is-odd"],
+        serde_json::json!("^1.0.0")
+    );
+    assert_eq!(
+        parsed["is-even@*"]["peerDependenciesMeta"]["is-odd"]["optional"],
+        serde_json::json!(true)
+    );
+}
+
+#[test]
+fn yarnrc_without_package_extensions_emits_no_entry() {
+    let entries = translate_yarnrc_content("nodeLinker: node-modules\n");
+    assert!(
+        entries.iter().all(|(k, _)| k != "packageExtensions"),
+        "absent packageExtensions must not synthesize an empty settings entry"
+    );
+}
+
+#[test]
 fn yarnrc_project_overrides_global_yarnrc_entries() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

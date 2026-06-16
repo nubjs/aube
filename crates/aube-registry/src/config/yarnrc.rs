@@ -124,6 +124,18 @@ struct YarnRc {
     npm_scopes: BTreeMap<String, YarnScope>,
     #[serde(default)]
     npm_registries: BTreeMap<String, YarnRegistry>,
+    // Yarn Berry's `packageExtensions:` — a map of `pkg@range` selectors to
+    // `{ dependencies, peerDependencies, peerDependenciesMeta }` shapes. The
+    // value is captured verbatim (the YAML deserializer maps it straight into
+    // `serde_json::Value`) and re-emitted as a JSON object string under the
+    // `packageExtensions` settings key, so it flows through the exact same
+    // object-setting merge + parser that pnpm's `pnpm.packageExtensions` does.
+    // Yarn's shape mirrors the resolver's model 1:1 (Yarn omits
+    // `optionalDependencies`, which the parser simply reads as empty). Captured
+    // as a generic `serde_json::Value` rather than a typed struct so arbitrary
+    // nested entries round-trip untouched.
+    #[serde(default)]
+    package_extensions: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -221,8 +233,27 @@ impl YarnRc {
             }
         }
 
+        if !self.package_extensions.is_empty()
+            && let Some(json) = package_extensions_json(&self.package_extensions)
+        {
+            push(&mut out, "packageExtensions", json);
+        }
+
         out
     }
+}
+
+/// Serialize a parsed Yarn `packageExtensions:` map to a JSON object string
+/// under the `packageExtensions` settings key. The settings layer reads that
+/// key with `parse_json_object`, so the value must be a JSON *object* string.
+/// Returns `None` if the map fails to round-trip to a JSON object (it never
+/// should — every captured value is YAML-decodable — but we drop silently
+/// rather than emit a malformed entry).
+fn package_extensions_json(map: &BTreeMap<String, serde_json::Value>) -> Option<String> {
+    let serde_json::Value::Object(obj) = serde_json::to_value(map).ok()? else {
+        return None;
+    };
+    serde_json::to_string(&serde_json::Value::Object(obj)).ok()
 }
 
 fn push(out: &mut Vec<(String, String)>, key: impl Into<String>, value: impl Into<String>) {

@@ -1002,6 +1002,51 @@ mod override_tests {
 }
 
 #[cfg(test)]
+mod yarn_package_extensions_tests {
+    use super::*;
+
+    // End-to-end for the Yarn `packageExtensions` route. The registry layer
+    // translates a `.yarnrc.yml` `packageExtensions:` block into a single
+    // `("packageExtensions", <json-object-string>)` settings entry (covered by
+    // the translator's own unit test in aube-registry). This test starts from
+    // that exact entry shape and asserts it flows through the SAME
+    // object-setting parser pnpm uses, reaching the resolver's
+    // `PackageExtension` model — proving the field is wired all the way
+    // through to `resolve_dependency_policy`, not merely parsed in isolation.
+    #[test]
+    fn yarnrc_package_extensions_reach_the_dependency_policy() {
+        // Byte-for-byte the entry the Yarn translator emits for the block:
+        //   packageExtensions:
+        //     "is-even@*":
+        //       dependencies: { is-odd: "^1.0.0" }
+        //       peerDependencies: { react: "*" }
+        //       peerDependenciesMeta: { react: { optional: true } }
+        let yarnrc_entries = vec![(
+            "packageExtensions".to_string(),
+            r#"{"is-even@*":{"dependencies":{"is-odd":"^1.0.0"},"peerDependencies":{"react":"*"},"peerDependenciesMeta":{"react":{"optional":true}}}}"#
+                .to_string(),
+        )];
+
+        let workspace_yaml = std::collections::BTreeMap::new();
+        let ctx = aube_settings::ResolveCtx::files_only(&yarnrc_entries, &workspace_yaml);
+        let manifest = aube_manifest::PackageJson::default();
+        let policy = resolve_dependency_policy(&manifest, &ctx);
+
+        let ext = policy
+            .package_extensions
+            .iter()
+            .find(|e| e.selector == "is-even@*")
+            .expect("Yarn packageExtensions selector must reach the resolver policy");
+        assert_eq!(ext.dependencies.get("is-odd").unwrap(), "^1.0.0");
+        assert_eq!(ext.peer_dependencies.get("react").unwrap(), "*");
+        assert!(ext.peer_dependencies_meta.get("react").unwrap().optional);
+        // Yarn's schema has no optionalDependencies in packageExtensions, so
+        // the parser leaves that map empty rather than inventing entries.
+        assert!(ext.optional_dependencies.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod network_concurrency_tests {
     use super::*;
 
