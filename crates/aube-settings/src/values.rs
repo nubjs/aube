@@ -212,23 +212,29 @@ pub fn process_env() -> &'static [(String, String)] {
 ///
 /// ```text
 /// cli > env
-///     > project_aube_config (<cwd>/.config/aube/config.toml)
-///     > project_npmrc       (<cwd>/.npmrc + npmrcAuthFile)
 ///     > workspace_yaml      (pnpm-workspace.yaml / aube-workspace.yaml)
 ///     > global_config_yaml  (<configDir>/config.yaml, pnpm v11, pnpm-incumbent only)
+///     > project_aube_config (<cwd>/.config/aube/config.toml)
+///     > project_npmrc       (<cwd>/.npmrc + npmrcAuthFile)
 ///     > user_aube_config    (~/.config/aube/config.toml)
 ///     > user_npmrc          (~/.npmrc + pnpm auth.ini)
 /// ```
 ///
-/// Two principles drive the file-source ordering:
+/// The file-source ordering matches pnpm's config precedence (v10.5+/v11):
+/// the YAML settings sources outrank the project `.npmrc`. pnpm reads
+/// `.npmrc` first and then merges the global `config.yaml` and project
+/// `pnpm-workspace.yaml` over it (last-write-wins), so both YAML sources
+/// beat `.npmrc`. Two principles fill in the rest:
 ///
-/// - **Scope locality**: project-scope entries beat user-scope entries.
-///   `workspace_yaml` lives at the project root, so it ranks above
-///   every user-scope source.
-/// - **Aube authority**: within a scope, aube's own config file beats
-///   `.npmrc`. Values aube writes via `aube config set` are not
-///   silently shadowed by leftover entries in a `.npmrc` that other
-///   tools (npm, pnpm, yarn) also read.
+/// - **YAML-over-`.npmrc` (pnpm parity)**: `workspace_yaml` and
+///   `global_config_yaml` outrank `.npmrc`. A project
+///   `pnpm-workspace.yaml` setting is not silently shadowed by a stale
+///   `.npmrc` entry. (Both YAML maps are empty unless pnpm is the
+///   provable incumbent, so under a non-pnpm project this is inert.)
+/// - **Scope locality + aube authority** (below the YAMLs): project-scope
+///   beats user-scope, and within a scope aube's own `config.toml`
+///   beats `.npmrc` so values written via `aube config set` aren't
+///   shadowed by leftover entries other tools (npm, pnpm, yarn) read.
 ///
 /// The per-setting `precedence` override in `settings.toml` reorders
 /// the file-based sources but cannot demote `cli` or `env` off the
@@ -906,12 +912,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_accessor_walks_npmrc_then_workspace_yaml() {
-        // `.npmrc` wins over workspace.yaml.
+    fn generated_accessor_prefers_workspace_yaml_over_npmrc() {
+        // pnpm parity (v10.5+/v11): pnpm-workspace.yaml wins over the
+        // project `.npmrc` (`files_only` treats the npmrc slice as
+        // project-scope).
         let npmrc = entries(&[("auto-install-peers", "false")]);
         let ws = raw_yaml("autoInstallPeers: true\n");
         let ctx = ResolveCtx::files_only(&npmrc, &ws);
-        assert!(!resolved::auto_install_peers(&ctx));
+        assert!(resolved::auto_install_peers(&ctx));
     }
 
     #[test]
@@ -1037,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_beats_env_beats_npmrc_beats_workspace_yaml() {
+    fn cli_beats_env_beats_every_file_source() {
         // CLI and env always win over file sources. This test hits
         // every layer (cli, env, project npmrc, workspace yaml) by
         // setting a unique value at each and asserting the generated
@@ -1230,6 +1238,83 @@ mod tests {
     }
 
     #[test]
+    fn workspace_yaml_wins_over_project_npmrc_by_default() {
+        // pnpm parity (v10.5+/v11): a project `pnpm-workspace.yaml`
+        // setting outranks the same key in the project `.npmrc`. pnpm
+        // merges the workspace YAML over the `.npmrc`-derived config
+        // (last-write-wins), so a stale `.npmrc` entry must not shadow
+        // the workspace YAML. `autoInstallPeers` has no per-setting
+        // precedence override, so it exercises the default order.
+        let project_npmrc = entries(&[("auto-install-peers", "true")]);
+        let ws = raw_yaml("autoInstallPeers: false\n");
+        let ctx = ResolveCtx {
+            project_aube_config: &[],
+            project_npmrc: &project_npmrc,
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert!(
+            !resolved::auto_install_peers(&ctx),
+            "workspace yaml=false should win over project npmrc=true"
+        );
+    }
+
+    #[test]
+    fn global_config_yaml_wins_over_project_npmrc_by_default() {
+        // pnpm v11 ranks the global `<configDir>/config.yaml` above the
+        // project `.npmrc` (it's merged over the `.npmrc`-derived
+        // config before the project workspace YAML). With no project
+        // workspace YAML present, global config.yaml still beats
+        // `.npmrc`.
+        let project_npmrc = entries(&[("auto-install-peers", "true")]);
+        let global_yaml = raw_yaml("autoInstallPeers: false\n");
+        let ws = BTreeMap::new();
+        let ctx = ResolveCtx {
+            project_aube_config: &[],
+            project_npmrc: &project_npmrc,
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: &global_yaml,
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert!(
+            !resolved::auto_install_peers(&ctx),
+            "global config.yaml=false should win over project npmrc=true"
+        );
+    }
+
+    #[test]
+    fn workspace_yaml_wins_over_global_config_yaml_by_default() {
+        // pnpm v11: a project `pnpm-workspace.yaml` overrides the user's
+        // global `config.yaml` (the workspace YAML is merged last).
+        let global_yaml = raw_yaml("autoInstallPeers: true\n");
+        let ws = raw_yaml("autoInstallPeers: false\n");
+        let ctx = ResolveCtx {
+            project_aube_config: &[],
+            project_npmrc: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: &global_yaml,
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert!(
+            !resolved::auto_install_peers(&ctx),
+            "project workspace yaml=false should win over global config.yaml=true"
+        );
+    }
+
+    #[test]
     fn env_alias_order_defines_priority() {
         let env = entries(&[
             ("CI", "true"),
@@ -1278,15 +1363,19 @@ mod tests {
         // The generator used to apply `from_str_normalized` per-source
         // via `.and_then`, which silently skipped the typo and let the
         // lower source win — a strict precedence violation.
-        let npmrc = entries(&[("nodeLinker", "totally-fake")]);
-        let ws = raw_yaml("nodeLinker: hoisted\n");
+        //
+        // pnpm-workspace.yaml outranks the project `.npmrc` (pnpm
+        // v10.5+/v11), so an unparseable value in the workspace YAML
+        // must block the `.npmrc` value and fall back to the default.
+        let npmrc = entries(&[("nodeLinker", "hoisted")]);
+        let ws = raw_yaml("nodeLinker: totally-fake\n");
         let ctx = ResolveCtx::files_only(&npmrc, &ws);
         assert_eq!(
             resolved::node_linker(&ctx),
             resolved::NodeLinker::Isolated,
-            ".npmrc had a raw value, even if unparseable — it must win \
-             over pnpm-workspace.yaml and fall back to the generated \
-             default"
+            "pnpm-workspace.yaml had a raw value, even if unparseable — \
+             it must win over the project .npmrc and fall back to the \
+             generated default"
         );
     }
 

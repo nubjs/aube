@@ -18,21 +18,18 @@ impl NpmConfig {
     /// User-provided `.npmrc` entries win — `apply` has already run by
     /// the time we get here, so we only fill in gaps.
     ///
-    /// ACCEPTED DIVERGENCE — pnpm's *builtin* npmrc (the `npmrc` file
-    /// shipped inside the pnpm/npm install prefix, npm's
-    /// `BUILTIN_CONFIG`/`pnpmrc`): aube does NOT read it. These
-    /// compiled-in defaults (the npmjs default registry, the `@jsr`
-    /// scope above) ARE aube's equivalent of that builtin layer. The
-    /// on-disk builtin file only carries non-default values when someone
-    /// customizes a pnpm *binary distribution* (e.g. a corporate repack
-    /// that bakes an internal registry into the shipped binary) — a
-    /// vanishingly rare case, and one where the user is running that
-    /// repacked pnpm, not aube. Reading it would also mean probing a
-    /// path inside the active pnpm install prefix, which aube has no
-    /// reliable way to locate when embedded. The user-facing
-    /// global/user/project npmrc cascade, pnpm's global `config.yaml`,
-    /// and `auth.ini` are all honored; only this binary-baked builtin
-    /// layer is out of scope. (GAP #2 in the pnpm config-compat audit.)
+    /// These compiled-in defaults (the npmjs default registry, the `@jsr`
+    /// scope below) are aube's *own* baseline, applied beneath every
+    /// on-disk source so a user `.npmrc` always wins. They are distinct
+    /// from npm's on-disk builtin/global `npmrc`, which the loader now
+    /// reads as their own scopes ([`load_npmrc_entries_tagged_with_globals`]):
+    /// the full npm file cascade — builtin < global < user < project — is
+    /// honored when the npm install prefix is locatable
+    /// (`NPM_CONFIG_PREFIX` / `PREFIX` / `NPM_CONFIG_GLOBALCONFIG`). When
+    /// no prefix can be determined (aube embedded with no npm install in
+    /// view) those scopes are simply absent and these compiled-in defaults
+    /// are the only baseline. pnpm's global `config.yaml` and `auth.ini`
+    /// are handled separately.
     pub(super) fn apply_builtin_scoped_defaults(&mut self) {
         self.scoped_registries
             .entry(crate::jsr::JSR_NPM_SCOPE.to_string())
@@ -151,22 +148,11 @@ impl NpmConfig {
     }
 
     pub(super) fn apply_tagged(&mut self, entries: Vec<(NpmrcSource, String, String)>) {
-        let mut user_registry = "https://registry.npmjs.org/".to_string();
-        let mut pnpm_auth_registry = "https://registry.npmjs.org/".to_string();
-        let mut project_registry = "https://registry.npmjs.org/".to_string();
-        let mut npmrc_auth_file_registry = "https://registry.npmjs.org/".to_string();
-        let mut env_registry = "https://registry.npmjs.org/".to_string();
+        let mut registries = SourceRegistries::default();
 
         for (source, key, value) in &entries {
             if key == "registry" {
-                *source_registry_mut(
-                    *source,
-                    &mut user_registry,
-                    &mut pnpm_auth_registry,
-                    &mut project_registry,
-                    &mut npmrc_auth_file_registry,
-                    &mut env_registry,
-                ) = normalize_registry_url(value);
+                *registries.slot_mut(*source) = normalize_registry_url(value);
             }
         }
 
@@ -182,14 +168,7 @@ impl NpmConfig {
             if key == "registry" {
                 self.registry = normalize_registry_url(&value);
             } else if key == "_authToken" {
-                let registry = source_registry(
-                    source,
-                    &user_registry,
-                    &pnpm_auth_registry,
-                    &project_registry,
-                    &npmrc_auth_file_registry,
-                    &env_registry,
-                );
+                let registry = registries.slot(source);
                 self.rescope_unscoped_registry_setting(
                     source,
                     registry,
@@ -201,14 +180,7 @@ impl NpmConfig {
                     |auth| auth.auth_token = Some(value),
                 );
             } else if key == "_auth" {
-                let registry = source_registry(
-                    source,
-                    &user_registry,
-                    &pnpm_auth_registry,
-                    &project_registry,
-                    &npmrc_auth_file_registry,
-                    &env_registry,
-                );
+                let registry = registries.slot(source);
                 self.rescope_unscoped_registry_setting(
                     source,
                     registry,
@@ -220,14 +192,7 @@ impl NpmConfig {
                     |auth| auth.auth = Some(value),
                 );
             } else if key == "username" {
-                let registry = source_registry(
-                    source,
-                    &user_registry,
-                    &pnpm_auth_registry,
-                    &project_registry,
-                    &npmrc_auth_file_registry,
-                    &env_registry,
-                );
+                let registry = registries.slot(source);
                 self.rescope_unscoped_registry_setting(
                     source,
                     registry,
@@ -239,14 +204,7 @@ impl NpmConfig {
                     |auth| auth.username = Some(value),
                 );
             } else if key == "_password" {
-                let registry = source_registry(
-                    source,
-                    &user_registry,
-                    &pnpm_auth_registry,
-                    &project_registry,
-                    &npmrc_auth_file_registry,
-                    &env_registry,
-                );
+                let registry = registries.slot(source);
                 self.rescope_unscoped_registry_setting(
                     source,
                     registry,
@@ -259,14 +217,7 @@ impl NpmConfig {
                 );
             } else if matches!(key.as_str(), "cert" | "key") {
                 let suffix = key.clone();
-                let registry = source_registry(
-                    source,
-                    &user_registry,
-                    &pnpm_auth_registry,
-                    &project_registry,
-                    &npmrc_auth_file_registry,
-                    &env_registry,
-                );
+                let registry = registries.slot(source);
                 let explicit_uri_field = explicit_uri_fields.contains(&(
                     registry_uri_key(registry),
                     canonical_rescoped_suffix(&suffix).unwrap_or(suffix.as_str()),
@@ -299,14 +250,7 @@ impl NpmConfig {
                     );
                     continue;
                 };
-                let registry = source_registry(
-                    source,
-                    &user_registry,
-                    &pnpm_auth_registry,
-                    &project_registry,
-                    &npmrc_auth_file_registry,
-                    &env_registry,
-                );
+                let registry = registries.slot(source);
                 self.rescope_unscoped_registry_setting(
                     source,
                     registry,
@@ -534,37 +478,65 @@ fn canonical_rescoped_suffix(suffix: &str) -> Option<&'static str> {
     }
 }
 
-fn source_registry<'a>(
-    source: NpmrcSource,
-    user: &'a str,
-    pnpm_auth: &'a str,
-    project: &'a str,
-    npmrc_auth_file: &'a str,
-    env: &'a str,
-) -> &'a str {
-    match source {
-        NpmrcSource::User => user,
-        NpmrcSource::PnpmAuth => pnpm_auth,
-        NpmrcSource::Project => project,
-        NpmrcSource::UserNpmrcAuthFile | NpmrcSource::ProjectNpmrcAuthFile => npmrc_auth_file,
-        NpmrcSource::Env => env,
+/// Per-source view of "which default `registry=` was set in this scope",
+/// used to pin an unscoped `_authToken` (etc.) from a given source to the
+/// registry that same source declared. One slot per file/env scope;
+/// builtin and global share their own slots so an admin-set unscoped auth
+/// in the global `npmrc` binds to the global `registry=`. The two
+/// `*NpmrcAuthFile` sources collapse onto the auth-file slot (a value the
+/// auth file itself rarely sets), matching the prior behavior.
+struct SourceRegistries {
+    builtin: String,
+    global: String,
+    user: String,
+    pnpm_auth: String,
+    project: String,
+    npmrc_auth_file: String,
+    env: String,
+}
+
+impl Default for SourceRegistries {
+    fn default() -> Self {
+        let default = || "https://registry.npmjs.org/".to_string();
+        Self {
+            builtin: default(),
+            global: default(),
+            user: default(),
+            pnpm_auth: default(),
+            project: default(),
+            npmrc_auth_file: default(),
+            env: default(),
+        }
     }
 }
 
-fn source_registry_mut<'a>(
-    source: NpmrcSource,
-    user: &'a mut String,
-    pnpm_auth: &'a mut String,
-    project: &'a mut String,
-    npmrc_auth_file: &'a mut String,
-    env: &'a mut String,
-) -> &'a mut String {
-    match source {
-        NpmrcSource::User => user,
-        NpmrcSource::PnpmAuth => pnpm_auth,
-        NpmrcSource::Project => project,
-        NpmrcSource::UserNpmrcAuthFile | NpmrcSource::ProjectNpmrcAuthFile => npmrc_auth_file,
-        NpmrcSource::Env => env,
+impl SourceRegistries {
+    fn slot(&self, source: NpmrcSource) -> &str {
+        match source {
+            NpmrcSource::Builtin => &self.builtin,
+            NpmrcSource::Global => &self.global,
+            NpmrcSource::User => &self.user,
+            NpmrcSource::PnpmAuth => &self.pnpm_auth,
+            NpmrcSource::Project => &self.project,
+            NpmrcSource::UserNpmrcAuthFile | NpmrcSource::ProjectNpmrcAuthFile => {
+                &self.npmrc_auth_file
+            }
+            NpmrcSource::Env => &self.env,
+        }
+    }
+
+    fn slot_mut(&mut self, source: NpmrcSource) -> &mut String {
+        match source {
+            NpmrcSource::Builtin => &mut self.builtin,
+            NpmrcSource::Global => &mut self.global,
+            NpmrcSource::User => &mut self.user,
+            NpmrcSource::PnpmAuth => &mut self.pnpm_auth,
+            NpmrcSource::Project => &mut self.project,
+            NpmrcSource::UserNpmrcAuthFile | NpmrcSource::ProjectNpmrcAuthFile => {
+                &mut self.npmrc_auth_file
+            }
+            NpmrcSource::Env => &mut self.env,
+        }
     }
 }
 

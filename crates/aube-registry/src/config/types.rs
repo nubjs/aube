@@ -10,6 +10,18 @@ use std::path::PathBuf;
 /// not qualify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NpmrcSource {
+    /// The builtin `npmrc` shipped next to the npm CLI (npm's
+    /// `BUILTIN_CONFIG`, `resolve(npmPath, 'npmrc')`). System/admin
+    /// controlled — a value here was baked into the installed toolchain,
+    /// so it is at least as trusted as the user's own `.npmrc`. Lowest
+    /// precedence of every file source.
+    Builtin,
+    /// The global `npmrc` (`$PREFIX/etc/npmrc`, or `NPM_CONFIG_GLOBALCONFIG`).
+    /// System/admin controlled — corporate and CI machines set the
+    /// registry, proxy, cafile, and auth here. Trusted at >= user level
+    /// (an admin-set global is at least as trusted as the user's own
+    /// config). Sits below user/project in npm's precedence cascade.
+    Global,
     /// `~/.npmrc`. The developer's personal config. Trusted.
     User,
     /// `~/.config/pnpm/auth.ini`. pnpm's global auth file. Trusted
@@ -40,7 +52,12 @@ impl NpmrcSource {
     pub(super) fn is_trusted_for_subprocess_settings(self) -> bool {
         matches!(
             self,
-            Self::User | Self::PnpmAuth | Self::UserNpmrcAuthFile | Self::Env
+            Self::Builtin
+                | Self::Global
+                | Self::User
+                | Self::PnpmAuth
+                | Self::UserNpmrcAuthFile
+                | Self::Env
         )
     }
 

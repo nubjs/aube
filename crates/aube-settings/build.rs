@@ -270,11 +270,11 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
         };
 
         // Emit source lookups in the declared precedence order. The
-        // default order is `[projectAubeConfig, projectNpmrc,
-        // workspaceYaml, userAubeConfig, userNpmrc]`; a setting whose
-        // `precedence` field names only one source gets the rest
-        // appended after it. Unknown source names panic loudly at
-        // build time — cheaper to catch a typo here than in a user
+        // default order is `[workspaceYaml, globalConfigYaml,
+        // projectAubeConfig, projectNpmrc, userAubeConfig, userNpmrc]`;
+        // a setting whose `precedence` field names only one source gets
+        // the rest appended after it. Unknown source names panic loudly
+        // at build time — cheaper to catch a typo here than in a user
         // bug report.
         let order = resolve_precedence(&def.precedence);
         writeln!(
@@ -559,25 +559,30 @@ fn resolve_precedence(declared: &[String]) -> Vec<String> {
     // sources. Anyone who declares `cli` or `env` in their precedence
     // list gets it silently dropped because it's already pinned on top.
     //
-    // The default file order encodes two principles: scope locality
-    // (project > user) and aube authority within a scope (aubeConfig >
-    // npmrc).
-    // `workspaceYaml` lives at the project root (`pnpm-workspace.yaml`
-    // / `aube-workspace.yaml`), so it's project-scope and outranks
-    // every user-scope source. Within project scope, aube's own
-    // `config.toml` and project `.npmrc` keep their lead — workspace
-    // yaml sits at the bottom of project-scope but above user-scope.
+    // The default file order matches pnpm's config-source precedence
+    // (v10.5+/v11): the YAML settings sources outrank the project
+    // `.npmrc`. pnpm builds its config from `.npmrc` first, then
+    // `Object.assign`s the global `config.yaml` and finally the project
+    // `pnpm-workspace.yaml` over it (last-write-wins), so both YAML
+    // sources beat `.npmrc`. (Verified against pnpm v10.5.0
+    // `config/config/src/index.ts:494-499` and v11.3.0
+    // `config/reader/src/index.ts`; the YAML-over-`.npmrc` order has
+    // been stable since pnpm v10.5.0, so no per-major branch is needed.)
+    //
+    // `workspaceYaml` (project `pnpm-workspace.yaml` / `aube-workspace.yaml`)
+    // ranks first among files: it's project-scope and a project YAML
+    // overrides the user's global `config.yaml` (matching pnpm v11).
+    // `globalConfigYaml` (pnpm v11's `<configDir>/config.yaml`) ranks
+    // just below it. Then the project aube `config.toml` / `.npmrc`
+    // pair (aube's own config beats `.npmrc` within a scope), then
+    // user-scope, then embedder defaults. Both YAML maps are empty
+    // unless pnpm is the provable incumbent (the pnpm-named-paths hard
+    // gate), so under a non-pnpm project the reorder is observably inert.
     let file_default = [
+        "workspaceYaml",
+        "globalConfigYaml",
         "projectAubeConfig",
         "projectNpmrc",
-        "workspaceYaml",
-        // pnpm's global `config.yaml` (pnpm v11) is a GLOBAL/user-scope
-        // source: it ranks below the project-root workspace yaml (a
-        // project `pnpm-workspace.yaml` overrides the user's global
-        // config.yaml, matching pnpm v11) and above the user-scope
-        // `.npmrc` / aube config. Empty unless pnpm is the provable
-        // incumbent (the pnpm-named-paths hard gate).
-        "globalConfigYaml",
         "userAubeConfig",
         "userNpmrc",
         // Embedder-supplied defaults sit at the very bottom: below every

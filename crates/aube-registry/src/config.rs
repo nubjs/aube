@@ -23,7 +23,8 @@ pub(crate) use url::lookup_by_uri_prefix;
 use env::{npm_config_env_entries_from, translate_npm_config_env};
 #[cfg(test)]
 use load::{
-    expand_userconfig_path, load_npmrc_entries_tagged_with_home, load_npmrc_entries_with_home,
+    GlobalNpmrcPaths, expand_userconfig_path, load_npmrc_entries_tagged_with_globals,
+    load_npmrc_entries_tagged_with_home, load_npmrc_entries_with_home, resolve_global_npmrc_paths,
     userconfig_override_from_env,
 };
 #[cfg(test)]

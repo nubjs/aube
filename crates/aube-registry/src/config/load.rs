@@ -83,11 +83,17 @@ impl NpmConfig {
         // loader so tests that drive `load_with_env` can exercise the
         // same code path without mutating process-wide env.
         let user_rc_override = userconfig_override_from_env(env, home.as_deref());
-        let mut tagged = load_npmrc_entries_tagged_with_home(
+        // System/admin-scoped npmrc (builtin < global), resolved from the
+        // same captured env slice so this stays hermetic for tests.
+        let global_paths = resolve_global_npmrc_paths(|name| {
+            env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+        });
+        let mut tagged = load_npmrc_entries_tagged_with_globals(
             home.as_deref(),
             xdg.as_deref(),
             project_dir,
             user_rc_override.as_deref(),
+            &global_paths,
         );
         // `npm_config_*` / `NPM_CONFIG_*` env vars beat file config in
         // npm/pnpm. Apply them after `.npmrc` so last-write-wins gives
@@ -129,16 +135,27 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
     let home = home_dir();
     let user_rc_override =
         userconfig_env_value().and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
-    let tagged = load_npmrc_entries_tagged_with_home(
+    let global_paths = resolve_global_npmrc_paths_from_std_env();
+    let tagged = load_npmrc_entries_tagged_with_globals(
         home.as_deref(),
         xdg.as_deref(),
         project_dir,
         user_rc_override.as_deref(),
+        &global_paths,
     );
     let mut split = SplitNpmrcEntries::default();
     for (src, k, v) in tagged {
         match src {
-            NpmrcSource::User | NpmrcSource::PnpmAuth | NpmrcSource::UserNpmrcAuthFile => {
+            // Builtin + global sit below user in precedence but are
+            // still non-project (locality: project wins over all of
+            // them). They're emitted ahead of user by the walker, so
+            // pushing them into the same bucket preserves
+            // builtin < global < user order.
+            NpmrcSource::Builtin
+            | NpmrcSource::Global
+            | NpmrcSource::User
+            | NpmrcSource::PnpmAuth
+            | NpmrcSource::UserNpmrcAuthFile => {
                 split.user.push((k, v));
             }
             NpmrcSource::Project | NpmrcSource::ProjectNpmrcAuthFile => split.project.push((k, v)),
@@ -201,29 +218,106 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     // pnpm-incumbent gate on the `PNPM_CONFIG_*` forms.
     let user_rc_override =
         userconfig_env_value().and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
-    let entries = load_npmrc_entries_with_home(
+    let global_paths = resolve_global_npmrc_paths_from_std_env();
+    let entries = load_npmrc_entries_tagged_with_globals(
         home.as_deref(),
         xdg.as_deref(),
         project_dir,
         user_rc_override.as_deref(),
-    );
+        &global_paths,
+    )
+    .into_iter()
+    .map(|(_, k, v)| (k, v))
+    .collect::<Vec<_>>();
     if let Ok(mut map) = cache.lock() {
         map.insert(project_dir.to_path_buf(), entries.clone());
     }
     entries
 }
 
+/// The two system/admin-scoped npmrc files that sit *below* the user
+/// `.npmrc` in npm's config cascade: the builtin `npmrc` shipped next to
+/// the npm CLI, and the global `npmrc` (`$PREFIX/etc/npmrc`). Both are
+/// resolved from the environment ([`resolve_global_npmrc_paths`]) at the
+/// public entry points and injected here so the walker stays testable.
+/// Either may be `None` when the path can't be located — aube does not
+/// fabricate a path, the scope is simply absent.
+#[derive(Default, Clone)]
+pub(super) struct GlobalNpmrcPaths {
+    /// `resolve(npmPath, 'npmrc')` — the builtin layer.
+    pub builtin: Option<PathBuf>,
+    /// `$PREFIX/etc/npmrc` or `NPM_CONFIG_GLOBALCONFIG`.
+    pub global: Option<PathBuf>,
+}
+
 /// Same as [`load_npmrc_entries_with_home`] but each entry is tagged
 /// with the file it came from. `apply_tagged` uses the tag to refuse
 /// high-privilege settings (currently `tokenHelper`) that originated
 /// from a project-scope `.npmrc` a hostile repo can commit.
+///
+/// This entry point reads no global/builtin npmrc (passes
+/// [`GlobalNpmrcPaths::default`]); the production loaders go through
+/// [`load_npmrc_entries_tagged_with_globals`], which resolves those
+/// system-scoped files from the environment. Test-only: every production
+/// path resolves the global scopes, so this shim exists purely to keep the
+/// many fixtures that don't exercise builtin/global terse.
+#[cfg(test)]
 pub(super) fn load_npmrc_entries_tagged_with_home(
     home: Option<&Path>,
     xdg_config_home: Option<&Path>,
     project_dir: &Path,
     user_rc_override: Option<&Path>,
 ) -> Vec<(NpmrcSource, String, String)> {
+    load_npmrc_entries_tagged_with_globals(
+        home,
+        xdg_config_home,
+        project_dir,
+        user_rc_override,
+        &GlobalNpmrcPaths::default(),
+    )
+}
+
+/// Tagged walker over the full npm config-file cascade, lowest → highest
+/// precedence: **builtin < global < user < project** (env and CLI sit
+/// above and are layered on by the caller). The builtin and global
+/// `npmrc` are admin/system-controlled, so they parse as *trusted*
+/// (`${VAR}` expansion on, `tokenHelper`/proxy/`strict-ssl` allowed) —
+/// an admin who baked a setting into the installed toolchain or the
+/// global config is at least as trusted as the user's own `.npmrc`. Only
+/// the project `.npmrc` (and a project-pointed auth file) is untrusted.
+pub(super) fn load_npmrc_entries_tagged_with_globals(
+    home: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    project_dir: &Path,
+    user_rc_override: Option<&Path>,
+    global_paths: &GlobalNpmrcPaths,
+) -> Vec<(NpmrcSource, String, String)> {
     let mut out: Vec<(NpmrcSource, String, String)> = Vec::new();
+    // Builtin npmrc (lowest precedence): the `npmrc` shipped next to the
+    // npm CLI. System-controlled, so trusted (env expansion on).
+    if let Some(builtin_rc) = global_paths.builtin.as_deref()
+        && builtin_rc.exists()
+        && let Ok(entries) = parse_npmrc(builtin_rc)
+    {
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Builtin, k, v)),
+        );
+    }
+    // Global npmrc (`$PREFIX/etc/npmrc` / `NPM_CONFIG_GLOBALCONFIG`):
+    // admin-controlled corporate/CI config. Sits below user, above
+    // builtin. Trusted.
+    if let Some(global_rc) = global_paths.global.as_deref()
+        && global_rc.exists()
+        && let Ok(entries) = parse_npmrc(global_rc)
+    {
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Global, k, v)),
+        );
+    }
     // User-level rc: explicit override (from `NPM_CONFIG_USERCONFIG`)
     // wins over `$HOME/.npmrc`. Keeps the `User` source tag either
     // way — the user chose the file location, so `apply_tagged`'s
@@ -290,7 +384,9 @@ pub(super) fn load_npmrc_entries_tagged_with_home(
 /// Same as [`load_npmrc_entries`] but with an injectable user-home
 /// directory and XDG config-home override. Used by tests that need to
 /// isolate from the developer's real `~/.npmrc` and pnpm config dir
-/// without mutating process-wide environment variables.
+/// without mutating process-wide environment variables. Test-only — reads
+/// no global/builtin scope.
+#[cfg(test)]
 pub(super) fn load_npmrc_entries_with_home(
     home: Option<&Path>,
     xdg_config_home: Option<&Path>,
@@ -425,6 +521,68 @@ pub(super) fn userconfig_override_from_env(
 }
 pub(super) fn home_dir() -> Option<PathBuf> {
     aube_util::env::home_dir()
+}
+
+/// Resolve the builtin + global `npmrc` paths the way npm does, reading
+/// only the npm-compat env vars (`NPM_CONFIG_GLOBALCONFIG`,
+/// `NPM_CONFIG_PREFIX`/`PREFIX`) via the supplied lookup. npm's rules:
+///
+/// - **global** = `NPM_CONFIG_GLOBALCONFIG` if set, else
+///   `$PREFIX/etc/npmrc`, where `$PREFIX` = `NPM_CONFIG_PREFIX` ?? `PREFIX`.
+/// - **builtin** = `npmrc` shipped inside the npm install, at
+///   `$PREFIX/lib/node_modules/npm/npmrc` (POSIX) or
+///   `$PREFIX/node_modules/npm/npmrc` (Windows), overridable via
+///   `NPM_CONFIG_BUILTIN_CONFIG`.
+///
+/// When the prefix can't be determined (no `NPM_CONFIG_PREFIX`/`PREFIX`
+/// and no explicit override), the corresponding scope is `None` — aube is
+/// embedded and has no reliable way to locate a foreign npm install, so it
+/// declines to guess rather than fabricate a path. `existence` is *not*
+/// probed here; the walker checks `.exists()` itself.
+pub(super) fn resolve_global_npmrc_paths(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> GlobalNpmrcPaths {
+    let non_empty = |s: String| {
+        let t = s.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    };
+    let read = |name: &str| lookup(name).and_then(non_empty);
+
+    let prefix = read("NPM_CONFIG_PREFIX")
+        .or_else(|| read("npm_config_prefix"))
+        .or_else(|| read("PREFIX"))
+        .map(PathBuf::from);
+
+    let global = read("NPM_CONFIG_GLOBALCONFIG")
+        .or_else(|| read("npm_config_globalconfig"))
+        .map(PathBuf::from)
+        .or_else(|| prefix.as_ref().map(|p| p.join("etc").join("npmrc")));
+
+    let builtin = read("NPM_CONFIG_BUILTIN_CONFIG")
+        .or_else(|| read("npm_config_builtin_config"))
+        .map(PathBuf::from)
+        .or_else(|| prefix.as_ref().map(|p| p.join(builtin_npm_subpath())));
+
+    GlobalNpmrcPaths { builtin, global }
+}
+
+/// Path from the npm install prefix to the bundled npm package's `npmrc`.
+/// POSIX installs nest packages under `lib/node_modules`; Windows omits
+/// the `lib` segment.
+fn builtin_npm_subpath() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from("node_modules").join("npm").join("npmrc")
+    } else {
+        PathBuf::from("lib")
+            .join("node_modules")
+            .join("npm")
+            .join("npmrc")
+    }
+}
+
+/// [`resolve_global_npmrc_paths`] reading the process environment.
+fn resolve_global_npmrc_paths_from_std_env() -> GlobalNpmrcPaths {
+    resolve_global_npmrc_paths(|name| std::env::var(name).ok())
 }
 
 /// Resolve the path to pnpm's global auth file: `<configDir>/auth.ini`,

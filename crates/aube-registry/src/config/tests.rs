@@ -374,6 +374,214 @@ fn user_declared_npmrc_auth_file_loses_to_project_npmrc() {
     );
 }
 
+/// The full npm config-file cascade — builtin < global < user < project —
+/// resolves with the right precedence: each scope overrides the one below
+/// it, and the project `.npmrc` still wins overall. Drives the tagged
+/// walker directly with injected home + global paths so the developer's
+/// real `~/.npmrc` and `NPM_CONFIG_*` env can't perturb the assertion.
+#[test]
+fn npmrc_cascade_orders_builtin_global_user_project() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+
+    let builtin_rc = global_dir.path().join("builtin-npmrc");
+    let global_rc = global_dir.path().join("global-npmrc");
+
+    // Each scope sets `registry` (so we can see who wins overall) plus a
+    // scope-unique `@<scope>:registry` (so we can see every scope was read).
+    std::fs::write(
+        &builtin_rc,
+        "registry=https://builtin.example/\n@builtin:registry=https://builtin.example/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &global_rc,
+        "registry=https://global.example/\n@global:registry=https://global.example/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join(".npmrc"),
+        "registry=https://user.example/\n@user:registry=https://user.example/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "registry=https://project.example/\n@project:registry=https://project.example/\n",
+    )
+    .unwrap();
+
+    let globals = GlobalNpmrcPaths {
+        builtin: Some(builtin_rc),
+        global: Some(global_rc),
+    };
+    let tagged = load_npmrc_entries_tagged_with_globals(
+        Some(home.path()),
+        None,
+        project.path(),
+        None,
+        &globals,
+    );
+
+    // The `registry` entries appear in cascade order, lowest first.
+    let registry_order: Vec<(NpmrcSource, &str)> = tagged
+        .iter()
+        .filter(|(_, k, _)| k == "registry")
+        .map(|(s, _, v)| (*s, v.as_str()))
+        .collect();
+    assert_eq!(
+        registry_order,
+        vec![
+            (NpmrcSource::Builtin, "https://builtin.example/"),
+            (NpmrcSource::Global, "https://global.example/"),
+            (NpmrcSource::User, "https://user.example/"),
+            (NpmrcSource::Project, "https://project.example/"),
+        ],
+        "registry entries must be emitted builtin < global < user < project",
+    );
+
+    let mut config = NpmConfig::default();
+    config.apply_tagged(tagged);
+
+    // Last-write-wins → project's default registry is the resolved one.
+    assert_eq!(
+        config.registry, "https://project.example/",
+        "project .npmrc registry wins the full cascade",
+    );
+    // Every scope's scoped-registry override survived (proving all four
+    // files were read, not just the winner).
+    assert_eq!(
+        config.registry_for("@builtin/pkg"),
+        "https://builtin.example/"
+    );
+    assert_eq!(
+        config.registry_for("@global/pkg"),
+        "https://global.example/"
+    );
+    assert_eq!(config.registry_for("@user/pkg"), "https://user.example/");
+    assert_eq!(
+        config.registry_for("@project/pkg"),
+        "https://project.example/"
+    );
+}
+
+/// Trust posture: the global `npmrc` is admin/system-controlled, so it may
+/// set a subprocess-spawning `tokenHelper`; a project `.npmrc` (attacker-
+/// controlled on a hostile clone) may not. Mirrors npm's trust model where
+/// global config ranks at/above user.
+#[test]
+fn global_npmrc_may_set_token_helper_project_may_not() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+    let global_rc = global_dir.path().join("global-npmrc");
+
+    // A bare absolute path passes sanitize_token_helper.
+    std::fs::write(
+        &global_rc,
+        "//registry.example.com/:tokenHelper=/usr/local/bin/get-token\n",
+    )
+    .unwrap();
+    // The project tries to override it with its own helper.
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "//registry.example.com/:tokenHelper=/tmp/evil\n",
+    )
+    .unwrap();
+
+    let globals = GlobalNpmrcPaths {
+        builtin: None,
+        global: Some(global_rc),
+    };
+    let mut config = NpmConfig::default();
+    config.apply_tagged(load_npmrc_entries_tagged_with_globals(
+        Some(home.path()),
+        None,
+        project.path(),
+        None,
+        &globals,
+    ));
+
+    assert_eq!(
+        config.token_helper_for("https://registry.example.com/"),
+        Some("/usr/local/bin/get-token"),
+        "global tokenHelper is trusted; the project's attempt to override is rejected",
+    );
+}
+
+/// `resolve_global_npmrc_paths` derives the global path from
+/// `NPM_CONFIG_PREFIX` (`$PREFIX/etc/npmrc`) and honors an explicit
+/// `NPM_CONFIG_GLOBALCONFIG`. With no prefix and no override, both scopes
+/// are absent — aube does not fabricate a path.
+#[test]
+fn resolve_global_npmrc_paths_follows_npm_rules() {
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    // Prefix → $PREFIX/etc/npmrc, builtin under the npm package.
+    let from_prefix = resolve_global_npmrc_paths(lookup(&[("NPM_CONFIG_PREFIX", "/opt/node")]));
+    assert_eq!(
+        from_prefix.global.as_deref(),
+        Some(Path::new("/opt/node/etc/npmrc")),
+    );
+    assert!(
+        from_prefix
+            .builtin
+            .as_deref()
+            .is_some_and(|p| p.starts_with("/opt/node") && p.ends_with("npmrc")),
+        "builtin path is derived under the npm install prefix",
+    );
+
+    // Explicit GLOBALCONFIG overrides the prefix-derived global path.
+    let explicit = resolve_global_npmrc_paths(lookup(&[
+        ("NPM_CONFIG_PREFIX", "/opt/node"),
+        ("NPM_CONFIG_GLOBALCONFIG", "/etc/corp/npmrc"),
+    ]));
+    assert_eq!(
+        explicit.global.as_deref(),
+        Some(Path::new("/etc/corp/npmrc")),
+    );
+
+    // No prefix, no override → no fabricated paths.
+    let empty = resolve_global_npmrc_paths(lookup(&[]));
+    assert!(empty.global.is_none() && empty.builtin.is_none());
+}
+
+/// End-to-end through the public `NpmConfig` loader: a scoped registry set
+/// ONLY in the global `npmrc` (pointed at by `NPM_CONFIG_GLOBALCONFIG` in
+/// the captured env) is resolved by the registry client. Before global
+/// npmrc was read this scope resolved to the default registry. A scope the
+/// developer's real `~/.npmrc` won't define keeps the assertion robust
+/// against the process `$HOME` that `load_with_env` reads.
+#[test]
+fn npm_config_picks_up_registry_from_global_npmrc_only() {
+    let global_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap(); // empty: no project .npmrc
+    let global_rc = global_dir.path().join("npmrc");
+    std::fs::write(
+        &global_rc,
+        "@globalonly:registry=https://global-only.example/\n",
+    )
+    .unwrap();
+
+    let env = vec![(
+        "NPM_CONFIG_GLOBALCONFIG".to_string(),
+        global_rc.to_string_lossy().into_owned(),
+    )];
+    let config = NpmConfig::load_with_env(project.path(), &env);
+
+    assert_eq!(
+        config.registry_for("@globalonly/pkg"),
+        "https://global-only.example/",
+        "registry-client resolves a scope defined only in the global npmrc",
+    );
+}
+
 #[test]
 fn test_package_scope() {
     assert_eq!(package_scope("@myorg/pkg"), Some("@myorg"));
