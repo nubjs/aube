@@ -78,11 +78,38 @@ pub struct EngineContext {
     /// sources are unaffected.
     pub read_branded_pnpm_config: bool,
 
+    /// Whether aube reads Yarn Berry's `.yarnrc.yml` config surface and
+    /// translates the subset that maps cleanly onto the existing npmrc-shaped
+    /// registry/settings model. `false` (default) preserves upstream aube
+    /// behavior. Embedders such as nub set this only when Yarn is the active
+    /// incumbent; under nub identity or another PM, Yarn-named config is
+    /// another tool's state and must not be read.
+    pub read_yarn_config: bool,
+
+    /// Whether manifest-root map settings owned by an embedder whose
+    /// `manifest_namespace` is empty are read as the tool's native config
+    /// surface. `false` (default) preserves upstream behavior and keeps
+    /// top-level extension keys inert unless a specific cross-tool reader
+    /// owns them. Embedders such as nub set this only under their own project
+    /// identity, so root-native config is not accidentally honored while
+    /// mirroring another package manager.
+    pub read_manifest_root_config: bool,
+
     /// Whether the cwd-default `.pnpmfile` is detected. `true` (default) is
     /// upstream. An embedder under a non-pnpm incumbent sets `false`: a stray
     /// `.pnpmfile` is another tool's resolution-shaping config and is not
     /// honored. Explicit `pnpmfilePath` overrides are unaffected.
     pub pnpmfile_default_enabled: bool,
+
+    /// Additional user-scope `.npmrc`-shaped entries supplied by an embedder.
+    /// Empty by default. These are inserted below the real user `.npmrc`, so a
+    /// developer's own npm config keeps normal precedence.
+    pub synthetic_user_npmrc_entries: Vec<(String, String)>,
+
+    /// Additional project-scope `.npmrc`-shaped entries supplied by an
+    /// embedder. Empty by default. These are inserted below the real project
+    /// `.npmrc`, preserving explicit project npm config precedence.
+    pub synthetic_project_npmrc_entries: Vec<(String, String)>,
 
     /// PATH entries prepended (in order, ahead of the existing PATH) to every
     /// lifecycle spawn. An embedder places a runtime shim dir first so a bare
@@ -120,7 +147,11 @@ impl Default for EngineContext {
             embedder_overrides: None,
             trusted_dependencies_honored: true,
             read_branded_pnpm_config: true,
+            read_yarn_config: false,
+            read_manifest_root_config: false,
             pnpmfile_default_enabled: true,
+            synthetic_user_npmrc_entries: Vec::new(),
+            synthetic_project_npmrc_entries: Vec::new(),
             path_prepends: Vec::new(),
             env_overlay: Vec::new(),
             lifecycle_user_agent_product: None,
@@ -176,7 +207,11 @@ mod tests {
         assert_eq!(ctx.embedder_overrides, None);
         assert!(ctx.trusted_dependencies_honored);
         assert!(ctx.read_branded_pnpm_config);
+        assert!(!ctx.read_yarn_config);
+        assert!(!ctx.read_manifest_root_config);
         assert!(ctx.pnpmfile_default_enabled);
+        assert!(ctx.synthetic_user_npmrc_entries.is_empty());
+        assert!(ctx.synthetic_project_npmrc_entries.is_empty());
         assert!(ctx.path_prepends.is_empty());
         assert!(ctx.env_overlay.is_empty());
         assert_eq!(ctx.lifecycle_user_agent_product, None);

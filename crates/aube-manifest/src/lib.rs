@@ -421,11 +421,14 @@ impl PackageJson {
     }
 
     /// Extract the `pnpm.allowBuilds` / `aube.allowBuilds` object from
-    /// the raw `package.json` payload, if present. Returns a map keyed
-    /// by the raw pattern string (e.g. `"esbuild"`,
-    /// `"@swc/core@1.3.0"`) with `bool` values preserved as `bool` and
-    /// any other shape captured verbatim so the caller can warn about
-    /// it. `aube.*` wins over `pnpm.*` on key conflict.
+    /// the raw `package.json` payload, if present. For embedders whose native
+    /// manifest config lives at root (`manifest_namespace == ""`), the
+    /// top-level `allowBuilds` map is also read when the runtime context says
+    /// that root-native surface is active. Returns a map keyed by the raw
+    /// pattern string (e.g. `"esbuild"`, `"@swc/core@1.3.0"`) with `bool`
+    /// values preserved as `bool` and any other shape captured verbatim so the
+    /// caller can warn about it. The tool's own namespace/root surface wins
+    /// over compatible namespaces on key conflict.
     ///
     /// The key is held in `extra` rather than as a named field because
     /// it's nested under a `pnpm`/`aube` object.
@@ -436,6 +439,15 @@ impl PackageJson {
                 for (k, v) in map {
                     out.insert(k.clone(), AllowBuildRaw::from_json(v));
                 }
+            }
+        }
+        let ctx = aube_util::engine_context();
+        if ctx.read_manifest_root_config
+            && aube_util::embedder().manifest_namespace.is_empty()
+            && let Some(map) = self.extra.get("allowBuilds").and_then(|v| v.as_object())
+        {
+            for (k, v) in map {
+                out.insert(k.clone(), AllowBuildRaw::from_json(v));
             }
         }
         out

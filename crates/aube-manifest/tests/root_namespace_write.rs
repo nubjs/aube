@@ -12,7 +12,7 @@
 //! root and whose read side gates the `pnpm` namespace off — so a nested
 //! `pnpm.*` write would be orphaned.
 
-use aube_manifest::workspace::edit_setting_map;
+use aube_manifest::{AllowBuildRaw, PackageJson, workspace::edit_setting_map};
 use aube_util::Embedder;
 
 static ROOT_TOOL: Embedder = Embedder {
@@ -93,4 +93,66 @@ fn root_embedder_writes_map_settings_at_manifest_root() {
         obj.get("pnpm").and_then(|p| p.get("allowBuilds")).is_none(),
         "must never nest the setting under the pnpm namespace, got: {obj:#?}"
     );
+}
+
+#[test]
+fn root_embedder_reads_root_allow_builds_only_when_root_surface_is_active() {
+    aube_util::set_embedder(&ROOT_TOOL);
+
+    let manifest = PackageJson::parse(
+        std::path::Path::new("package.json"),
+        r#"{
+            "name": "x",
+            "allowBuilds": {
+                "esbuild": true,
+                "sharp": false
+            },
+            "pnpm": {
+                "allowBuilds": {
+                    "left-pad": true
+                }
+            }
+        }"#
+        .to_string(),
+    )
+    .unwrap();
+
+    // A non-pnpm incumbent under a manifest-root embedder gates both pnpm and
+    // root-native config off. This preserves compat projects where root
+    // `allowBuilds` is not the active package manager's surface.
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_branded_pnpm_config = false;
+        ctx.read_manifest_root_config = false;
+    });
+    assert!(manifest.pnpm_allow_builds().is_empty());
+
+    // Pnpm/fresh mode reads only pnpm-branded config, not the manifest-root
+    // setting that belongs to the root embedder identity.
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_branded_pnpm_config = true;
+        ctx.read_manifest_root_config = false;
+    });
+    let pnpm = manifest.pnpm_allow_builds();
+    assert!(matches!(
+        pnpm.get("left-pad"),
+        Some(AllowBuildRaw::Bool(true))
+    ));
+    assert!(!pnpm.contains_key("esbuild"));
+
+    // NubIdentity-style mode gates pnpm off and reads root `allowBuilds` as the
+    // native config surface produced by `pm use nub`.
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_branded_pnpm_config = false;
+        ctx.read_manifest_root_config = true;
+    });
+    let root = manifest.pnpm_allow_builds();
+    assert!(matches!(
+        root.get("esbuild"),
+        Some(AllowBuildRaw::Bool(true))
+    ));
+    assert!(matches!(
+        root.get("sharp"),
+        Some(AllowBuildRaw::Bool(false))
+    ));
+    assert!(!root.contains_key("left-pad"));
 }
