@@ -86,6 +86,23 @@ pub struct EngineContext {
     /// another tool's state and must not be read.
     pub read_yarn_config: bool,
 
+    /// Whether the incumbent Yarn is *classic* (v1), gating the classic
+    /// `.yarnrc` reader. `false` (default) preserves upstream behavior. Only
+    /// meaningful when [`read_yarn_config`](Self::read_yarn_config) is `true`:
+    ///
+    /// - Classic Yarn (v1) reads `.yarnrc`; Yarn Berry (v2+) abandoned it and
+    ///   reads only `.yarnrc.yml`. A Berry project can carry a stray legacy
+    ///   `.yarnrc` that Berry itself ignores, so reading it under a Berry
+    ///   incumbent silently diverges from Yarn (wrong registry/auth).
+    /// - The Berry `.yarnrc.yml` surface is gated by `read_yarn_config` alone
+    ///   and is unaffected by this flag; only the classic `.yarnrc` path
+    ///   additionally requires `yarn_is_classic`.
+    ///
+    /// Embedders set this `true` only when the active Yarn is provably classic
+    /// (v1). The embedder owns the classic-vs-Berry classification — aube
+    /// assigns no policy.
+    pub yarn_is_classic: bool,
+
     /// Whether manifest-root map settings owned by an embedder whose
     /// `manifest_namespace` is empty are read as the tool's native config
     /// surface. `false` (default) preserves upstream behavior and keeps
@@ -148,6 +165,7 @@ impl Default for EngineContext {
             trusted_dependencies_honored: true,
             read_branded_pnpm_config: true,
             read_yarn_config: false,
+            yarn_is_classic: false,
             read_manifest_root_config: false,
             pnpmfile_default_enabled: true,
             synthetic_user_npmrc_entries: Vec::new(),
@@ -208,6 +226,7 @@ mod tests {
         assert!(ctx.trusted_dependencies_honored);
         assert!(ctx.read_branded_pnpm_config);
         assert!(!ctx.read_yarn_config);
+        assert!(!ctx.yarn_is_classic);
         assert!(!ctx.read_manifest_root_config);
         assert!(ctx.pnpmfile_default_enabled);
         assert!(ctx.synthetic_user_npmrc_entries.is_empty());

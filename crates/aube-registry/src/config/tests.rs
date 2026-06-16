@@ -429,7 +429,7 @@ network-timeout 60000
 }
 
 #[test]
-fn classic_yarnrc_load_is_incumbent_gated() {
+fn classic_yarnrc_load_is_incumbent_and_classic_gated() {
     let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -438,13 +438,34 @@ fn classic_yarnrc_load_is_incumbent_gated() {
     )
     .unwrap();
 
-    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    // No Yarn incumbent → not read.
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_yarn_config = false;
+        ctx.yarn_is_classic = false;
+    });
     let disabled = NpmConfig::load_with_env(project.path(), &[]);
     assert_eq!(disabled.registry, "https://registry.npmjs.org/");
 
-    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    // Yarn incumbent but BERRY (classic gate off) → `.yarnrc` is NOT read. A
+    // Berry project's stray legacy `.yarnrc` must not leak into config, since
+    // Berry itself ignores it. This is the gating-bug regression guard.
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_yarn_config = true;
+        ctx.yarn_is_classic = false;
+    });
+    let berry = NpmConfig::load_with_env(project.path(), &[]);
+    assert_eq!(berry.registry, "https://registry.npmjs.org/");
+
+    // Classic (v1) Yarn incumbent → `.yarnrc` IS read.
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_yarn_config = true;
+        ctx.yarn_is_classic = true;
+    });
     let enabled = NpmConfig::load_with_env(project.path(), &[]);
-    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_yarn_config = false;
+        ctx.yarn_is_classic = false;
+    });
     assert_eq!(enabled.registry, "https://classic-yarn.example/");
 }
 
@@ -465,9 +486,15 @@ fn classic_yarnrc_nearest_file_wins_along_ancestor_walk() {
     )
     .unwrap();
 
-    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_yarn_config = true;
+        ctx.yarn_is_classic = true;
+    });
     let cfg = NpmConfig::load_with_env(&child, &[]);
-    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_yarn_config = false;
+        ctx.yarn_is_classic = false;
+    });
     assert_eq!(cfg.registry, "https://child.example/");
 }
 

@@ -25,10 +25,10 @@ pub(super) fn load_yarnrc_entries_split_with_home(
     home: Option<&Path>,
     starting_dir: &Path,
 ) -> SplitYarnrcEntries {
-    let mut out = SplitYarnrcEntries::default();
-    out.user = load_user_yarnrc_entries_with_home(home);
-    out.project = load_project_yarnrc_entries_with_home(home, starting_dir);
-    out
+    SplitYarnrcEntries {
+        user: load_user_yarnrc_entries_with_home(home),
+        project: load_project_yarnrc_entries_with_home(home, starting_dir),
+    }
 }
 
 pub(super) fn load_user_yarnrc_entries(home: Option<&Path>) -> Vec<(String, String)> {
@@ -63,7 +63,7 @@ fn load_project_yarnrc_entries_with_home(
 ) -> Vec<(String, String)> {
     let per_file: Vec<Vec<(String, String)>> = yarnrc_paths_from_root(starting_dir, ".yarnrc.yml")
         .into_iter()
-        .filter(|path| !home.is_some_and(|home| path == &home.join(".yarnrc.yml")))
+        .filter(|path| home.is_none_or(|home| path != &home.join(".yarnrc.yml")))
         .map(|path| load_yarnrc_entries_from_path(&path))
         .collect();
     let mut out = merge_project_yarnrc_entries(per_file);
@@ -174,6 +174,16 @@ pub(super) fn translate_yarnrc_content(content: &str) -> Vec<(String, String)> {
 }
 
 fn load_classic_yarnrc_entries_from_path(path: &Path) -> Vec<(String, String)> {
+    // Classic `.yarnrc` is read ONLY under a classic-Yarn (v1) incumbent. Yarn
+    // Berry (v2+) abandoned `.yarnrc` for `.yarnrc.yml`, so a stray legacy
+    // `.yarnrc` beside a Berry project is one Berry itself ignores — reading it
+    // would silently diverge from Yarn (wrong registry/auth). The embedder sets
+    // `yarn_is_classic` only when the active Yarn is provably v1; the Berry
+    // `.yarnrc.yml` path above is gated by `read_yarn_config` alone and is
+    // unaffected. Default (`false`) leaves standalone aube unchanged.
+    if !aube_util::engine_context().yarn_is_classic {
+        return Vec::new();
+    }
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -344,8 +354,8 @@ impl YarnRc {
             .map(normalize_registry_url);
         let registry_configs = self
             .npm_registries
-            .iter()
-            .map(|(registry, _)| normalize_registry_url(registry))
+            .keys()
+            .map(|registry| normalize_registry_url(registry))
             .collect::<BTreeSet<_>>();
         let scope_registry_counts = scope_registry_counts(&self.npm_scopes);
 
