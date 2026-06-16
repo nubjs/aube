@@ -56,11 +56,55 @@ fn load_project_yarnrc_entries_with_home(
     home: Option<&Path>,
     starting_dir: &Path,
 ) -> Vec<(String, String)> {
-    yarnrc_paths_from_root(starting_dir)
+    let per_file: Vec<Vec<(String, String)>> = yarnrc_paths_from_root(starting_dir)
         .into_iter()
         .filter(|path| !home.is_some_and(|home| path == &home.join(".yarnrc.yml")))
-        .flat_map(|path| load_yarnrc_entries_from_path(&path))
-        .collect()
+        .map(|path| load_yarnrc_entries_from_path(&path))
+        .collect();
+    merge_project_yarnrc_entries(per_file)
+}
+
+/// Combine the per-file entry lists from the ancestor `.yarnrc.yml` walk
+/// (root→child order) into the single concatenated list the settings layer
+/// reads.
+///
+/// Scalar settings (registry/auth/nodeLinker) stay concatenated in order so the
+/// settings reader's last-one-wins (`entries.iter().rev()`) keeps the nearest
+/// file winning. `packageExtensions` is the exception: it is a map-typed
+/// setting, and the settings reader is single-file last-wins, so emitting one
+/// entry per file would silently drop every ancestor file's selectors. Yarn
+/// instead shallow-merges map settings across all rc files
+/// (`Object.assign({}, ...allFiles)` in `configUtils.resolveRcFiles`), so we
+/// merge every file's `packageExtensions` object into ONE entry — root→child
+/// order so a child file's value wins on a duplicate selector key, while
+/// selectors unique to an ancestor file survive — and emit it once.
+fn merge_project_yarnrc_entries(per_file: Vec<Vec<(String, String)>>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut merged_package_extensions: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut saw_package_extensions = false;
+
+    for entries in per_file {
+        for (key, value) in entries {
+            if key == "packageExtensions" {
+                if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(&value) {
+                    saw_package_extensions = true;
+                    // Later (child) files win on a duplicate selector key; the
+                    // BTreeMap insert overwrites, matching Yarn's shallow merge.
+                    merged_package_extensions.extend(obj);
+                }
+            } else {
+                out.push((key, value));
+            }
+        }
+    }
+
+    if saw_package_extensions
+        && let Some(json) = package_extensions_json(&merged_package_extensions)
+    {
+        push(&mut out, "packageExtensions", json);
+    }
+
+    out
 }
 
 pub(super) fn yarn_env_entries_from(env: &[(String, String)]) -> Vec<(String, String)> {

@@ -258,6 +258,76 @@ fn yarnrc_walks_ancestor_rc_files_with_nearest_file_winning() {
 }
 
 #[test]
+fn yarnrc_merges_package_extensions_across_ancestor_rc_files_child_wins() {
+    // Map-typed `packageExtensions` is shallow-merged across every rc file in
+    // the ancestor walk, not last-file-wins (which is correct only for scalar
+    // settings like registry/linker). Selectors unique to the root file must
+    // survive alongside the child's, and a selector set in BOTH must resolve to
+    // the child (nearest) file's value.
+    let root = tempfile::tempdir().unwrap();
+    let child = root.path().join("packages/app");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(
+        root.path().join(".yarnrc.yml"),
+        r#"
+packageExtensions:
+  "root-only@*":
+    dependencies:
+      left-pad: "^1.0.0"
+  "shared@*":
+    dependencies:
+      from-root: "^1.0.0"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        child.join(".yarnrc.yml"),
+        r#"
+packageExtensions:
+  "child-only@*":
+    dependencies:
+      right-pad: "^2.0.0"
+  "shared@*":
+    dependencies:
+      from-child: "^2.0.0"
+"#,
+    )
+    .unwrap();
+
+    let split = load_yarnrc_entries_split_with_home(None, &child);
+
+    // A single merged entry — not one per file.
+    let pkg_ext_entries: Vec<_> = split
+        .project
+        .iter()
+        .filter(|(k, _)| k == "packageExtensions")
+        .collect();
+    assert_eq!(
+        pkg_ext_entries.len(),
+        1,
+        "ancestor packageExtensions must collapse into a single merged entry"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&pkg_ext_entries[0].1).unwrap();
+
+    // Both files' unique selectors survive the merge.
+    assert_eq!(
+        parsed["root-only@*"]["dependencies"]["left-pad"],
+        serde_json::json!("^1.0.0")
+    );
+    assert_eq!(
+        parsed["child-only@*"]["dependencies"]["right-pad"],
+        serde_json::json!("^2.0.0")
+    );
+    // The overlapping selector resolves to the nearest (child) file's value.
+    assert_eq!(
+        parsed["shared@*"]["dependencies"],
+        serde_json::json!({ "from-child": "^2.0.0" }),
+        "child file must win on a duplicate selector key"
+    );
+}
+
+#[test]
 fn yarnrc_load_is_incumbent_gated_for_registry_config() {
     let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();
