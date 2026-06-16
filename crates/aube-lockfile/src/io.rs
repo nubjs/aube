@@ -207,7 +207,11 @@ fn lockfile_write_is_noop(
             .cloned()
     };
     crate::graph_hash::graph_identity_hash_with_patches(graph, &no_build, &graph_patch)
-        == crate::graph_hash::graph_identity_hash_with_patches(&existing, &no_build, &existing_patch)
+        == crate::graph_hash::graph_identity_hash_with_patches(
+            &existing,
+            &no_build,
+            &existing_patch,
+        )
 }
 
 /// Return the [`LockfileKind`] of the lockfile already on disk in

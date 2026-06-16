@@ -573,8 +573,7 @@ mod tests {
         let child_dep_path = "node-gyp-build-optional-packages@5.2.0";
 
         // Parent on disk (must exist or `link_dep_bins` skips it).
-        let parent_dir =
-            materialized_pkg_dir(aube_dir, parent_dep_path, "lmdb", 120, None);
+        let parent_dir = materialized_pkg_dir(aube_dir, parent_dep_path, "lmdb", 120, None);
         std::fs::create_dir_all(&parent_dir).unwrap();
         std::fs::write(
             parent_dir.join("package.json"),
@@ -599,9 +598,10 @@ mod tests {
         std::fs::write(child_dir.join("bin/build.js"), "#!/usr/bin/env node\n").unwrap();
 
         let mut parent = locked("lmdb", "3.0.0", BTreeMap::new());
-        parent
-            .dependencies
-            .insert("node-gyp-build-optional-packages".to_string(), "5.2.0".to_string());
+        parent.dependencies.insert(
+            "node-gyp-build-optional-packages".to_string(),
+            "5.2.0".to_string(),
+        );
 
         let mut packages = BTreeMap::new();
         packages.insert(parent_dep_path.to_string(), parent);
@@ -677,7 +677,13 @@ mod tests {
         let aube_dir2 = dir2.path().join("node_modules/.aube");
         let (graph2, expected_shim2) = fixture_parent_with_bin_bearing_child(&aube_dir2);
         maybe_link_dep_bins(
-            false, false, false, &aube_dir2, &graph2, 120, None,
+            false,
+            false,
+            false,
+            &aube_dir2,
+            &graph2,
+            120,
+            None,
             aube_linker::BinShimOptions::default(),
             &mut PkgJsonCache::new(),
         )

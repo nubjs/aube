@@ -208,7 +208,9 @@ pub(crate) fn primer_within_ttl() -> bool {
 /// never silently disables a primer whose age can't be computed.
 fn within_ttl(ttl: Option<Duration>, generated_at: Option<u64>, now: u64) -> bool {
     let Some(ttl) = ttl else { return true };
-    let Some(built) = generated_at else { return true };
+    let Some(built) = generated_at else {
+        return true;
+    };
     now.saturating_sub(built) < ttl.as_secs()
 }
 

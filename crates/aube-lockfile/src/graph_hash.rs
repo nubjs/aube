@@ -643,8 +643,14 @@ mod tests {
 
     #[test]
     fn graph_identity_hash_equal_for_identical_graphs() {
-        let g1 = graph_with_importer(&[mk_pkg("foo", "1.0.0", Some("sha512-A"))], &[("foo", "foo@1.0.0")]);
-        let g2 = graph_with_importer(&[mk_pkg("foo", "1.0.0", Some("sha512-A"))], &[("foo", "foo@1.0.0")]);
+        let g1 = graph_with_importer(
+            &[mk_pkg("foo", "1.0.0", Some("sha512-A"))],
+            &[("foo", "foo@1.0.0")],
+        );
+        let g2 = graph_with_importer(
+            &[mk_pkg("foo", "1.0.0", Some("sha512-A"))],
+            &[("foo", "foo@1.0.0")],
+        );
         assert_eq!(
             graph_identity_hash(&g1, &|_| false),
             graph_identity_hash(&g2, &|_| false)
@@ -653,8 +659,14 @@ mod tests {
 
     #[test]
     fn graph_identity_hash_differs_when_a_package_changes() {
-        let g1 = graph_with_importer(&[mk_pkg("foo", "1.0.0", Some("sha512-A"))], &[("foo", "foo@1.0.0")]);
-        let g2 = graph_with_importer(&[mk_pkg("foo", "1.0.0", Some("sha512-B"))], &[("foo", "foo@1.0.0")]);
+        let g1 = graph_with_importer(
+            &[mk_pkg("foo", "1.0.0", Some("sha512-A"))],
+            &[("foo", "foo@1.0.0")],
+        );
+        let g2 = graph_with_importer(
+            &[mk_pkg("foo", "1.0.0", Some("sha512-B"))],
+            &[("foo", "foo@1.0.0")],
+        );
         assert_ne!(
             graph_identity_hash(&g1, &|_| false),
             graph_identity_hash(&g2, &|_| false)
