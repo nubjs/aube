@@ -131,6 +131,19 @@ pub(super) fn yarn_env_entries_from(env: &[(String, String)]) -> Vec<(String, St
             Some("npmAuthToken") => config.npm_auth_token = Some(value.clone()),
             Some("npmAuthIdent") => config.npm_auth_ident = Some(value.clone()),
             Some("nodeLinker") => config.node_linker = Some(value.clone()),
+            // Yarn Berry resolves env vars with `camelcase(name)` to a flat
+            // top-level setting key (`getEnvironmentSettings`), so only the
+            // top-level network/TLS settings have a well-defined env spelling.
+            // The map-shaped settings (`npmScopes`, `npmRegistries`,
+            // `networkSettings`) are NOT reachable via env in Yarn itself —
+            // there is no `YARN_<SCREAMING>` form that targets a map entry — so
+            // there is nothing to translate for those.
+            Some("httpsCaFilePath") => config.https_ca_file_path = Some(value.clone()),
+            Some("httpProxy") => config.http_proxy = Some(value.clone()),
+            Some("httpsProxy") => config.https_proxy = Some(value.clone()),
+            Some("enableStrictSsl") => {
+                config.enable_strict_ssl = aube_settings::parse_bool(value);
+            }
             _ => {}
         }
     }
@@ -312,10 +325,26 @@ struct YarnRc {
     npm_auth_token: Option<String>,
     npm_auth_ident: Option<String>,
     node_linker: Option<String>,
+    // Top-level network/TLS settings. Yarn Berry expresses the CA bundle
+    // as a *file path* (`httpsCaFilePath`) and the proxies as plain URLs
+    // (`httpProxy` / `httpsProxy`), which map 1:1 onto the npmrc-shaped
+    // `cafile` / `http-proxy` / `https-proxy` settings the registry client
+    // already consumes. `enableStrictSsl` maps onto `strict-ssl`.
+    https_ca_file_path: Option<String>,
+    http_proxy: Option<String>,
+    https_proxy: Option<String>,
+    enable_strict_ssl: Option<bool>,
     #[serde(default)]
     npm_scopes: BTreeMap<String, YarnScope>,
     #[serde(default)]
     npm_registries: BTreeMap<String, YarnRegistry>,
+    // Per-hostname network settings (`networkSettings.<host>.*`). Only the
+    // CA bundle path is representable in nub's per-registry config model
+    // (`//host/:cafile`); per-host proxy/TLS-key entries have no equivalent
+    // (nub's proxy is process-wide) and glob host keys can't map onto the
+    // exact-prefix auth model, so both are skipped — see `into_entries`.
+    #[serde(default)]
+    network_settings: BTreeMap<String, YarnNetworkSettings>,
     // Yarn Berry's `packageExtensions:` — a map of `pkg@range` selectors to
     // `{ dependencies, peerDependencies, peerDependenciesMeta }` shapes. The
     // value is captured verbatim (the YAML deserializer maps it straight into
@@ -343,6 +372,12 @@ struct YarnScope {
 struct YarnRegistry {
     npm_auth_token: Option<String>,
     npm_auth_ident: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct YarnNetworkSettings {
+    https_ca_file_path: Option<String>,
 }
 
 impl YarnRc {
@@ -425,6 +460,53 @@ impl YarnRc {
             }
         }
 
+        // Top-level network/TLS settings → npmrc-shaped keys. These flow
+        // through the same `apply_tagged` consumer the `.npmrc` path uses, so
+        // they inherit the existing trust gate: a *project* `.yarnrc.yml`
+        // setting a proxy / disabling strict-ssl is rejected with a warning
+        // (untrusted source), while a user-level `~/.yarnrc.yml` is honored —
+        // identical to how a project vs user `.npmrc` is treated.
+        if let Some(cafile) = self.https_ca_file_path.as_deref() {
+            push(&mut out, "cafile", cafile);
+        }
+        if let Some(proxy) = self.http_proxy.as_deref() {
+            push(&mut out, "http-proxy", proxy);
+        }
+        if let Some(proxy) = self.https_proxy.as_deref() {
+            push(&mut out, "https-proxy", proxy);
+        }
+        if let Some(strict) = self.enable_strict_ssl {
+            // The npmrc consumer parses the value with `parse_bool`; emit the
+            // canonical lowercase spelling.
+            push(
+                &mut out,
+                "strict-ssl",
+                if strict { "true" } else { "false" },
+            );
+        }
+
+        // Per-host `networkSettings.<host>.httpsCaFilePath` → the per-registry
+        // `//host/:cafile` form. Only literal (glob-free) host keys are
+        // translated: nub's per-registry config is keyed by an exact `//host/`
+        // prefix, so a Yarn glob pattern (`*.example.com`) has no faithful
+        // mapping and is skipped rather than silently mis-scoped. Per-host
+        // proxy / TLS-key/cert entries are likewise skipped (no representable
+        // target). The host key becomes the URI-scoped `//<host>/:cafile`
+        // entry the `.npmrc` consumer already understands.
+        for (host, settings) in &self.network_settings {
+            let Some(cafile) = settings.https_ca_file_path.as_deref() else {
+                continue;
+            };
+            if host_is_glob(host) {
+                continue;
+            }
+            push(
+                &mut out,
+                format!("//{}/:cafile", host.trim_matches('/')),
+                cafile,
+            );
+        }
+
         if !self.package_extensions.is_empty()
             && let Some(json) = package_extensions_json(&self.package_extensions)
         {
@@ -433,6 +515,14 @@ impl YarnRc {
 
         out
     }
+}
+
+/// True when a Yarn `networkSettings` host key contains a glob
+/// metacharacter. nub's per-registry config matches on an exact `//host/`
+/// prefix, so a glob pattern can't be translated without silently
+/// widening or narrowing the entry — those are skipped instead.
+fn host_is_glob(host: &str) -> bool {
+    host.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!', '+', '@'])
 }
 
 /// Serialize a parsed Yarn `packageExtensions:` map to a JSON object string
@@ -507,6 +597,10 @@ fn yarn_env_key(key: &str) -> Option<String> {
         "npm_auth_token" => Some("npmAuthToken".to_string()),
         "npm_auth_ident" => Some("npmAuthIdent".to_string()),
         "node_linker" => Some("nodeLinker".to_string()),
+        "https_ca_file_path" => Some("httpsCaFilePath".to_string()),
+        "http_proxy" => Some("httpProxy".to_string()),
+        "https_proxy" => Some("httpsProxy".to_string()),
+        "enable_strict_ssl" => Some("enableStrictSsl".to_string()),
         _ => None,
     }
 }

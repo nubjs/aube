@@ -607,7 +607,7 @@ fn load_project_npmrc_entries_tagged(
     out
 }
 
-fn merge_yarnrc_tagged_entries(
+pub(super) fn merge_yarnrc_tagged_entries(
     tagged: Vec<(NpmrcSource, String, String)>,
     home: Option<&Path>,
     project_dir: &Path,
