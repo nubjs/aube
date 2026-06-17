@@ -1,5 +1,72 @@
-use crate::{GitSource, LocalSource, LockedPackage};
+use crate::{GitSource, HostedGit, HostedGitHost, LocalSource, LockedPackage, RemoteTarballSource};
 use std::path::PathBuf;
+
+/// True when a package's local source is a git dependency in *either*
+/// representation: a plain git-clone source (`LocalSource::Git`) or a
+/// host-served codeload archive (`RemoteTarball { git_hosted: true }`).
+/// Upstream #857 reclassified github/gitlab/bitbucket-shorthand git
+/// deps to the codeload-tarball form, so the npm writer's git
+/// special-casing must recognize both — a plain (non-git) remote
+/// tarball stays excluded.
+pub(crate) fn is_git_local_source(src: Option<&LocalSource>) -> bool {
+    matches!(
+        src,
+        Some(LocalSource::Git(_))
+            | Some(LocalSource::RemoteTarball(RemoteTarballSource {
+                git_hosted: true,
+                ..
+            }))
+    )
+}
+
+/// Recover `(HostedGit, sha)` from a codeload-style archive URL that a
+/// hosted git dep resolves to — the inverse of [`HostedGit::tarball_url`].
+/// Returns `None` for any URL that isn't a recognized host archive
+/// pinned to a 40-char commit SHA, so non-git remote tarballs and
+/// unpinned archives fall through untouched.
+fn hosted_git_from_codeload(url: &str) -> Option<(HostedGit, String)> {
+    let valid_sha = |s: &str| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit());
+    let hosted = |host, owner: &str, repo: &str, sha: &str| {
+        valid_sha(sha).then(|| {
+            (
+                HostedGit {
+                    host,
+                    owner: owner.to_string(),
+                    repo: repo.to_string(),
+                },
+                sha.to_ascii_lowercase(),
+            )
+        })
+    };
+
+    // GitHub: https://codeload.github.com/<owner>/<repo>/tar.gz/<sha>
+    if let Some(rest) = url.strip_prefix("https://codeload.github.com/") {
+        return match rest.split('/').collect::<Vec<_>>().as_slice() {
+            [owner, repo, "tar.gz", sha] => hosted(HostedGitHost::GitHub, owner, repo, sha),
+            _ => None,
+        };
+    }
+
+    // GitLab: https://gitlab.com/<owner>/<repo>/-/archive/<sha>/<repo>-<sha>.tar.gz
+    if let Some(rest) = url.strip_prefix("https://gitlab.com/")
+        && let Some((before, after)) = rest.split_once("/-/archive/")
+        && let Some((owner, repo)) = before.split_once('/')
+        && let Some((sha, _)) = after.split_once('/')
+    {
+        return hosted(HostedGitHost::GitLab, owner, repo, sha);
+    }
+
+    // Bitbucket: https://bitbucket.org/<owner>/<repo>/get/<sha>.tar.gz
+    if let Some(rest) = url.strip_prefix("https://bitbucket.org/")
+        && let Some((before, tail)) = rest.split_once("/get/")
+        && let Some((owner, repo)) = before.split_once('/')
+        && let Some(sha) = tail.strip_suffix(".tar.gz")
+    {
+        return hosted(HostedGitHost::Bitbucket, owner, repo, sha);
+    }
+
+    None
+}
 
 pub(super) fn local_git_source_from_resolved(resolved: &str) -> Option<LocalSource> {
     let (url, committish, subpath) = crate::parse_git_spec(resolved)?;
@@ -37,6 +104,21 @@ pub(super) fn local_file_source_from_resolved(resolved: &str) -> Option<LocalSou
 }
 
 pub(super) fn npm_resolved_field(pkg: &LockedPackage) -> Option<String> {
+    // A host-served git dep (#857) resolves through a codeload archive,
+    // so `tarball_url` holds that codeload URL — but npm's canonical
+    // `resolved` for a hosted git dep is the provider sshurl, NOT the
+    // archive URL. Emit the canonical git form here (and ahead of the
+    // `tarball_url` fallback) so `npm ci` accepts the line and a
+    // follow-up `npm install` doesn't churn it.
+    if let Some(LocalSource::RemoteTarball(RemoteTarballSource {
+        url,
+        git_hosted: true,
+        ..
+    })) = &pkg.local_source
+        && let Some((hosted, sha)) = hosted_git_from_codeload(url)
+    {
+        return Some(format!("git+{}#{sha}", hosted.ssh_url()));
+    }
     pkg.tarball_url.clone().or_else(|| match &pkg.local_source {
         Some(LocalSource::Git(git)) => {
             // npm canonicalizes hosted git deps to the provider's

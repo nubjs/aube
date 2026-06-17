@@ -215,7 +215,7 @@ pub fn write(
     for pkg in graph
         .packages
         .values()
-        .filter(|pkg| matches!(pkg.local_source, Some(LocalSource::Git(_))))
+        .filter(|pkg| super::source::is_git_local_source(pkg.local_source.as_ref()))
     {
         canonical
             .entry(super::canonical_key_from_dep_path(&pkg.dep_path))

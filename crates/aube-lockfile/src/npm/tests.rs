@@ -344,6 +344,127 @@ fn test_write_canonicalizes_hosted_git_resolved_to_sshurl() {
     );
 }
 
+// Upstream #857 reclassified github/gitlab/bitbucket-shorthand git deps
+// to resolve via a codeload archive — `LocalSource::RemoteTarball { url:
+// "https://codeload.github.com/<o>/<r>/tar.gz/<sha>", git_hosted: true }`
+// rather than `LocalSource::Git`. The npm writer must still (a) PLACE the
+// dep in the lockfile (the bug: it was dropped, so `npm ci` rejected the
+// lock with `Missing: ms from lock file`) and (b) emit npm's canonical
+// `git+ssh://…#<sha>` resolved field, NOT the codeload archive URL.
+#[test]
+fn test_write_places_git_hosted_codeload_dep_with_sshurl_resolved() {
+    let sha = "1c6264b795492e8fdecbc82cb8802fcfbfc08d26";
+    let codeload = format!("https://codeload.github.com/vercel/ms/tar.gz/{sha}");
+    let local = LocalSource::RemoteTarball(crate::RemoteTarballSource {
+        url: codeload.clone(),
+        integrity: "sha512-deadbeef".to_string(),
+        git_hosted: true,
+    });
+    let dep_path = local.dep_path("ms");
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        dep_path.clone(),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            dep_path: dep_path.clone(),
+            tarball_url: Some(codeload),
+            local_source: Some(local),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "ms".to_string(),
+            dep_path,
+            dep_type: DepType::Production,
+            specifier: Some("github:vercel/ms#2.1.3".to_string()),
+        }],
+    );
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("test".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [("ms".to_string(), "github:vercel/ms#2.1.3".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let body = std::fs::read_to_string(out.path()).unwrap();
+
+    assert!(
+        body.contains("\"node_modules/ms\""),
+        "git-hosted codeload dep must be placed in the lockfile; got:\n{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "\"resolved\": \"git+ssh://git@github.com/vercel/ms.git#{sha}\""
+        )),
+        "git-hosted codeload dep must emit npm's canonical sshurl, not the codeload URL; got:\n{body}"
+    );
+    assert!(
+        !body.contains("codeload.github.com"),
+        "the codeload archive URL must NOT leak into the npm resolved field; got:\n{body}"
+    );
+}
+
+// `npm_resolved_field` inverts each provider's codeload archive form back
+// to the canonical sshurl. A plain (non-git) remote tarball, and a
+// git-hosted URL whose shape isn't a recognized pinned archive, must NOT
+// be turned into a git resolved field — they fall through to the
+// `tarball_url`/None paths unchanged.
+#[test]
+fn test_npm_resolved_field_inverts_codeload_per_host() {
+    let sha = "1c6264b795492e8fdecbc82cb8802fcfbfc08d26";
+    let field = |url: &str, git_hosted: bool| {
+        let local = LocalSource::RemoteTarball(crate::RemoteTarballSource {
+            url: url.to_string(),
+            integrity: String::new(),
+            git_hosted,
+        });
+        let pkg = LockedPackage {
+            name: "pkg".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: local.dep_path("pkg"),
+            tarball_url: Some(url.to_string()),
+            local_source: Some(local),
+            ..Default::default()
+        };
+        super::source::npm_resolved_field(&pkg)
+    };
+
+    assert_eq!(
+        field(
+            &format!("https://codeload.github.com/vercel/ms/tar.gz/{sha}"),
+            true
+        )
+        .as_deref(),
+        Some(format!("git+ssh://git@github.com/vercel/ms.git#{sha}").as_str())
+    );
+    assert_eq!(
+        field(
+            &format!("https://gitlab.com/o/r/-/archive/{sha}/r-{sha}.tar.gz"),
+            true
+        )
+        .as_deref(),
+        Some(format!("git+ssh://git@gitlab.com/o/r.git#{sha}").as_str())
+    );
+    assert_eq!(
+        field(&format!("https://bitbucket.org/o/r/get/{sha}.tar.gz"), true).as_deref(),
+        Some(format!("git+ssh://git@bitbucket.org/o/r.git#{sha}").as_str())
+    );
+
+    // Non-git remote tarball: keep its tarball URL, never a git form.
+    let plain = "https://registry.example.com/pkg/-/pkg-1.0.0.tgz";
+    assert_eq!(field(plain, false).as_deref(), Some(plain));
+    // git_hosted but unrecognized/unpinned shape: fall through, no git form.
+    let weird = "https://codeload.github.com/o/r/zip/main";
+    assert_eq!(field(weird, true).as_deref(), Some(weird));
+}
+
 /// A `file:` directory dep must serialize as npm's two-entry pair: a
 /// `<path>: { name, version }` package record keyed by the on-disk
 /// path, plus a `node_modules/<name>: { resolved: "<path>", link: true }`
