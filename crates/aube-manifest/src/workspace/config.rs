@@ -447,6 +447,15 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub save_workspace_protocol: Option<yaml_serde::Value>,
 
+    /// Version prefix written to `package.json` when `aube add` records a
+    /// dep (`""` exact, `"~"`, or `"^"`). pnpm reads a top-level
+    /// `savePrefix` from `pnpm-workspace.yaml`; declared here so the
+    /// setting resolver can read it as a workspace-yaml source (the
+    /// resolver validates the value, so the typed field is a plain
+    /// `String`).
+    #[serde(default)]
+    pub save_prefix: Option<String>,
+
     // -- Peer Dependency Settings --
     /// Whether to auto-install peer dependencies (default: true).
     #[serde(default)]

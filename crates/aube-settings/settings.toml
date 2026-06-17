@@ -2444,6 +2444,7 @@ docs = "Resolved from `.npmrc`. `--save-exact` overrides to empty prefix."
 sources.cli = []
 sources.env = ["npm_config_save_prefix", "NPM_CONFIG_SAVE_PREFIX", "AUBE_SAVE_PREFIX"]
 sources.npmrc = ["save-prefix", "savePrefix"]
+sources.workspaceYaml = ["savePrefix"]
 examples = []
 
 [linkWorkspacePackages]

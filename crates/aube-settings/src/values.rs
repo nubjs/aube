@@ -903,6 +903,19 @@ mod tests {
     }
 
     #[test]
+    fn workspace_yaml_resolves_save_prefix() {
+        // pnpm reads a top-level `savePrefix` from pnpm-workspace.yaml and
+        // applies it when writing added deps (`add is-odd` → `~3.0.1`). The
+        // `savePrefix` setting declares `sources.workspaceYaml = ["savePrefix"]`
+        // so the resolver honors it as a YAML source (above `.npmrc`).
+        let m = raw_yaml("savePrefix: \"~\"\npackages: []\n");
+        assert_eq!(
+            string_from_workspace_yaml("savePrefix", &m),
+            Some("~".to_string())
+        );
+    }
+
+    #[test]
     fn workspace_yaml_resolves_nested_string_list_field() {
         let m = raw_yaml("updateConfig:\n  ignoreDependencies:\n    - is-odd\n    - is-even\n");
         assert_eq!(
