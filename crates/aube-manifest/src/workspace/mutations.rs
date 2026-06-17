@@ -6,16 +6,32 @@
 //! the workspace yaml keeps its comments + structure when aube
 //! mutates these maps.
 
-use super::config::{ConfigWriteTarget, config_write_target};
+use super::config::{ConfigWriteTarget, config_write_target, workspace_yaml_target};
 use super::edits::{edit_setting_map, edit_workspace_yaml, workspace_yaml_submap};
 use std::path::{Path, PathBuf};
 
 /// Force-write `names` in the project's `allowBuilds` map. Routes
 /// through [`config_write_target`]: workspace yaml when one exists,
-/// otherwise `package.json#pnpm.allowBuilds`. Returns the file that
-/// was written. Used by `aube approve-builds` and the
-/// `--allow-build=<pkg>` / `--deny-build=<pkg>` CLI flags — entries
-/// are forcibly set, overwriting any prior value.
+/// otherwise `package.json` (`pnpm.allowBuilds` / `aube.allowBuilds`
+/// for a namespaced tool, top-level for a manifest-root embedder).
+/// Returns the file that was written. Used by `aube approve-builds`
+/// and the `--allow-build=<pkg>` / `--deny-build=<pkg>` CLI flags —
+/// entries are forcibly set, overwriting any prior value.
+///
+/// Manifest-root embedder caveat (the approve-builds heal gap): an
+/// embedder whose `manifest_namespace` is `""` writes the setting at
+/// the *top level* of `package.json` via [`edit_setting_map`], but the
+/// read side only honors that top-level key when
+/// `read_manifest_root_config` is set (the embedder's own identity
+/// surface). Under the embedder's pnpm-compat surface
+/// (`read_branded_pnpm_config` on, `read_manifest_root_config` off —
+/// the common pnpm-lock/fresh case) the reader looks at
+/// `pnpm.allowBuilds` and the workspace yaml, *not* the top-level key,
+/// so a top-level write would be invisible and the approval a no-op.
+/// When the read posture has gated off the top-level key but still
+/// reads the (pnpm) workspace yaml, create/write the workspace yaml —
+/// which the reader honors, and which matches where real pnpm records
+/// its approved-builds allowlist (`pnpm-workspace.yaml`).
 pub fn set_allow_builds(
     project_dir: &Path,
     names: &[String],
@@ -23,6 +39,9 @@ pub fn set_allow_builds(
 ) -> Result<PathBuf, crate::Error> {
     match config_write_target(project_dir) {
         ConfigWriteTarget::WorkspaceYaml(path) => write_allow_builds_yaml(&path, names, allow),
+        ConfigWriteTarget::PackageJson if root_write_unread_but_yaml_read() => {
+            write_allow_builds_yaml(&workspace_yaml_target(project_dir), names, allow)
+        }
         ConfigWriteTarget::PackageJson => {
             edit_setting_map(project_dir, "allowBuilds", |map| {
                 for name in names {
@@ -32,6 +51,24 @@ pub fn set_allow_builds(
             Ok(project_dir.join("package.json"))
         }
     }
+}
+
+/// Whether a `package.json`-target `allowBuilds` write would land at the
+/// *top level* of the manifest yet be unread there, while the workspace
+/// yaml *would* be read — the manifest-root-embedder + pnpm-compat-surface
+/// combination that makes a top-level write a silent no-op. True only when:
+/// the embedder is manifest-root (`manifest_namespace == ""`, so
+/// [`edit_setting_map`] writes at top level), the read side does *not* read
+/// the top-level key (`read_manifest_root_config` is off), and it *does* read
+/// the pnpm workspace yaml (`read_branded_pnpm_config` is on). For a
+/// namespaced tool (standalone aube writes `aube.allowBuilds`, which its own
+/// reader consults) this is false and the `package.json` path is taken
+/// unchanged.
+fn root_write_unread_but_yaml_read() -> bool {
+    let ctx = aube_util::engine_context();
+    aube_util::embedder().manifest_namespace.is_empty()
+        && !ctx.read_manifest_root_config
+        && ctx.read_branded_pnpm_config
 }
 
 /// Force-approve `names` in the project's `allowBuilds` map.
