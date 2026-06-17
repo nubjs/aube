@@ -847,7 +847,7 @@ fn configure_script_settings_for_project(cwd: &Path) -> miette::Result<bool> {
     let env_snapshot = aube_settings::values::capture_env();
     let ctx = files.ctx(&raw_workspace, &env_snapshot, &[]);
     let enable_pre_post_scripts = aube_settings::resolved::enable_pre_post_scripts(&ctx);
-    super::configure_script_settings(&ctx, Some("run-script"));
+    super::configure_script_settings(cwd, &ctx, Some("run-script"));
     Ok(enable_pre_post_scripts)
 }
 

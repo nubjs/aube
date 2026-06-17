@@ -5,6 +5,7 @@ use miette::{Context, IntoDiagnostic};
 use super::FileSources;
 
 pub(crate) fn configure_script_settings(
+    cwd: &Path,
     ctx: &aube_settings::ResolveCtx<'_>,
     command: Option<&str>,
 ) {
@@ -46,6 +47,15 @@ pub(crate) fn configure_script_settings(
         // aube's cache; a write failure here is non-fatal (the var just
         // stays unset, matching pre-parity behavior).
         node_gyp_js: super::install::node_gyp_bootstrap::lazy_js_shim_path().ok(),
+        // `npm_config_registry` parity: export the resolved default
+        // registry so dependency postinstalls (and `aube run` scripts)
+        // see the same registry aube resolved from `.npmrc` / env.
+        // Defaults to `https://registry.npmjs.org/` when nothing
+        // overrides it.
+        registry: {
+            let r = aube_registry::config::NpmConfig::load(cwd).registry;
+            (!r.is_empty()).then_some(r)
+        },
     });
 }
 
@@ -65,7 +75,7 @@ pub(crate) fn configure_script_settings_for_cwd(
         .wrap_err("failed to load workspace config")?;
     let env_snapshot = aube_settings::values::capture_env();
     let ctx = files.ctx(&raw_workspace, &env_snapshot, &[]);
-    configure_script_settings(&ctx, command);
+    configure_script_settings(cwd, &ctx, command);
     Ok(())
 }
 

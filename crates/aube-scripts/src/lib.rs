@@ -73,6 +73,13 @@ pub struct ScriptSettings {
     /// first use) the real node-gyp and forwards argv. `None` leaves
     /// `npm_config_node_gyp` unset.
     pub node_gyp_js: Option<PathBuf>,
+    /// The resolved default registry URL, exported as
+    /// `npm_config_registry` (npm/pnpm parity) so dependency lifecycle
+    /// scripts (and `aube run` scripts) see the same registry aube
+    /// resolved from `.npmrc` / env. Mirrors the `aube run` script-spawn
+    /// path so install postinstalls and `run` scripts agree. `None`
+    /// leaves `npm_config_registry` unset.
+    pub registry: Option<String>,
 }
 
 /// Native build jail applied to dependency lifecycle scripts.
@@ -540,6 +547,12 @@ fn apply_script_settings_env(cmd: &mut tokio::process::Command, settings: &Scrip
     // spawn time) so it flows through both the jailed and the
     // non-jailed paths.
     cmd.env("npm_config_user_agent", aube_user_agent());
+    // pnpm parity: lifecycle scripts get `npm_config_registry` set to the
+    // resolved default registry, matching the `aube run` script-spawn
+    // path so install postinstalls and `run` scripts see the same value.
+    if let Some(registry) = settings.registry.as_deref() {
+        cmd.env("npm_config_registry", registry);
+    }
     // `npm_execpath`: the package-manager binary that drove the script.
     // Tools (and pnpm's own `$npm_execpath run …` postinstalls) read it
     // to re-invoke the *same* PM. `current_exe()` is the aube binary;
