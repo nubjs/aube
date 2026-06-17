@@ -66,6 +66,49 @@ pub(super) fn workspace_protocol_override_from_flags(save: bool, no_save: bool) 
     }
 }
 
+/// Scrub `name` from every dependency section, then write `specifier`
+/// into the section(s) the `--save-*` flags select. Shared by all four
+/// manifest-write paths (registry, linked-workspace, git, file/link)
+/// so the section-routing rules live in exactly one place.
+///
+/// `--save-peer` matches pnpm: the package lands in BOTH
+/// `peerDependencies` (the downstream contract) AND `devDependencies`
+/// (so the local project actually installs it) — pnpm's
+/// `getSaveType` maps `savePeer` to `devDependencies` and writes the
+/// peer entry on top, regardless of whether `--save-dev` was also
+/// passed. The peer section is therefore not scrubbed when
+/// `--save-peer` is set, and the dev section is scrubbed only when we
+/// are not about to re-add to it.
+fn place_dep_in_manifest(
+    manifest: &mut aube_manifest::PackageJson,
+    name: &str,
+    specifier: String,
+    opts: &AddManifestOptions,
+) {
+    manifest.dependencies.remove(name);
+    manifest.optional_dependencies.remove(name);
+    if !opts.save_peer {
+        manifest.peer_dependencies.remove(name);
+    }
+    if !opts.save_peer && !opts.save_dev {
+        manifest.dev_dependencies.remove(name);
+    }
+
+    let dep_name = name.to_string();
+    if opts.save_peer {
+        manifest
+            .peer_dependencies
+            .insert(dep_name.clone(), specifier.clone());
+        manifest.dev_dependencies.insert(dep_name, specifier);
+    } else if opts.save_dev {
+        manifest.dev_dependencies.insert(dep_name, specifier);
+    } else if opts.save_optional {
+        manifest.optional_dependencies.insert(dep_name, specifier);
+    } else {
+        manifest.dependencies.insert(dep_name, specifier);
+    }
+}
+
 pub(super) async fn update_manifest_for_add(
     cwd: &Path,
     packages: &[String],
@@ -492,39 +535,7 @@ pub(super) async fn update_manifest_for_add(
 
         eprintln!("  + {pkg_name_for_manifest}@{display_version} (specifier: {specifier})");
 
-        // Remove from all dep sections first to avoid duplicates across
-        // sections. `--save-peer` intentionally does NOT clear the peer
-        // section (see below) — we may end up writing to both peer and
-        // dev simultaneously, which is pnpm's `--save-peer` behavior.
-        manifest.dependencies.remove(pkg_name_for_manifest);
-        manifest.optional_dependencies.remove(pkg_name_for_manifest);
-        if !opts.save_peer {
-            manifest.peer_dependencies.remove(pkg_name_for_manifest);
-        }
-        if !(opts.save_peer && opts.save_dev) {
-            manifest.dev_dependencies.remove(pkg_name_for_manifest);
-        }
-
-        // Add to the appropriate section. When `--save-peer` is paired
-        // with `--save-dev`, pnpm writes to BOTH peerDependencies and
-        // devDependencies — the peer entry declares what downstream
-        // consumers need, and the dev entry makes the local project
-        // actually install it for tests and tooling.
-        let dep_name = pkg_name_for_manifest.to_string();
-        if opts.save_peer {
-            manifest
-                .peer_dependencies
-                .insert(dep_name.clone(), specifier.clone());
-            if opts.save_dev {
-                manifest.dev_dependencies.insert(dep_name, specifier);
-            }
-        } else if opts.save_dev {
-            manifest.dev_dependencies.insert(dep_name, specifier);
-        } else if opts.save_optional {
-            manifest.optional_dependencies.insert(dep_name, specifier);
-        } else {
-            manifest.dependencies.insert(dep_name, specifier);
-        }
+        place_dep_in_manifest(&mut manifest, pkg_name_for_manifest, specifier, &opts);
     }
 
     // Write the updated package.json. Under `--no-save` callers still
@@ -608,32 +619,7 @@ fn apply_workspace_spec_to_manifest(
         spec.range
     );
 
-    // Mirror the duplicate-section scrub the registry path does.
-    manifest.dependencies.remove(pkg_name_for_manifest);
-    manifest.optional_dependencies.remove(pkg_name_for_manifest);
-    if !opts.save_peer {
-        manifest.peer_dependencies.remove(pkg_name_for_manifest);
-    }
-    if !(opts.save_peer && opts.save_dev) {
-        manifest.dev_dependencies.remove(pkg_name_for_manifest);
-    }
-
-    let dep_name = pkg_name_for_manifest.to_string();
-    let specifier = spec.range.clone();
-    if opts.save_peer {
-        manifest
-            .peer_dependencies
-            .insert(dep_name.clone(), specifier.clone());
-        if opts.save_dev {
-            manifest.dev_dependencies.insert(dep_name, specifier);
-        }
-    } else if opts.save_dev {
-        manifest.dev_dependencies.insert(dep_name, specifier);
-    } else if opts.save_optional {
-        manifest.optional_dependencies.insert(dep_name, specifier);
-    } else {
-        manifest.dependencies.insert(dep_name, specifier);
-    }
+    place_dep_in_manifest(manifest, pkg_name_for_manifest, spec.range.clone(), opts);
     Ok(())
 }
 
@@ -723,30 +709,7 @@ fn apply_linked_workspace_to_manifest(
 
     eprintln!("  + {pkg_name_for_manifest}@{workspace_version} (specifier: {specifier})");
 
-    manifest.dependencies.remove(pkg_name_for_manifest);
-    manifest.optional_dependencies.remove(pkg_name_for_manifest);
-    if !opts.save_peer {
-        manifest.peer_dependencies.remove(pkg_name_for_manifest);
-    }
-    if !(opts.save_peer && opts.save_dev) {
-        manifest.dev_dependencies.remove(pkg_name_for_manifest);
-    }
-
-    let dep_name = pkg_name_for_manifest.to_string();
-    if opts.save_peer {
-        manifest
-            .peer_dependencies
-            .insert(dep_name.clone(), specifier.clone());
-        if opts.save_dev {
-            manifest.dev_dependencies.insert(dep_name, specifier);
-        }
-    } else if opts.save_dev {
-        manifest.dev_dependencies.insert(dep_name, specifier);
-    } else if opts.save_optional {
-        manifest.optional_dependencies.insert(dep_name, specifier);
-    } else {
-        manifest.dependencies.insert(dep_name, specifier);
-    }
+    place_dep_in_manifest(manifest, pkg_name_for_manifest, specifier, opts);
 }
 
 /// Write a git-form spec verbatim into the manifest. Mirrors the
@@ -773,31 +736,12 @@ fn apply_git_spec_to_manifest(
 ) {
     eprintln!("  + {pkg_name_for_manifest} (specifier: {verbatim_spec})");
 
-    manifest.dependencies.remove(pkg_name_for_manifest);
-    manifest.optional_dependencies.remove(pkg_name_for_manifest);
-    if !opts.save_peer {
-        manifest.peer_dependencies.remove(pkg_name_for_manifest);
-    }
-    if !(opts.save_peer && opts.save_dev) {
-        manifest.dev_dependencies.remove(pkg_name_for_manifest);
-    }
-
-    let dep_name = pkg_name_for_manifest.to_string();
-    let specifier = verbatim_spec.to_string();
-    if opts.save_peer {
-        manifest
-            .peer_dependencies
-            .insert(dep_name.clone(), specifier.clone());
-        if opts.save_dev {
-            manifest.dev_dependencies.insert(dep_name, specifier);
-        }
-    } else if opts.save_dev {
-        manifest.dev_dependencies.insert(dep_name, specifier);
-    } else if opts.save_optional {
-        manifest.optional_dependencies.insert(dep_name, specifier);
-    } else {
-        manifest.dependencies.insert(dep_name, specifier);
-    }
+    place_dep_in_manifest(
+        manifest,
+        pkg_name_for_manifest,
+        verbatim_spec.to_string(),
+        opts,
+    );
 }
 
 /// Write a `file:` / `link:` spec verbatim into the manifest. Same
@@ -897,4 +841,94 @@ fn decide_save_catalog(
         range: manual_specifier.to_string(),
     });
     (manifest_specifier, resolved_version.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(save_dev: bool, save_optional: bool, save_peer: bool) -> AddManifestOptions {
+        AddManifestOptions {
+            save_dev,
+            save_exact: false,
+            save_optional,
+            save_peer,
+            save_catalog: None,
+            workspace_protocol_override: None,
+        }
+    }
+
+    fn place(opts: &AddManifestOptions) -> aube_manifest::PackageJson {
+        let mut m = aube_manifest::PackageJson::default();
+        place_dep_in_manifest(&mut m, "is-odd", "^3.0.1".to_string(), opts);
+        m
+    }
+
+    #[test]
+    fn save_peer_writes_both_peer_and_dev() {
+        // pnpm's `getSaveType` maps `savePeer` to `devDependencies` and writes
+        // the peer entry on top, so `--save-peer` (even WITHOUT `--save-dev`)
+        // lands the package in BOTH sections. Verified against pnpm 10.15.
+        let m = place(&opts(false, false, true));
+        assert_eq!(
+            m.peer_dependencies.get("is-odd").map(String::as_str),
+            Some("^3.0.1")
+        );
+        assert_eq!(
+            m.dev_dependencies.get("is-odd").map(String::as_str),
+            Some("^3.0.1")
+        );
+        assert!(m.dependencies.is_empty());
+        assert!(m.optional_dependencies.is_empty());
+    }
+
+    #[test]
+    fn save_peer_with_save_dev_still_writes_both() {
+        let m = place(&opts(true, false, true));
+        assert!(m.peer_dependencies.contains_key("is-odd"));
+        assert!(m.dev_dependencies.contains_key("is-odd"));
+    }
+
+    #[test]
+    fn plain_add_writes_only_dependencies() {
+        let m = place(&opts(false, false, false));
+        assert_eq!(
+            m.dependencies.get("is-odd").map(String::as_str),
+            Some("^3.0.1")
+        );
+        assert!(m.dev_dependencies.is_empty());
+        assert!(m.peer_dependencies.is_empty());
+    }
+
+    #[test]
+    fn save_dev_and_save_optional_route_to_their_own_section() {
+        assert!(
+            place(&opts(true, false, false))
+                .dev_dependencies
+                .contains_key("is-odd")
+        );
+        assert!(
+            place(&opts(false, true, false))
+                .optional_dependencies
+                .contains_key("is-odd")
+        );
+    }
+
+    #[test]
+    fn scrub_clears_stale_section_on_resave() {
+        // A package previously in `dependencies` moves cleanly to peer+dev
+        // (no duplicate left behind in `dependencies`).
+        let mut m = aube_manifest::PackageJson::default();
+        m.dependencies
+            .insert("is-odd".to_string(), "^1.0.0".to_string());
+        place_dep_in_manifest(
+            &mut m,
+            "is-odd",
+            "^3.0.1".to_string(),
+            &opts(false, false, true),
+        );
+        assert!(m.dependencies.is_empty());
+        assert!(m.peer_dependencies.contains_key("is-odd"));
+        assert!(m.dev_dependencies.contains_key("is-odd"));
+    }
 }
