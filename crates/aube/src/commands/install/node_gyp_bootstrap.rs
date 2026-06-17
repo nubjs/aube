@@ -132,7 +132,7 @@ pub(crate) fn lazy_shim_bin_dir(project_bin_dir: &Path) -> miette::Result<Option
 /// `node $npm_config_node_gyp`. Rewritten on every call (like
 /// [`lazy_shim_bin_dir`]) so a shipped shim fix self-heals rather than
 /// being pinned to whatever first landed in the cache.
-pub(crate) fn lazy_js_shim_path() -> miette::Result<PathBuf> {
+pub fn lazy_js_shim_path() -> miette::Result<PathBuf> {
     let shim_dir = tool_root()?.join("lazy-bin");
     std::fs::create_dir_all(&shim_dir).into_diagnostic()?;
     write_lazy_shims(&shim_dir)?;
