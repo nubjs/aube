@@ -159,15 +159,15 @@ fn root_embedder_reads_root_allow_builds_only_when_root_surface_is_active() {
     assert!(!root.contains_key("left-pad"));
 }
 
-/// The approve-builds heal gap: under a manifest-root embedder on the
-/// pnpm-compat/fresh surface (`read_branded_pnpm_config` on,
-/// `read_manifest_root_config` off — the common case), `set_allow_builds`
-/// must NOT write the top-level `package.json#allowBuilds` key the read side
-/// ignores there. It writes the (pnpm) workspace yaml the reader honors, so a
-/// subsequent install actually sees the approval. Round-trips through the read
-/// side to prove the write is visible.
+/// The approve-builds heal path (pnpm-compat/fresh surface, no workspace
+/// yaml on disk): under a manifest-root embedder with `read_branded_pnpm_config`
+/// on and `read_manifest_root_config` off — the common case — an *approval*
+/// (`allow=true`) lands in the nested `package.json#pnpm.onlyBuiltDependencies`
+/// array (pnpm's canonical allowlist, which the read side and real pnpm 10.x
+/// both honor) WITHOUT creating a `pnpm-workspace.yaml`. Round-trips through the
+/// read side to prove the write is visible.
 #[test]
-fn set_allow_builds_writes_yaml_on_pnpm_surface_not_unread_root_key() {
+fn set_allow_builds_writes_pnpm_only_built_deps_on_pnpm_surface_no_yaml() {
     aube_util::set_embedder(&ROOT_TOOL);
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = true;
@@ -183,23 +183,165 @@ fn set_allow_builds_writes_yaml_on_pnpm_surface_not_unread_root_key() {
 
     let written = set_allow_builds(tmp.path(), &["core-js".to_string()], true).unwrap();
 
-    // No workspace yaml existed, so the write must create pnpm-workspace.yaml
-    // (where the read side looks on this surface), NOT a top-level package.json
-    // key the reader gates off.
+    // Lands in package.json — not a freshly-created workspace yaml.
     assert_eq!(
         written.file_name().and_then(|n| n.to_str()),
-        Some("pnpm-workspace.yaml"),
-        "expected the approval to land in pnpm-workspace.yaml on the pnpm-compat surface, got: {written:?}"
+        Some("package.json"),
+        "approval on the pnpm-compat surface (no yaml) must write package.json, got: {written:?}"
     );
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "must not create a pnpm-workspace.yaml where none existed"
+    );
+    // Nested under `pnpm.onlyBuiltDependencies`, not the unread top-level key.
     let manifest = read_manifest(tmp.path());
     assert!(
         manifest.get("allowBuilds").is_none(),
         "must not write an unread top-level allowBuilds key, got: {manifest:#?}"
     );
+    assert_eq!(
+        manifest["pnpm"]["onlyBuiltDependencies"],
+        serde_json::json!(["core-js"]),
+        "approval must land in pnpm.onlyBuiltDependencies, got: {manifest:#?}"
+    );
+
+    // The write round-trips through the read side on this surface.
+    let parsed = PackageJson::parse(
+        &tmp.path().join("package.json"),
+        std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.pnpm_only_built_dependencies(),
+        vec!["core-js".to_string()],
+        "read side must see the approval on the pnpm-compat surface"
+    );
+}
+
+/// An *existing* `pnpm-workspace.yaml` still wins on the pnpm-compat surface:
+/// the approval appends there (keeping all workspace config in one place)
+/// rather than splitting it into `package.json`.
+#[test]
+fn set_allow_builds_appends_existing_yaml_on_pnpm_surface() {
+    aube_util::set_embedder(&ROOT_TOOL);
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_branded_pnpm_config = true;
+        ctx.read_manifest_root_config = false;
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("package.json"), "{\n  \"name\": \"x\"\n}\n").unwrap();
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - 'pkg/*'\n",
+    )
+    .unwrap();
+
+    let written = set_allow_builds(tmp.path(), &["core-js".to_string()], true).unwrap();
+
+    assert_eq!(
+        written.file_name().and_then(|n| n.to_str()),
+        Some("pnpm-workspace.yaml"),
+        "an existing workspace yaml must be the write target, got: {written:?}"
+    );
     let yaml = std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap();
     assert!(
-        yaml.contains("allowBuilds:") && yaml.contains("core-js"),
-        "pnpm-workspace.yaml must record the approval, got:\n{yaml}"
+        yaml.contains("allowBuilds:") && yaml.contains("core-js") && yaml.contains("pkg/*"),
+        "existing yaml must gain the approval and keep its prior content, got:\n{yaml}"
+    );
+    let manifest = read_manifest(tmp.path());
+    assert!(
+        manifest.get("pnpm").is_none(),
+        "must not also write package.json when a yaml exists, got: {manifest:#?}"
+    );
+}
+
+/// A denial (`allow=false`) on the pnpm-compat surface with no yaml lands in
+/// the nested `pnpm.allowBuilds` map (the array allowlist can't carry a
+/// `false`), again without creating a workspace yaml.
+#[test]
+fn set_allow_builds_writes_pnpm_allow_builds_map_for_denial_no_yaml() {
+    aube_util::set_embedder(&ROOT_TOOL);
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_branded_pnpm_config = true;
+        ctx.read_manifest_root_config = false;
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("package.json"), "{\n  \"name\": \"x\"\n}\n").unwrap();
+
+    let written = set_allow_builds(tmp.path(), &["esbuild".to_string()], false).unwrap();
+
+    assert_eq!(
+        written.file_name().and_then(|n| n.to_str()),
+        Some("package.json")
+    );
+    assert!(!tmp.path().join("pnpm-workspace.yaml").exists());
+    let manifest = read_manifest(tmp.path());
+    assert_eq!(
+        manifest["pnpm"]["allowBuilds"]["esbuild"],
+        serde_json::Value::Bool(false),
+        "denial must land in pnpm.allowBuilds as false, got: {manifest:#?}"
+    );
+    let parsed = PackageJson::parse(
+        &tmp.path().join("package.json"),
+        std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            parsed.pnpm_allow_builds().get("esbuild"),
+            Some(AllowBuildRaw::Bool(false))
+        ),
+        "read side must see the denial on the pnpm-compat surface"
+    );
+}
+
+/// Documents the CURRENT NonPnpmCompat (npm/bun/yarn incumbent) behavior:
+/// both gates are off, so `set_allow_builds` writes the top-level
+/// `package.json#allowBuilds` key that the read side does NOT consult on this
+/// surface — i.e. `approve-builds` is still a no-op for these incumbents. This
+/// is a known gap pending a separate routing decision; the test pins the
+/// reality so any future fix is a deliberate, visible change.
+#[test]
+fn set_allow_builds_is_a_no_op_on_non_pnpm_compat_surface() {
+    aube_util::set_embedder(&ROOT_TOOL);
+    // npm/bun/yarn incumbent: neither the pnpm namespace nor the manifest-root
+    // key is read.
+    aube_util::update_engine_context(|ctx| {
+        ctx.read_branded_pnpm_config = false;
+        ctx.read_manifest_root_config = false;
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("package.json"), "{\n  \"name\": \"x\"\n}\n").unwrap();
+
+    let written = set_allow_builds(tmp.path(), &["core-js".to_string()], true).unwrap();
+    assert_eq!(
+        written.file_name().and_then(|n| n.to_str()),
+        Some("package.json")
+    );
+
+    // The approval is written at the top level…
+    let manifest = read_manifest(tmp.path());
+    assert_eq!(
+        manifest["allowBuilds"]["core-js"],
+        serde_json::Value::Bool(true)
+    );
+    // …but the read side on this surface ignores it: the approval does not
+    // take effect (the documented gap).
+    let parsed = PackageJson::parse(
+        &tmp.path().join("package.json"),
+        std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        parsed.pnpm_allow_builds().is_empty(),
+        "KNOWN GAP: approve-builds is a no-op on a non-pnpm-compat surface — \
+         the top-level write is unread here. If this assertion fails, the gap \
+         was fixed and this documenting test should become the real assertion. \
+         got: {:#?}",
+        parsed.pnpm_allow_builds()
     );
 }
 

@@ -232,6 +232,142 @@ where
     Ok(())
 }
 
+/// Append `names` to the compatible-namespace `onlyBuiltDependencies`
+/// array in `package.json` (`pnpm.onlyBuiltDependencies` under the nub /
+/// standalone-aube profiles, whose `compatible_names` is `["pnpm"]`).
+/// Creates the namespace object and the array as needed, dedupes against
+/// existing entries, and skips the rewrite when nothing changes.
+///
+/// This is the heal-path write for the pnpm-compat/fresh surface
+/// (`read_branded_pnpm_config` on, no workspace yaml on disk): it lands
+/// the approval in pnpm's canonical *allowlist* key — the array form nearly
+/// every real pnpm project uses — which the read side honors via
+/// [`PackageJson::pnpm_only_built_dependencies`] and which real pnpm 10.x
+/// reads from `package.json` too. Unlike [`edit_setting_map`], which under a
+/// manifest-root embedder writes a *top-level* key, this targets the first
+/// compatible namespace explicitly, because that is the surface the
+/// pnpm-compat reader consults (the top-level key is gated off there).
+///
+/// Allowlist-only: `onlyBuiltDependencies` carries no per-entry boolean, so
+/// only approvals (`allow=true`) route here. Denials use the
+/// `pnpm.allowBuilds` map (see [`set_allow_builds`]).
+///
+/// [`set_allow_builds`]: super::mutations::set_allow_builds
+pub fn add_to_pnpm_only_built_dependencies(
+    cwd: &Path,
+    names: &[String],
+) -> Result<(), crate::Error> {
+    // The compatible (pnpm) namespace is where the pnpm-compat reader looks.
+    // For nub/aube this is `"pnpm"`; fall back to the tool's own namespace
+    // only if no compatible name is declared (never the case for these
+    // profiles, but keeps the helper total).
+    let id = aube_util::embedder();
+    let ns = id
+        .compatible_names
+        .first()
+        .copied()
+        .or((!id.manifest_namespace.is_empty()).then_some(id.manifest_namespace))
+        .unwrap_or("pnpm");
+
+    let path = cwd.join("package.json");
+    let raw = std::fs::read_to_string(&path).map_err(|e| crate::Error::Io(path.clone(), e))?;
+    let mut value = crate::parse_json::<serde_json::Value>(&path, raw)?;
+    let obj = value.as_object_mut().ok_or_else(|| {
+        crate::Error::YamlParse(path.clone(), "package.json is not an object".to_string())
+    })?;
+    let before = obj.clone();
+
+    let ns_obj = obj
+        .entry(ns.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| crate::Error::YamlParse(path.clone(), format!("`{ns}` is not an object")))?;
+    let arr = ns_obj
+        .entry("onlyBuiltDependencies".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| {
+            crate::Error::YamlParse(
+                path.clone(),
+                format!("`{ns}.onlyBuiltDependencies` is not an array"),
+            )
+        })?;
+    for name in names {
+        let already = arr.iter().any(|v| v.as_str() == Some(name.as_str()));
+        if !already {
+            arr.push(serde_json::Value::String(name.clone()));
+        }
+    }
+
+    if *obj == before {
+        return Ok(());
+    }
+    let mut out = serde_json::to_string_pretty(&value)
+        .map_err(|e| crate::Error::YamlParse(path.clone(), format!("failed to serialize: {e}")))?;
+    out.push('\n');
+    std::fs::write(&path, out).map_err(|e| crate::Error::Io(path, e))?;
+    Ok(())
+}
+
+/// Set `names` to `value` in the compatible-namespace `allowBuilds` map
+/// in `package.json` (`pnpm.allowBuilds` under the nub / standalone-aube
+/// profiles). Companion to [`add_to_pnpm_only_built_dependencies`] for the
+/// denial (`false`) case, which the array allowlist can't represent.
+///
+/// Targets the first compatible namespace explicitly — same reasoning as
+/// [`add_to_pnpm_only_built_dependencies`]: under a manifest-root embedder
+/// on the pnpm-compat surface the reader consults `pnpm.allowBuilds`, not a
+/// top-level `allowBuilds` key, so the write must be nested. Both nub
+/// (via [`PackageJson::pnpm_allow_builds`]) and real pnpm 10.x read this map.
+///
+/// [`PackageJson::pnpm_allow_builds`]: crate::PackageJson::pnpm_allow_builds
+pub fn set_pnpm_allow_builds_entries(
+    cwd: &Path,
+    names: &[String],
+    value: bool,
+) -> Result<(), crate::Error> {
+    let id = aube_util::embedder();
+    let ns = id
+        .compatible_names
+        .first()
+        .copied()
+        .or((!id.manifest_namespace.is_empty()).then_some(id.manifest_namespace))
+        .unwrap_or("pnpm");
+
+    let path = cwd.join("package.json");
+    let raw = std::fs::read_to_string(&path).map_err(|e| crate::Error::Io(path.clone(), e))?;
+    let mut json = crate::parse_json::<serde_json::Value>(&path, raw)?;
+    let obj = json.as_object_mut().ok_or_else(|| {
+        crate::Error::YamlParse(path.clone(), "package.json is not an object".to_string())
+    })?;
+    let before = obj.clone();
+
+    let ns_obj = obj
+        .entry(ns.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| crate::Error::YamlParse(path.clone(), format!("`{ns}` is not an object")))?;
+    let map = ns_obj
+        .entry("allowBuilds".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            crate::Error::YamlParse(path.clone(), format!("`{ns}.allowBuilds` is not an object"))
+        })?;
+    for name in names {
+        map.insert(name.clone(), serde_json::Value::Bool(value));
+    }
+
+    if *obj == before {
+        return Ok(());
+    }
+    let mut out = serde_json::to_string_pretty(&json)
+        .map_err(|e| crate::Error::YamlParse(path.clone(), format!("failed to serialize: {e}")))?;
+    out.push('\n');
+    std::fs::write(&path, out).map_err(|e| crate::Error::Io(path, e))?;
+    Ok(())
+}
+
 /// Upsert a single `<map>.<entry>` pair into the project's
 /// workspace-level config. Routes through [`config_write_target`]:
 /// workspace yaml when one exists, otherwise `<pnpm|aube>.<map>` in

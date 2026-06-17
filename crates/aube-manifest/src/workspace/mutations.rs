@@ -6,8 +6,11 @@
 //! the workspace yaml keeps its comments + structure when aube
 //! mutates these maps.
 
-use super::config::{ConfigWriteTarget, config_write_target, workspace_yaml_target};
-use super::edits::{edit_setting_map, edit_workspace_yaml, workspace_yaml_submap};
+use super::config::{ConfigWriteTarget, config_write_target};
+use super::edits::{
+    add_to_pnpm_only_built_dependencies, edit_setting_map, edit_workspace_yaml,
+    set_pnpm_allow_builds_entries, workspace_yaml_submap,
+};
 use std::path::{Path, PathBuf};
 
 /// Force-write `names` in the project's `allowBuilds` map. Routes
@@ -25,13 +28,20 @@ use std::path::{Path, PathBuf};
 /// `read_manifest_root_config` is set (the embedder's own identity
 /// surface). Under the embedder's pnpm-compat surface
 /// (`read_branded_pnpm_config` on, `read_manifest_root_config` off —
-/// the common pnpm-lock/fresh case) the reader looks at
-/// `pnpm.allowBuilds` and the workspace yaml, *not* the top-level key,
-/// so a top-level write would be invisible and the approval a no-op.
+/// the common pnpm-lock/fresh case) the reader looks at the `pnpm.*`
+/// namespace and the workspace yaml, *not* the top-level key, so a
+/// top-level write would be invisible and the approval a no-op.
+///
 /// When the read posture has gated off the top-level key but still
-/// reads the (pnpm) workspace yaml, create/write the workspace yaml —
-/// which the reader honors, and which matches where real pnpm records
-/// its approved-builds allowlist (`pnpm-workspace.yaml`).
+/// reads the (pnpm) namespace, the write lands in `package.json` under
+/// `pnpm.*` — the surface the reader honors — *without* creating a
+/// `pnpm-workspace.yaml` where none exists (a fresh yaml file is noisy).
+/// Approvals (`allow=true`) go to `pnpm.onlyBuiltDependencies` (pnpm's
+/// canonical allowlist array, which real pnpm 10.x also reads from
+/// `package.json`); denials (`allow=false`) go to the `pnpm.allowBuilds`
+/// map, since the array form carries no per-entry boolean. An *existing*
+/// `pnpm-workspace.yaml` still wins (the `WorkspaceYaml` arm) — we append
+/// there to keep all workspace config in one place.
 pub fn set_allow_builds(
     project_dir: &Path,
     names: &[String],
@@ -40,7 +50,14 @@ pub fn set_allow_builds(
     match config_write_target(project_dir) {
         ConfigWriteTarget::WorkspaceYaml(path) => write_allow_builds_yaml(&path, names, allow),
         ConfigWriteTarget::PackageJson if root_write_unread_but_yaml_read() => {
-            write_allow_builds_yaml(&workspace_yaml_target(project_dir), names, allow)
+            if allow {
+                add_to_pnpm_only_built_dependencies(project_dir, names)?;
+            } else {
+                // No array slot for a denial — record `false` in the nested
+                // `pnpm.allowBuilds` map, which both nub and pnpm 10.x read.
+                set_pnpm_allow_builds_entries(project_dir, names, false)?;
+            }
+            Ok(project_dir.join("package.json"))
         }
         ConfigWriteTarget::PackageJson => {
             edit_setting_map(project_dir, "allowBuilds", |map| {
