@@ -211,6 +211,111 @@ fn yarnrc_without_package_extensions_emits_no_entry() {
 }
 
 #[test]
+fn yarnrc_translates_top_level_ca_proxy_and_strict_ssl() {
+    let entries = translate_yarnrc_content(
+        r#"
+httpsCaFilePath: /etc/ssl/corp-bundle.pem
+httpProxy: "http://proxy.example:3128"
+httpsProxy: "http://proxy.example:3129"
+enableStrictSsl: false
+"#,
+    );
+    assert!(entries.contains(&("cafile".to_string(), "/etc/ssl/corp-bundle.pem".to_string())));
+    assert!(entries.contains(&(
+        "http-proxy".to_string(),
+        "http://proxy.example:3128".to_string()
+    )));
+    assert!(entries.contains(&(
+        "https-proxy".to_string(),
+        "http://proxy.example:3129".to_string()
+    )));
+    assert!(entries.contains(&("strict-ssl".to_string(), "false".to_string())));
+}
+
+#[test]
+fn yarnrc_translates_per_host_ca_and_skips_glob_hosts() {
+    let entries = translate_yarnrc_content(
+        r#"
+networkSettings:
+  "registry.example.com":
+    httpsCaFilePath: /etc/ssl/host-ca.pem
+  "*.cdn.example.com":
+    httpsCaFilePath: /etc/ssl/glob-ca.pem
+"#,
+    );
+    // Literal host → the per-registry `//host/:cafile` form the .npmrc
+    // consumer already understands.
+    assert!(entries.contains(&(
+        "//registry.example.com/:cafile".to_string(),
+        "/etc/ssl/host-ca.pem".to_string()
+    )));
+    // A glob host pattern has no exact-prefix equivalent and must be dropped
+    // rather than mis-scoped to a literal `//*.cdn.example.com/` key.
+    assert!(
+        entries.iter().all(|(_, v)| v != "/etc/ssl/glob-ca.pem"),
+        "glob networkSettings host must not be translated to a per-registry cafile"
+    );
+}
+
+#[test]
+fn yarn_env_translates_top_level_ca_proxy_and_strict_ssl() {
+    let entries = yarn_env_entries_from(&[
+        (
+            "YARN_HTTPS_CA_FILE_PATH".to_string(),
+            "/etc/ssl/env-ca.pem".to_string(),
+        ),
+        ("YARN_HTTP_PROXY".to_string(), "http://e:1".to_string()),
+        ("YARN_HTTPS_PROXY".to_string(), "http://e:2".to_string()),
+        ("YARN_ENABLE_STRICT_SSL".to_string(), "false".to_string()),
+    ]);
+    assert!(entries.contains(&("cafile".to_string(), "/etc/ssl/env-ca.pem".to_string())));
+    assert!(entries.contains(&("http-proxy".to_string(), "http://e:1".to_string())));
+    assert!(entries.contains(&("https-proxy".to_string(), "http://e:2".to_string())));
+    assert!(entries.contains(&("strict-ssl".to_string(), "false".to_string())));
+}
+
+#[test]
+fn user_yarnrc_proxy_is_honored_but_project_yarnrc_proxy_is_rejected() {
+    // Proxy/strict-ssl are subprocess-affecting settings: a user-level
+    // `~/.yarnrc.yml` is trusted, a project-committed `.yarnrc.yml` is not —
+    // identical to the `.npmrc` trust gate. The yarnrc entries inherit it for
+    // free by flowing through `apply_tagged`.
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".yarnrc.yml"),
+        "httpsProxy: http://user-proxy.example\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".yarnrc.yml"),
+        "httpProxy: http://project-proxy.example\n",
+    )
+    .unwrap();
+
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
+    let tagged = crate::config::load::merge_yarnrc_tagged_entries(
+        load_npmrc_entries_tagged_with_home(Some(home.path()), None, project.path(), None),
+        Some(home.path()),
+        project.path(),
+    );
+    aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    let mut config = NpmConfig::default();
+    config.apply_tagged(tagged);
+
+    assert_eq!(
+        config.https_proxy.as_deref(),
+        Some("http://user-proxy.example"),
+        "user ~/.yarnrc.yml proxy must be honored"
+    );
+    assert!(
+        config.http_proxy.as_deref() != Some("http://project-proxy.example"),
+        "project .yarnrc.yml must not set a registry proxy (untrusted source)"
+    );
+}
+
+#[test]
 fn yarnrc_project_overrides_global_yarnrc_entries() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
