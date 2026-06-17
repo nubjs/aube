@@ -83,6 +83,57 @@ pub(super) fn translate_npm_config_env(name: &str, value: &str) -> Option<(Strin
     Some((npmrc_key.to_string(), value.to_string()))
 }
 
+/// Synthesize `.npmrc`-style entries from Bun's `BUN_CONFIG_REGISTRY` /
+/// `BUN_CONFIG_TOKEN` install-registry environment variables so
+/// [`NpmConfig::apply_tagged`] can consume them uniformly. Only emitted when
+/// the embedder has set [`EngineContext::read_bun_config`] (Bun is the active
+/// incumbent); standalone aube never reads these.
+///
+/// Mirrors Bun's `PackageManagerOptions` env handling
+/// (`src/install/PackageManager/PackageManagerOptions.zig`):
+///
+/// - `BUN_CONFIG_REGISTRY` → the default `registry`, but *only* when it parses
+///   as an `http://` / `https://` URL — Bun ignores any other value. This is
+///   the highest-precedence default-registry source (checked before
+///   `NPM_CONFIG_REGISTRY` / `npm_config_registry`), so the caller appends
+///   these entries *after* the `npm_config_*` entries for last-write-wins.
+/// - `BUN_CONFIG_TOKEN` → the default registry's `_authToken`. Emitted as an
+///   unscoped `_authToken` tagged [`NpmrcSource::Env`]; `apply_tagged` pins it
+///   to the env source's resolved default registry (the `BUN_CONFIG_REGISTRY`
+///   URL when set, else `registry.npmjs.org`). A `BUN_CONFIG_TOKEN` set without
+///   `BUN_CONFIG_REGISTRY` against a *file*-configured custom default registry
+///   therefore pins to npmjs.org rather than the file registry — the same
+///   source-slot limitation the `npm_config`/yarn env tokens have, and a rare
+///   case versus the common CI pattern of setting both together.
+pub(super) fn bun_env_entries_from(env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(registry) = bun_env_get(env, "BUN_CONFIG_REGISTRY")
+        && (registry.starts_with("https://") || registry.starts_with("http://"))
+    {
+        out.push(("registry".to_string(), registry.to_string()));
+    }
+    if let Some(token) = bun_env_get(env, "BUN_CONFIG_TOKEN") {
+        out.push(("_authToken".to_string(), token.to_string()));
+    }
+    out
+}
+
+/// Capture-slice equivalent of `std::env::var` for the Bun env keys. Returns
+/// the first non-empty value, matching Bun's `env.get(key)` + `len > 0` gate.
+fn bun_env_get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
+}
+
+/// `std::env`-reading wrapper over [`bun_env_entries_from`], used on the
+/// non-injected load paths (`load_*_split`, the scoped readers).
+pub(super) fn bun_env_entries_from_std() -> Vec<(String, String)> {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    bun_env_entries_from(&env)
+}
+
 fn strip_url_scoped_config_prefix(name: &str) -> Option<&str> {
     for prefix in ["npm_config_", "pnpm_config_"] {
         if name

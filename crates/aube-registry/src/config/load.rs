@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::env::npm_config_env_entries_from;
+use super::env::{bun_env_entries_from, bun_env_entries_from_std, npm_config_env_entries_from};
 use super::npmrc::{parse_npmrc, parse_npmrc_untrusted};
 use super::types::{NpmConfig, NpmrcSource};
 use super::yarnrc;
@@ -113,6 +113,15 @@ impl NpmConfig {
                 .into_iter()
                 .map(|(k, v)| (NpmrcSource::Env, k, v)),
         );
+        // Bun's `BUN_CONFIG_REGISTRY` / `BUN_CONFIG_TOKEN` outrank the
+        // `npm_config_*` registry/token, so append them last (last-write-wins).
+        if aube_util::engine_context().read_bun_config {
+            tagged.extend(
+                bun_env_entries_from(env)
+                    .into_iter()
+                    .map(|(k, v)| (NpmrcSource::Env, k, v)),
+            );
+        }
         config.apply_tagged(tagged);
         // Env vars fill in any proxy fields the .npmrc didn't set.
         // npm/pnpm/curl all check both the upper- and lowercase forms.
@@ -159,6 +168,11 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
     } else {
         Vec::new()
     };
+    let bun_env = if aube_util::engine_context().read_bun_config {
+        bun_env_entries_from_std()
+    } else {
+        Vec::new()
+    };
     let mut split = SplitNpmrcEntries::default();
     for (src, k, v) in tagged {
         match src {
@@ -181,6 +195,7 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
         }
     }
     split.project.extend(yarn_env);
+    split.project.extend(bun_env);
     if let Ok(mut map) = cache.lock() {
         map.insert(key, split.clone());
     }
@@ -236,6 +251,13 @@ pub fn load_project_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     if aube_util::engine_context().read_yarn_config {
         tagged.extend(
             yarnrc::yarn_env_entries_from_std()
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Env, k, v)),
+        );
+    }
+    if aube_util::engine_context().read_bun_config {
+        tagged.extend(
+            bun_env_entries_from_std()
                 .into_iter()
                 .map(|(k, v)| (NpmrcSource::Env, k, v)),
         );
@@ -302,6 +324,13 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
                 .map(|(k, v)| (NpmrcSource::Env, k, v)),
         );
     }
+    if aube_util::engine_context().read_bun_config {
+        tagged.extend(
+            bun_env_entries_from_std()
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::Env, k, v)),
+        );
+    }
     let entries = tagged
         .into_iter()
         .map(|(_, k, v)| (k, v))
@@ -320,12 +349,18 @@ struct NpmrcCacheKey {
     synthetic_user_npmrc_entries: Vec<(String, String)>,
     synthetic_project_npmrc_entries: Vec<(String, String)>,
     yarn_env_entries: Vec<(String, String)>,
+    bun_env_entries: Vec<(String, String)>,
 }
 
 fn npmrc_cache_key(project_dir: &Path) -> NpmrcCacheKey {
     let ctx = aube_util::engine_context();
     let yarn_env_entries = if ctx.read_yarn_config {
         yarnrc::yarn_env_entries_from_std()
+    } else {
+        Vec::new()
+    };
+    let bun_env_entries = if ctx.read_bun_config {
+        bun_env_entries_from_std()
     } else {
         Vec::new()
     };
@@ -336,6 +371,7 @@ fn npmrc_cache_key(project_dir: &Path) -> NpmrcCacheKey {
         synthetic_user_npmrc_entries: ctx.synthetic_user_npmrc_entries,
         synthetic_project_npmrc_entries: ctx.synthetic_project_npmrc_entries,
         yarn_env_entries,
+        bun_env_entries,
     }
 }
 

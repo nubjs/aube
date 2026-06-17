@@ -2930,6 +2930,116 @@ fn translate_npm_config_env_ignores_uri_token_helper() {
     );
 }
 
+/// Serializes the tests that flip the process-global
+/// `engine_context().read_bun_config` gate so a disabled-window can't race a
+/// concurrent load assuming the upstream default (off).
+static BUN_CONFIG_GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn bun_env_entries_map_registry_and_token() {
+    // `BUN_CONFIG_REGISTRY` becomes the default `registry`; `BUN_CONFIG_TOKEN`
+    // becomes an unscoped `_authToken` that `apply_tagged` pins to that
+    // registry (mirrors Bun's `this.scope.token`). Mapping is a pure function
+    // of the captured env — no `std::env` mutation.
+    let entries = super::env::bun_env_entries_from(&[
+        (
+            "BUN_CONFIG_REGISTRY".to_string(),
+            "https://bun.registry.example/".to_string(),
+        ),
+        ("BUN_CONFIG_TOKEN".to_string(), "bun-token".to_string()),
+    ]);
+    assert_eq!(
+        entries,
+        vec![
+            (
+                "registry".to_string(),
+                "https://bun.registry.example/".to_string()
+            ),
+            ("_authToken".to_string(), "bun-token".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn bun_env_entries_ignore_non_http_registry_and_empty_values() {
+    // Bun only accepts an `http(s)://` registry value and skips empty vars.
+    let entries = super::env::bun_env_entries_from(&[
+        (
+            "BUN_CONFIG_REGISTRY".to_string(),
+            "registry.example.com".to_string(),
+        ),
+        ("BUN_CONFIG_TOKEN".to_string(), String::new()),
+    ]);
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn load_with_env_bun_config_registry_and_token_pin_to_env_registry() {
+    let _guard = BUN_CONFIG_GATE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "registry=https://file.registry.example/\n",
+    )
+    .unwrap();
+    let env = vec![
+        (
+            "BUN_CONFIG_REGISTRY".to_string(),
+            "https://bun.registry.example/".to_string(),
+        ),
+        ("BUN_CONFIG_TOKEN".to_string(), "bun-token".to_string()),
+    ];
+
+    // Off (upstream default): Bun env vars are another tool's state, ignored.
+    aube_util::update_engine_context(|ctx| ctx.read_bun_config = false);
+    let disabled = NpmConfig::load_with_env(dir.path(), &env);
+    assert_eq!(disabled.registry, "https://file.registry.example/");
+    assert_eq!(
+        disabled.auth_token_for("https://bun.registry.example/"),
+        None
+    );
+
+    // On (Bun incumbent): `BUN_CONFIG_REGISTRY` wins over the project file and
+    // the token pins to that registry.
+    aube_util::update_engine_context(|ctx| ctx.read_bun_config = true);
+    let enabled = NpmConfig::load_with_env(dir.path(), &env);
+    aube_util::update_engine_context(|ctx| ctx.read_bun_config = false);
+
+    assert_eq!(enabled.registry, "https://bun.registry.example/");
+    assert_eq!(
+        enabled.auth_token_for("https://bun.registry.example/"),
+        Some("bun-token")
+    );
+}
+
+#[test]
+fn load_with_env_bun_config_registry_outranks_npm_config_registry() {
+    // Bun checks `BUN_CONFIG_REGISTRY` before `NPM_CONFIG_REGISTRY`, so the
+    // Bun spelling must win when both are present.
+    let _guard = BUN_CONFIG_GATE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let env = vec![
+        (
+            "NPM_CONFIG_REGISTRY".to_string(),
+            "https://npm.registry.example/".to_string(),
+        ),
+        (
+            "BUN_CONFIG_REGISTRY".to_string(),
+            "https://bun.registry.example/".to_string(),
+        ),
+    ];
+
+    aube_util::update_engine_context(|ctx| ctx.read_bun_config = true);
+    let config = NpmConfig::load_with_env(dir.path(), &env);
+    aube_util::update_engine_context(|ctx| ctx.read_bun_config = false);
+
+    assert_eq!(config.registry, "https://bun.registry.example/");
+}
+
 #[test]
 fn load_with_env_npm_config_registry_overrides_project_file() {
     // Integration-ish: `load_with_env` stitches file config and
