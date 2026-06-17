@@ -36,14 +36,22 @@
 //!   On a fresh resolve with every advisory backend off and no prior
 //!   lockfile to inherit from, the floor turns off with the gate.
 //! - **cooling window** — the resolved version's recorded publish time
-//!   (the lockfile-graph `time:` data the resolver records whenever
-//!   `minimumReleaseAge` is active) is older than the
-//!   `minimumReleaseAge` window. Unknown publish time fails closed:
-//!   the pnpm `time:` block only persists direct-dep entries, so
-//!   transitive deps on a frozen reinstall fall back to deny+warn
-//!   rather than being trusted without evidence. `minimumReleaseAge =
-//!   0` disables the floor entirely — it consults the cooling defense,
-//!   it never substitutes for it.
+//!   (the lockfile-graph `time:` data the resolver records in-memory
+//!   whenever `minimumReleaseAge` is active) is older than the
+//!   `minimumReleaseAge` window. Unknown publish time fails closed *on a
+//!   fresh resolve* — a missing time there means the package never
+//!   cleared resolution-time vetting. On a **frozen** install
+//!   (`lockfile_vetted`) an unknown time instead *waives* the window:
+//!   since #892 (commit `2b61eaa`) the lockfile no longer persists
+//!   `time:` data under non-time-based resolution, so a frozen reinstall
+//!   legitimately has no times, and the cooling window — a
+//!   resolution-time defense against pulling a brand-new version — has
+//!   nothing to defend against when the install pulls nothing new. A
+//!   known-but-too-young time still denies even when frozen; only the
+//!   *absence* is waived, and only when `lockfile_vetted`. The other
+//!   gates (registry provenance, advisory vetting, the allowlist) still
+//!   apply. `minimumReleaseAge = 0` disables the floor entirely — it
+//!   consults the cooling defense, it never substitutes for it.
 //!
 //! `aube rebuild` does not consult the floor: no advisory gate runs
 //! there, and `aube rebuild <name>` already bypasses the policy for
@@ -198,10 +206,9 @@ impl DefaultTrustFloor {
         if !aube_scripts::is_default_trusted(pkg.registry_name()) {
             return false;
         }
-        // Cooling window, fail-closed on unknown publish time. The
-        // resolver keys fresh entries by dep_path (peer suffix
-        // included); the pnpm lockfile round-trip re-keys them as
-        // canonical `name@version`. Probe all spellings.
+        // Cooling window. The resolver keys fresh entries by dep_path
+        // (peer suffix included); the pnpm lockfile round-trip re-keys
+        // them as canonical `name@version`. Probe all spellings.
         let canonical = format!("{}@{}", pkg.registry_name(), pkg.version);
         let aliased = format!("{}@{}", pkg.name, pkg.version);
         let published = times
@@ -209,8 +216,25 @@ impl DefaultTrustFloor {
             .or_else(|| times.get(&aliased))
             .or_else(|| times.get(&pkg.dep_path));
         match published {
+            // Known publish time: enforce the window on every install.
             Some(t) => t.as_str() <= cutoff,
-            None => false,
+            // Unknown publish time. On a FRESH resolve the resolver
+            // records `time:` data in-memory whenever `minimumReleaseAge`
+            // is active, so a missing time means the package never cleared
+            // resolution-time vetting — fail closed. On a FROZEN install
+            // (`lockfile_vetted`) the graph is inherited from a lockfile
+            // whose versions were already pinned and vetted when it was
+            // written; the cooling window is a *resolution-time* defense
+            // (don't pull a brand-new version), and a frozen install pulls
+            // nothing new. Since `2b61eaa` the lockfile no longer persists
+            // `time:` data under non-time-based resolution (upstream #892),
+            // so `times` is legitimately empty on a frozen reinstall — and
+            // re-applying the age gate against that absence would wrongly
+            // deny build scripts that ran for whoever locked the file. The
+            // other gates (registry provenance, advisory vetting via
+            // `lockfile_vetted`, the allowlist) all still applied above, so
+            // waiving *only* the cooling window here keeps the floor sound.
+            None => self.lockfile_vetted,
         }
     }
 }
@@ -447,22 +471,42 @@ mod tests {
         );
     }
 
-    /// Lockfile vetting does not weaken the other gates: a frozen
-    /// install still fails closed on an unknown / too-young publish
-    /// time, because the cooling window is the vetting signal it
-    /// inherits — there's nothing to inherit without it.
+    /// Frozen install + a KNOWN publish time still enforces the cooling
+    /// window: a too-young pinned version must not floor. The window is
+    /// only waived when the time is *absent* (see the next test), never
+    /// overridden when it is present and fails the gate.
     #[test]
-    fn frozen_install_still_requires_the_cooling_window() {
+    fn frozen_install_still_enforces_the_window_when_the_time_is_known() {
         let pkg = listed_pkg();
         let floor = frozen_floor();
         let young = times_published_minutes_ago(&pkg, 60);
         assert!(
             !floor.trusts(&pkg, &young),
-            "a too-young version must not floor even on a frozen install"
+            "a too-young version with a known publish time must not floor, even frozen"
+        );
+    }
+
+    /// Frozen install + an UNKNOWN publish time waives the cooling
+    /// window. The lockfile no longer persists `time:` data under
+    /// non-time-based resolution (upstream #892, commit `2b61eaa`), so a
+    /// frozen reinstall legitimately has empty `times`. The cooling
+    /// window is a resolution-time defense and a frozen install pulls
+    /// nothing new, so the floor inherits the lockfile's vetting and
+    /// trusts the (registry-only, allowlisted, advisory-vetted) package.
+    /// A FRESH install with the same empty map still fails closed — the
+    /// waiver is gated on `lockfile_vetted`.
+    #[test]
+    fn frozen_install_waives_the_window_when_the_publish_time_is_unknown() {
+        let pkg = listed_pkg();
+        assert!(
+            frozen_floor().trusts(&pkg, &BTreeMap::new()),
+            "a frozen install must trust an allowlisted package when the lockfile \
+             carries no publish time (post-#892 non-time-based lockfiles)"
         );
         assert!(
-            !floor.trusts(&pkg, &BTreeMap::new()),
-            "unknown publish time must fail closed even on a frozen install"
+            !active_floor().trusts(&pkg, &BTreeMap::new()),
+            "a fresh resolve with no recorded publish time must still fail closed — \
+             the waiver is gated on lockfile_vetted"
         );
     }
 
