@@ -939,16 +939,17 @@ impl<'a> ResolveDriver<'a> {
 
         // Record the picked version's publish time so (a) the
         // time-based cutoff computation at the end of wave 0 can
-        // derive `published_by` from the directs and (b) the
-        // lockfile write emits a `time:` block. Gated on
-        // `should_record_times()` — i.e. `resolution-mode=time-based`
-        // only — because that's the sole case pnpm persists `time:`
-        // to the lockfile (see `should_record_times` for the pnpm
-        // source trail). pnpm captures `publishedAt` per-package
-        // opportunistically in memory regardless of mode, but only
-        // aggregates it into the lockfile under time-based resolution,
-        // so Highest-mode installs (incl. `minimumReleaseAge` /
-        // `trustPolicy`) stay `time:`-free here too.
+        // derive `published_by` from the directs, (b) the lockfile
+        // write emits a `time:` block under time-based mode, and (c)
+        // the embedder's `defaultTrust` floor can read `graph.times`
+        // for its cooling-window gate. Gated on
+        // `should_keep_in_memory_times()` — time-based OR
+        // `minimumReleaseAge` OR `trustPolicy=no-downgrade` — because
+        // all three need the in-memory publish dates during the
+        // resolve. Lockfile-`time:` persistence is gated separately at
+        // the write site (`persist_times`), so a Highest-mode install
+        // with `minimumReleaseAge` keeps `graph.times` populated yet
+        // still writes a `time:`-free lockfile (pnpm parity).
         //
         // Fall back to the prior lockfile's time when the
         // packument doesn't carry one — `aube update` filters
@@ -959,7 +960,7 @@ impl<'a> ResolveDriver<'a> {
         // the dep's `time:` entry on every update, even when
         // the version didn't change. Reported in discussion
         // #345 (mrazauskas).
-        if self.resolver.should_record_times() {
+        if self.resolver.should_keep_in_memory_times() {
             if let Some(t) = picked_publish_time.as_ref() {
                 self.resolved_times.insert(dep_path.clone(), t.clone());
             } else if let Some(g) = self.existing
@@ -2047,7 +2048,7 @@ impl<'a> ResolveDriver<'a> {
             // next lockfile write preserves the existing `time:`
             // entry even when this install reuses the locked version
             // without re-fetching a packument.
-            if self.resolver.should_record_times()
+            if self.resolver.should_keep_in_memory_times()
                 && let Some(g) = self.existing
                 && let Some(t) = g.times.get(&dep_path)
             {

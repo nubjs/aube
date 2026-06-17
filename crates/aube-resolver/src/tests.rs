@@ -972,6 +972,101 @@ async fn minimum_release_age_fetches_full_packument_directly() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// Regression guard for the upstream #892 merge-sync hazard: under the
+/// DEFAULT `resolution-mode=highest` with `minimumReleaseAge` active,
+/// the resolver must still keep the picked versions' publish times in
+/// the in-memory `graph.times`. #892 narrowed the in-memory recording
+/// gate to time-based mode only, which left `graph.times` empty on the
+/// default install — failing the embedder's `defaultTrust` cooling-window
+/// floor closed (allowlisted native packages got denied). The fix
+/// decoupled in-memory recording (kept wide: time-based OR
+/// `minimumReleaseAge` OR `trustPolicy=no-downgrade`) from lockfile
+/// `time:` PERSISTENCE (still time-based-only, gated at the write site).
+/// A future `git merge upstream/main` that re-narrows
+/// `should_keep_in_memory_times` would re-break the floor; this test
+/// catches it. Uses a direct mock registry (no primer path) so it
+/// exercises the normal pick-site recording, not the primer-refetch
+/// heal the sibling test covers.
+#[tokio::test]
+async fn highest_mode_with_minimum_release_age_keeps_in_memory_times() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut packument = make_packument("foo", &["1.0.0"], "1.0.0");
+    packument.modified = Some("2024-01-01T00:00:00.000Z".to_string());
+    packument
+        .time
+        .insert("1.0.0".to_string(), "2024-01-01T00:00:00.000Z".to_string());
+    let body = serde_json::to_vec(&packument).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            });
+        }
+    });
+
+    let base = std::env::temp_dir().join(format!(
+        "aube-resolver-mra-times-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cache_dir = base.join("packuments");
+    let full_cache_dir = base.join("packuments-full");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::create_dir_all(&full_cache_dir).unwrap();
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(&registry));
+    // Default resolution mode is Highest — intentionally NOT time-based.
+    // `minimumReleaseAge` is the only policy active, so the in-memory
+    // recording must come from `should_keep_in_memory_times`'s
+    // `minimum_release_age.is_some()` branch.
+    let mut resolver = Resolver::new(client)
+        .with_packument_cache(cache_dir)
+        .with_packument_full_cache(full_cache_dir)
+        .with_minimum_release_age(Some(MinimumReleaseAge {
+            minutes: 60,
+            ..Default::default()
+        }));
+    assert_eq!(
+        resolver.resolution_mode,
+        ResolutionMode::Highest,
+        "test must run in the default Highest mode to guard the regression"
+    );
+    let mut manifest = PackageJson::default();
+    manifest
+        .dependencies
+        .insert("foo".to_string(), "1.0.0".to_string());
+
+    let graph = resolver.resolve(&manifest, None).await.unwrap();
+
+    assert!(graph_has_package(&graph, "foo", "1.0.0"));
+    assert_eq!(
+        graph.times.get("foo@1.0.0").map(String::as_str),
+        Some("2024-01-01T00:00:00.000Z"),
+        "Highest mode + minimumReleaseAge must keep the publish time in \
+         graph.times for the defaultTrust floor; got {:?}",
+        graph.times
+    );
+    server.abort();
+    let _ = std::fs::remove_dir_all(base);
+}
+
 /// Regression: a primer-seeded pick that satisfies the range must still
 /// record the package's publish time when `minimumReleaseAge` is active.
 /// The bundled primer's `time` data is sparse, so a primer hit could

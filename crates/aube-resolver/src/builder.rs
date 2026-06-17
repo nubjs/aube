@@ -136,29 +136,32 @@ impl Resolver {
         self
     }
 
-    /// Whether the resolver should round-trip registry `time:` entries
-    /// into the output graph (and from there into the lockfile's
-    /// top-level `time:` block).
+    /// Whether the resolver should keep the picked versions' publish
+    /// times in the in-memory output graph (`graph.times`).
     ///
-    /// pnpm writes `time:` to the lockfile *only* under
-    /// `resolution-mode=time-based`. In `resolveDependencies.ts` the
-    /// `time` map is populated solely inside the `if (ctx.resolutionMode
-    /// === 'time-based')` branch, and `updateLockfile` then guards
-    /// `newLockfile.time = …` behind that map being truthy. The
-    /// `minimumReleaseAge` and `trustPolicy=no-downgrade` policies do
-    /// *not* persist `time:` — pnpm enforces them from a separate
-    /// on-disk metadata cache (re-fetching full metadata as needed), so
-    /// its lockfiles stay `time:`-free even with both policies active.
+    /// This governs the *in-memory* map only. It is intentionally WIDER
+    /// than the lockfile-`time:`-persistence gate: `minimumReleaseAge`
+    /// and `trustPolicy=no-downgrade` both need the publish dates during
+    /// the resolve, and the embedder's `defaultTrust` floor reads
+    /// `graph.times` to enforce its cooling-window gate against
+    /// allowlisted native packages. Dropping the times here (as a narrow
+    /// `TimeBased`-only gate would) leaves `graph.times` empty under the
+    /// default `resolution-mode=highest` + `minimumReleaseAge=1440`
+    /// install, which fails the floor closed.
     ///
-    /// aube mirrors that here: the two policies still drive `needs_time`
-    /// (we fetch the publish dates to enforce them in-memory during the
-    /// resolve), but they no longer leak a `time:` block that pnpm would
-    /// never write. Including them previously produced a spurious `time:`
-    /// block on every default install (aube defaults `trustPolicy` to
-    /// `no-downgrade` and `minimumReleaseAge` to 1440), which showed up
-    /// as churn in a pnpm ↔ aube lockfile diff.
-    pub(crate) fn should_record_times(&self) -> bool {
+    /// pnpm writes `time:` to the *lockfile* only under
+    /// `resolution-mode=time-based` — it enforces `minimumReleaseAge` /
+    /// `trustPolicy` from a separate on-disk metadata cache, so its
+    /// lockfiles stay `time:`-free even with both policies active. aube
+    /// mirrors that, but the gate lives at the WRITE site (the
+    /// `persist_times` flag threaded into the lockfile writers), NOT
+    /// here: the in-memory times are always available to in-process
+    /// consumers, and the writer independently decides whether to
+    /// serialize a `time:` block.
+    pub(crate) fn should_keep_in_memory_times(&self) -> bool {
         self.resolution_mode == ResolutionMode::TimeBased
+            || self.minimum_release_age.is_some()
+            || self.dependency_policy.trust_policy == crate::TrustPolicy::NoDowngrade
     }
 
     /// Override the default `auto-install-peers=true` behavior. pnpm reads

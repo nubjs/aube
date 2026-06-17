@@ -27,7 +27,7 @@ mod materialize;
 // aube reaches them the same way; widening visibility changes no behavior.
 pub mod node_gyp_bootstrap;
 mod resolve;
-mod settings;
+pub(crate) mod settings;
 mod side_effects_cache;
 mod startup;
 mod summary;
@@ -1778,11 +1778,22 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 // snapshot metadata (`optional: true`, `transitivePeerDependencies`)
                 // before the write and before the host-only `filter_graph` below.
                 crate::commands::prepare_resolved_graph_for_lockfile_write(&mut graph);
+                // pnpm persists a top-level `time:` block only under
+                // `resolution-mode=time-based`; in every other mode the
+                // lockfile stays `time:`-free even when the resolver kept
+                // publish times in memory for `minimumReleaseAge` /
+                // `trustPolicy` / the `defaultTrust` floor. Strip them on
+                // the writer's view (a clone) WITHOUT mutating the shared
+                // `graph` — the floor clones `graph` further down and
+                // still needs `graph.times`.
+                let persist_times = settings::resolve_resolution_mode(&settings_ctx)
+                    == aube_resolver::ResolutionMode::TimeBased;
+                let write_graph = lockfile_dir::lockfile_graph_for_write(&graph, persist_times);
                 if shared_workspace_lockfile || !has_workspace {
                     let written_path = write_lockfile_dir_remapped(
                         &lockfile_dir,
                         &lockfile_importer_key,
-                        &graph,
+                        &write_graph,
                         &manifest,
                         write_kind,
                     )
@@ -1800,7 +1811,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 } else {
                     write_per_project_lockfiles(
                         &cwd,
-                        &graph,
+                        &write_graph,
                         &manifests,
                         write_kind,
                         per_project_write_selection.as_ref(),

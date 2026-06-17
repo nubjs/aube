@@ -23,7 +23,9 @@ fn parse_resolution_mode(s: &str) -> Option<aube_resolver::ResolutionMode> {
 /// (CLI > env > `.npmrc` > `aube-workspace.yaml` > default). The `.cli`
 /// source carries `--resolution-mode` via `to_cli_flag_bag`, so every
 /// caller feeds the same ctx and gets the same answer.
-fn resolve_resolution_mode(ctx: &aube_settings::ResolveCtx<'_>) -> aube_resolver::ResolutionMode {
+pub(crate) fn resolve_resolution_mode(
+    ctx: &aube_settings::ResolveCtx<'_>,
+) -> aube_resolver::ResolutionMode {
     // Legacy alias: pnpm's CLI / `.npmrc` / env accept the shorthand
     // `time` for `time-based`. The generator-side `from_str_normalized`
     // only knows the canonical variants declared in `settings.toml`,

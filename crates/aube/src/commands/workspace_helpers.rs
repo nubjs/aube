@@ -98,6 +98,24 @@ pub(crate) fn prepare_resolved_graph_for_lockfile_write(graph: &mut aube_lockfil
     aube_resolver::platform::mark_transitive_peer_dependencies(graph);
 }
 
+/// Resolve the effective `ResolutionMode` for a project directory from
+/// its config chain (`.npmrc` / `aube-workspace.yaml` / env), without
+/// CLI overrides. Used by the non-install rewrite commands (update /
+/// remove / dedupe / audit) to decide whether a top-level `time:` block
+/// should be persisted — pnpm writes it only under
+/// `resolution-mode=time-based`. Best-effort: a config-read failure
+/// degrades to the default (`Highest`).
+pub(crate) fn resolution_mode_for_cwd(cwd: &Path) -> aube_resolver::ResolutionMode {
+    let files = crate::commands::FileSources::load(cwd);
+    let yaml_root = crate::dirs::find_workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let raw_workspace = aube_manifest::workspace::load_both(&yaml_root)
+        .map(|(_, raw)| raw)
+        .unwrap_or_default();
+    let env = aube_settings::values::process_env();
+    let ctx = files.ctx(&raw_workspace, env, &[]);
+    crate::commands::install::settings::resolve_resolution_mode(&ctx)
+}
+
 /// Write lockfile preserving existing format and log the file name.
 pub(crate) fn write_and_log_lockfile(
     cwd: &Path,
@@ -109,9 +127,22 @@ pub(crate) fn write_and_log_lockfile(
     // lockfile from a fresh graph, and dropping the patch block here
     // would desync the lockfile from the manifest's
     // `patchedDependencies` until the next `install`.
+    //
+    // Also apply the `time:`-persistence gate: the resolver keeps
+    // publish times in memory whenever `minimumReleaseAge` /
+    // `trustPolicy` / time-based mode is active, but pnpm serializes a
+    // top-level `time:` block to the lockfile *only* under time-based
+    // resolution. A non-time-based rewrite therefore drops any `time:`
+    // block (incl. a stray one carried in from the prior lockfile),
+    // matching pnpm and the install write path.
+    let persist_times =
+        resolution_mode_for_cwd(cwd) == aube_resolver::ResolutionMode::TimeBased;
     let graph = &{
         let mut g = graph.clone();
         crate::patches::record_patches_on_graph(cwd, &mut g)?;
+        if !persist_times {
+            g.times.clear();
+        }
         g
     };
     // Preserve the project's resolved lockfile format — the existing

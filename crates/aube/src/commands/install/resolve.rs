@@ -311,11 +311,18 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
     // (`optional: true`, `transitivePeerDependencies`) so `--lockfile-only`
     // output stays byte-identical to a regular install.
     crate::commands::prepare_resolved_graph_for_lockfile_write(&mut graph);
+    // Same `time:`-persistence gate as the regular install write path:
+    // pnpm writes a top-level `time:` block only under time-based mode,
+    // so a Highest-mode `--lockfile-only` run stays `time:`-free even
+    // with `minimumReleaseAge` keeping publish times in memory.
+    let persist_times = super::settings::resolve_resolution_mode(settings_ctx)
+        == aube_resolver::ResolutionMode::TimeBased;
+    let write_graph = super::lockfile_dir::lockfile_graph_for_write(&graph, persist_times);
     if shared_workspace_lockfile || !has_workspace {
         let lo_written = write_lockfile_dir_remapped(
             lockfile_dir,
             lockfile_importer_key,
-            &graph,
+            &write_graph,
             manifest,
             lo_write_kind,
         )
@@ -331,7 +338,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
     } else {
         write_per_project_lockfiles(
             cwd,
-            &graph,
+            &write_graph,
             manifests,
             lo_write_kind,
             per_project_write_selection,

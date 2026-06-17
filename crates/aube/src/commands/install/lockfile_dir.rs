@@ -1,3 +1,33 @@
+/// Return the graph the lockfile writer should serialize, honoring the
+/// `persist_times` gate.
+///
+/// The resolver keeps publish times in `graph.times` whenever any of
+/// time-based mode / `minimumReleaseAge` / `trustPolicy=no-downgrade`
+/// is active (the in-memory map feeds the cutoff computation and the
+/// embedder's `defaultTrust` floor). pnpm, however, persists a
+/// top-level `time:` block to the lockfile *only* under
+/// `resolution-mode=time-based`. This decouples the two: when
+/// `persist_times` is false (any non-time-based mode), the writer sees a
+/// `times`-free clone so the lockfile stays byte-for-byte pnpm-parity,
+/// while the live in-memory graph (which the floor clones) keeps its
+/// times intact.
+///
+/// Returns a borrow when `persist_times` is true (the common
+/// time-based path and the no-times-recorded path both write the graph
+/// unchanged) and an owned `times`-stripped clone otherwise.
+pub(super) fn lockfile_graph_for_write(
+    graph: &aube_lockfile::LockfileGraph,
+    persist_times: bool,
+) -> std::borrow::Cow<'_, aube_lockfile::LockfileGraph> {
+    if persist_times || graph.times.is_empty() {
+        std::borrow::Cow::Borrowed(graph)
+    } else {
+        let mut stripped = graph.clone();
+        stripped.times.clear();
+        std::borrow::Cow::Owned(stripped)
+    }
+}
+
 /// Read a lockfile from `lockfile_dir` and remap its importer key
 /// for the current project from the project's relative-path key to
 /// `"."`, so the rest of the install pipeline can keep treating the
