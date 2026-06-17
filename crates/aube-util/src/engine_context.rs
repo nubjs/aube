@@ -103,6 +103,22 @@ pub struct EngineContext {
     /// assigns no policy.
     pub yarn_is_classic: bool,
 
+    /// Whether aube honors Bun's `BUN_CONFIG_REGISTRY` / `BUN_CONFIG_TOKEN`
+    /// install/registry environment variables, translating them onto the
+    /// existing npmrc-shaped registry/token settings. `false` (default)
+    /// preserves upstream aube behavior. Embedders such as nub set this only
+    /// when Bun is the active incumbent; under nub identity or another PM,
+    /// Bun-named config is another tool's state and must not be read.
+    ///
+    /// Bun's semantics (mirrored here): `BUN_CONFIG_REGISTRY` sets the default
+    /// registry and is checked *before* `NPM_CONFIG_REGISTRY` /
+    /// `npm_config_registry` (so it outranks them); `BUN_CONFIG_TOKEN` sets the
+    /// default registry's auth token, checked before `NPM_CONFIG_TOKEN` /
+    /// `npm_config_token`. Only these two — the high-impact CI-credentials
+    /// pair — are mapped; the wider `BUN_CONFIG_*` install-behavior family
+    /// (retry counts, lockfile toggles, …) is not honored.
+    pub read_bun_config: bool,
+
     /// Whether manifest-root map settings owned by an embedder whose
     /// `manifest_namespace` is empty are read as the tool's native config
     /// surface. `false` (default) preserves upstream behavior and keeps
@@ -166,6 +182,7 @@ impl Default for EngineContext {
             read_branded_pnpm_config: true,
             read_yarn_config: false,
             yarn_is_classic: false,
+            read_bun_config: false,
             read_manifest_root_config: false,
             pnpmfile_default_enabled: true,
             synthetic_user_npmrc_entries: Vec::new(),
@@ -227,6 +244,7 @@ mod tests {
         assert!(ctx.read_branded_pnpm_config);
         assert!(!ctx.read_yarn_config);
         assert!(!ctx.yarn_is_classic);
+        assert!(!ctx.read_bun_config);
         assert!(!ctx.read_manifest_root_config);
         assert!(ctx.pnpmfile_default_enabled);
         assert!(ctx.synthetic_user_npmrc_entries.is_empty());
