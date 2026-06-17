@@ -197,6 +197,55 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     };
 
     if linker.uses_global_virtual_store() {
+        // Source-backed deps that get shared globally (git / remote
+        // tarball) carry no registry integrity, so their graph-hash
+        // identity is just their `<url>#<commit>` coordinate. Two
+        // installs of the same coordinate can still materialize
+        // different bytes — most commonly a git dep whose `prepare`
+        // built `dist/` versus the same commit installed under
+        // `--ignore-scripts` (raw checkout). Fingerprint the actual
+        // imported tree and fold it into the hash so those two land at
+        // distinct GVS paths instead of the first writer's tree leaking
+        // into the second project.
+        let mut content_hashes: aube_util::collections::FxMap<String, String> =
+            aube_util::collections::FxMap::default();
+        for (dep_path, pkg) in &graph_for_link.packages {
+            let is_shareable_source = pkg
+                .local_source
+                .as_ref()
+                .is_some_and(|s| s.is_globally_shareable());
+            if !is_shareable_source {
+                continue;
+            }
+            // The fingerprint *defines* this dep's GVS path, and the
+            // linker keys its dependents' sibling symlinks off the same
+            // hash. Silently dropping a dep whose index is absent would
+            // compute the parent's path with a fingerprint-less hash
+            // while the dep itself was materialized at the
+            // fingerprinted path — a dangling sibling and a runtime
+            // `Cannot find module`. The fetch driver guarantees every
+            // in-graph source dep is imported (and thus indexed), so a
+            // miss is a contract violation, not a recoverable cache
+            // gap: there is no `store.load_index` fallback because
+            // git/tarball indices aren't persisted by coordinate (a
+            // prepared tree and its raw `--ignore-scripts` checkout
+            // would collide). Fail loudly to keep the invariant honest.
+            let index = package_indices.get(dep_path).ok_or_else(|| {
+                miette!(
+                    code = aube_codes::errors::ERR_AUBE_MISSING_PACKAGE_INDEX,
+                    "internal: globally-shared source dependency {dep_path} is in the link \
+                     graph but missing from package_indices; cannot fingerprint its content \
+                     for the global virtual store"
+                )
+            })?;
+            content_hashes.insert(
+                dep_path.clone(),
+                aube_store::index_content_fingerprint(index),
+            );
+        }
+        let content_hash_fn =
+            |dep_path: &str| -> Option<String> { content_hashes.get(dep_path).cloned() };
+
         // Reuse the prewarm task's `compute_graph_hashes` output when
         // the link-phase graph matches what the prewarm hashed. The
         // prewarm hashed the unfiltered post-resolve graph; if no
@@ -205,8 +254,15 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         // hashes are byte-identical to a fresh compute. Falling
         // through to a fresh compute keeps the contract simple
         // whenever the graphs diverge.
+        //
+        // The prewarm runs concurrently with fetch and so can't see the
+        // not-yet-imported source-dep trees; when any globally-shared
+        // source dep is present its content fingerprint is missing from
+        // the prewarm hashes, so skip the reuse and recompute here where
+        // every index is available.
         let cached_hashes = prewarm_graph_hashes.filter(|arc| {
-            arc.node_hash.len() == graph_for_link.packages.len()
+            content_hashes.is_empty()
+                && arc.node_hash.len() == graph_for_link.packages.len()
                 && graph_for_link
                     .packages
                     .keys()
@@ -226,11 +282,12 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
                     aube_scripts::AllowDecision::Allow
                 )
             };
-            aube_lockfile::graph_hash::compute_graph_hashes_with_patches(
+            aube_lockfile::graph_hash::compute_graph_hashes_full(
                 graph_for_link,
                 &allow,
                 engine.as_ref(),
                 &patch_hash_fn,
+                &content_hash_fn,
             )
         };
         linker = linker.with_graph_hashes(graph_hashes);

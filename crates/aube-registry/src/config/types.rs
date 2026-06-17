@@ -82,6 +82,9 @@ pub struct NpmConfig {
     pub scoped_registries: BTreeMap<String, String>,
     /// Auth config keyed by registry URL prefix (e.g., "//registry.example.com/")
     pub auth_by_uri: BTreeMap<String, AuthConfig>,
+    /// Scope-specific auth config keyed by registry URL prefix, then
+    /// package scope (e.g., "//npm.pkg.github.com/" -> "@org").
+    pub scoped_auth_by_uri: BTreeMap<String, BTreeMap<String, AuthConfig>>,
     /// Proxy URL for outgoing HTTPS requests (`https-proxy` / `HTTPS_PROXY`).
     pub https_proxy: Option<String>,
     /// Proxy URL for outgoing HTTP requests (`proxy` / `http-proxy` / `HTTP_PROXY`).
@@ -133,6 +136,15 @@ pub struct AuthConfig {
     pub tls: TlsConfig,
 }
 
+impl AuthConfig {
+    pub(crate) fn has_tls_material(&self) -> bool {
+        !self.tls.ca.is_empty()
+            || self.tls.cafile.is_some()
+            || self.tls.cert.is_some()
+            || self.tls.key.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
     pub ca: Vec<String>,
@@ -153,6 +165,7 @@ impl Default for NpmConfig {
             registry: String::new(),
             scoped_registries: BTreeMap::new(),
             auth_by_uri: BTreeMap::new(),
+            scoped_auth_by_uri: BTreeMap::new(),
             https_proxy: None,
             http_proxy: None,
             no_proxy: None,

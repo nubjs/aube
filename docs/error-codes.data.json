@@ -435,6 +435,12 @@
       "exit_code": null
     },
     {
+      "name": "WARN_AUBE_PNPMFILE_CHECKSUM_FAILED",
+      "category": "pnpmfile / hooks",
+      "description": "Reading the local pnpmfile for checksum computation failed; the lockfile's `pnpmfileChecksum` field is omitted so a later install will re-resolve instead of trusting a stale value.",
+      "exit_code": null
+    },
+    {
       "name": "WARN_AUBE_HOOK_IMPORTER_MUTATED",
       "category": "pnpmfile / hooks",
       "description": "A pnpmfile `afterAllResolved` hook mutated `importers[...]`; aube ignored the edit.",
@@ -762,6 +768,12 @@
       "name": "WARN_AUBE_YARN_BERRY_UNSUPPORTED",
       "category": "Lockfile",
       "description": "A Yarn Berry `patch:` / `portal:` / `exec:` protocol — or any unrecognized protocol — was found in `yarn.lock`. Entry was skipped.",
+      "exit_code": null
+    },
+    {
+      "name": "WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX",
+      "category": "Lockfile",
+      "description": "A pnpm dep_path peer suffix had unbalanced parentheses (a truncated or hand-corrupted lockfile entry). The key is preserved verbatim instead of silently dropping everything after the `(`, so a later install surfaces the bad entry rather than mis-resolving it.",
       "exit_code": null
     },
     {

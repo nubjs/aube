@@ -25,86 +25,28 @@
 /// literal `"current"` inside any array expands to the same host value
 /// so users can write `["current", "linux"]` to keep their native
 /// platform *and* also resolve optionals for Linux.
-///
-/// `explicit_combinations` sidesteps the cartesian expansion entirely —
-/// [`aube_lock_default`] uses it to emit a hand-picked matrix that
-/// drops rare combinations (darwin-x64) without shrinking the OS / CPU
-/// lists a user might inspect.
 #[derive(Debug, Clone, Default)]
 pub struct SupportedArchitectures {
     pub os: Vec<String>,
     pub cpu: Vec<String>,
     pub libc: Vec<String>,
-    /// When `Some`, `combinations()` returns these triples verbatim
-    /// instead of computing `os` × `cpu` × `libc`. Lets a preset prune
-    /// individual (os, cpu, libc) combinations the cartesian product
-    /// would otherwise include.
-    pub explicit_combinations: Option<Vec<(String, String, String)>>,
+    /// When true, [`is_supported`] accepts every package regardless of
+    /// its `os`/`cpu`/`libc`. Set at *resolve* time for the committed,
+    /// cross-platform lockfiles (pnpm-lock.yaml, aube-lock.yaml,
+    /// bun.lock) so every optional-dep variant a package declares lands
+    /// in the lockfile — exactly what pnpm and bun both record,
+    /// regardless of the host running the resolve. Link-time filtering
+    /// (`filter_graph`) and the streaming-fetch gate run against the
+    /// host triple instead, so `node_modules` and the tarball downloads
+    /// stay trimmed to the host.
+    pub accept_all: bool,
 }
 
 impl SupportedArchitectures {
-    /// Wide default used when resolving into a cross-platform lockfile
-    /// (`aube-lock.yaml`, `pnpm-lock.yaml`, `bun.lock`,
-    /// `package-lock.json`) with no user-declared
-    /// `pnpm.supportedArchitectures`. Covers the common npm OS / CPU /
-    /// libc combinations so optional native deps for every major
-    /// platform land in the lockfile on a first resolve — a project
-    /// resolved on macOS installs correctly on Linux CI without the
-    /// user having to hand-edit their manifest, matching what pnpm,
-    /// bun, and npm themselves record. Yarn classic output stays
-    /// host-only — its lockfile has no per-package os/cpu metadata to
-    /// carry the extra variants.
-    ///
-    /// darwin-x64 is not in the baseline matrix: Apple Silicon is the
-    /// shipping Mac platform, and several major native package
-    /// ecosystems (sharp, swc) have already dropped Intel Mac binaries,
-    /// so an Apple Silicon developer's lockfile doesn't need to bake in
-    /// Intel Mac natives for other contributors. The host's own triple
-    /// is always added to the set, though — an Intel Mac user installing
-    /// on that same machine gets darwin-x64 natives because the host
-    /// triple joins the matrix here. Exotic hosts (freebsd, ppc64, …)
-    /// get the same treatment: their native deps still install for the
-    /// user, and the wide matrix covers everyone else.
-    pub fn aube_lock_default() -> Self {
-        let mut combos = vec![
-            ("darwin".to_string(), "arm64".to_string(), String::new()),
-            ("linux".to_string(), "x64".to_string(), "glibc".to_string()),
-            ("linux".to_string(), "x64".to_string(), "musl".to_string()),
-            (
-                "linux".to_string(),
-                "arm64".to_string(),
-                "glibc".to_string(),
-            ),
-            ("linux".to_string(), "arm64".to_string(), "musl".to_string()),
-            ("win32".to_string(), "x64".to_string(), String::new()),
-            ("win32".to_string(), "arm64".to_string(), String::new()),
-        ];
-        // Ensure the host's own triple is always included. Without this
-        // step an Intel Mac user (darwin-x64) would silently lose their
-        // own native optional deps — the cross-platform widening dropped
-        // them from the matrix, and the post-resolve `filter_graph` can't
-        // bring back packages that never entered the graph in the first
-        // place.
-        let host = host_triple();
-        let host_triple_owned = (host.0.to_string(), host.1.to_string(), host.2.to_string());
-        if !combos.contains(&host_triple_owned) {
-            combos.push(host_triple_owned);
-        }
-        Self {
-            os: Vec::new(),
-            cpu: Vec::new(),
-            libc: Vec::new(),
-            explicit_combinations: Some(combos),
-        }
-    }
-
     /// Expand any `"current"` entries to the host triple and default
     /// empty arrays to `[host]`. The result is a non-empty list of
     /// (os, cpu, libc) combinations the caller can test against.
     fn combinations(&self) -> Vec<(String, String, String)> {
-        if let Some(ref explicit) = self.explicit_combinations {
-            return explicit.clone();
-        }
         let host = host_triple();
         let expand = |field: &[String], host_val: &str| -> Vec<String> {
             if field.is_empty() {
@@ -258,6 +200,13 @@ pub fn is_supported(
     pkg_libc: &[String],
     supported: &SupportedArchitectures,
 ) -> bool {
+    // pnpm-lock parity: record every declared variant in the lockfile
+    // regardless of host. Host-only trimming happens later via
+    // `filter_graph` / the streaming-fetch gate, which use the real host
+    // triple rather than this accept-all set.
+    if supported.accept_all {
+        return true;
+    }
     for (os, cpu, libc) in supported.combinations() {
         if !field_matches(pkg_os, &os) {
             continue;
@@ -320,12 +269,16 @@ pub fn filter_graph(
     for pkg in graph.packages.values_mut() {
         let mut removed = Vec::new();
         pkg.optional_dependencies.retain(|name, tail| {
-            let child_key = if package_keys.contains(tail) {
-                tail.clone()
-            } else {
-                format!("{name}@{tail}")
-            };
-            let keep = !ignored.contains(name) && !mismatched_packages.contains(&child_key);
+            // Resolve through every reader convention (incl. the
+            // git/remote-tarball `name@url+<hash>` form) so a
+            // platform-mismatched optional git/tarball child is actually
+            // pruned here rather than surviving until the GC pass below.
+            let child_is_mismatched =
+                match aube_lockfile::resolve_dep_edge(name, tail, |k| package_keys.contains(k)) {
+                    Some(child_key) => mismatched_packages.contains(&child_key),
+                    None => false,
+                };
+            let keep = !ignored.contains(name) && !child_is_mismatched;
             if !keep {
                 removed.push(name.clone());
             }
@@ -351,24 +304,183 @@ pub fn filter_graph(
         }
         if let Some(pkg) = graph.packages.get(&dep_path) {
             for (name, tail) in &pkg.dependencies {
-                // Different lockfile readers use different conventions
-                // for dependency values: the pnpm reader stores the
-                // dep_path *tail* (`"1.2.3"`), while the npm/yarn/bun
-                // readers store the full dep_path (`"foo@1.2.3"`).
-                // Try the raw value first, then the pnpm-style
-                // reconstruction.
-                if graph.packages.contains_key(tail) {
-                    stack.push(tail.clone());
-                } else {
-                    let child_key = format!("{name}@{tail}");
-                    if graph.packages.contains_key(&child_key) {
-                        stack.push(child_key);
-                    }
+                // Resolve the edge through every reader convention,
+                // including the git/remote-tarball `name@url+<hash>` form
+                // — otherwise a canonically-keyed git/tarball child (and
+                // its whole subtree) is unreachable here and gets GC'd.
+                if let Some(child) =
+                    aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
+                {
+                    stack.push(child);
                 }
             }
         }
     }
     graph.packages.retain(|k, _| reachable.contains(k));
+}
+
+/// Set each package's `optional` flag the way pnpm marks the
+/// `snapshots:` section: a package is `optional: true` when it is
+/// reachable *only* through optional dependency edges (the classic case
+/// is every `@esbuild/*` platform native sitting under `esbuild`'s
+/// `optionalDependencies`). pnpm derives this during resolution; aube
+/// recomputes it as a post-resolve pass so freshly resolved lockfiles
+/// carry the same markers pnpm writes instead of an empty `{}` snapshot.
+///
+/// Algorithm: seed a `required` set from every non-optional direct
+/// dependency of every importer, then walk each required package's
+/// *non-optional* edges. A package's non-optional edges are its
+/// `dependencies` minus its `optional_dependencies`, because the pnpm
+/// parser mirrors active optional edges into `dependencies`. Any package
+/// not reached this way is optional. A single fully-required path keeps a
+/// package required even when other paths to it are optional, matching
+/// pnpm.
+pub fn mark_optional_packages(graph: &mut aube_lockfile::LockfileGraph) {
+    use crate::FxHashSet;
+    use aube_lockfile::DepType;
+
+    let mut required: FxHashSet<String> = FxHashSet::default();
+    let mut stack: Vec<String> = Vec::new();
+    for deps in graph.importers.values() {
+        for dep in deps {
+            if dep.dep_type != DepType::Optional {
+                stack.push(dep.dep_path.clone());
+            }
+        }
+    }
+    while let Some(dep_path) = stack.pop() {
+        if !required.insert(dep_path.clone()) {
+            continue;
+        }
+        let Some(pkg) = graph.packages.get(&dep_path) else {
+            continue;
+        };
+        for (name, tail) in &pkg.dependencies {
+            // Skip optional edges. `dependencies` carries pnpm's mirrored
+            // active optionals, so the `optional_dependencies` membership
+            // check is what separates a required edge from an optional one.
+            if pkg.optional_dependencies.contains_key(name) {
+                continue;
+            }
+            // Match `filter_graph`'s child-key convention (incl. the
+            // git/remote-tarball `name@url+<hash>` form) so a required
+            // git/tarball dep isn't mis-marked optional-only.
+            if let Some(child) =
+                aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
+            {
+                stack.push(child);
+            }
+        }
+    }
+    for (dep_path, pkg) in graph.packages.iter_mut() {
+        pkg.optional = !required.contains(dep_path);
+    }
+}
+
+/// Populate each package's `transitive_peer_dependencies` the way pnpm
+/// does: a snapshot lists every peer name that some package in its
+/// dependency subtree declares but leaves unresolved (the peers that
+/// "bubble up" to be provided by a consumer). A peer that *was* resolved
+/// is mirrored into the declaring package's `dependencies` (pnpm and aube
+/// both do this — e.g. `@babel/core` lands in
+/// `@babel/helper-module-transforms`'s deps), so `peer_dependencies` minus
+/// `dependencies` is exactly the unresolved set. Those unresolved names are
+/// propagated to every ancestor; a package never lists its own peers.
+///
+/// Runs on the final, peer-contextualized graph (after `apply_peer_contexts`
+/// and the dedupe passes) so dep-path tails carry their peer suffixes.
+pub fn mark_transitive_peer_dependencies(graph: &mut aube_lockfile::LockfileGraph) {
+    use crate::{FxHashMap, FxHashSet};
+    use std::collections::BTreeSet;
+
+    // Reverse edges (child dep_path -> the parents that depend on it) plus
+    // each package's unresolved declared peers.
+    let mut parents: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    let mut unresolved: FxHashMap<String, Vec<String>> = FxHashMap::default();
+
+    for (dep_path, pkg) in &graph.packages {
+        for (name, tail) in pkg
+            .dependencies
+            .iter()
+            .chain(pkg.optional_dependencies.iter())
+        {
+            // Skip resolved-peer edges. A dependency the package also
+            // declares as a peer (e.g. `eslint` inside an eslint plugin) is
+            // an injected peer, not an owned dependency — pnpm satisfies it
+            // from the consumer's context and does not bubble that peer's
+            // own transitive peers through the edge. Mirroring that keeps a
+            // plugin from inheriting `supports-color`/`typescript` purely
+            // because its injected `eslint`/`typescript` peer transitively
+            // depends on them.
+            if pkg.peer_dependencies.contains_key(name)
+                || pkg.peer_dependencies_meta.contains_key(name)
+            {
+                continue;
+            }
+            // Match `filter_graph`'s child-key convention (incl. the
+            // git/remote-tarball `name@url+<hash>` form) so peers bubble
+            // through git/tarball edges too.
+            if let Some(child) =
+                aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
+            {
+                parents.entry(child).or_default().push(dep_path.clone());
+            } else {
+                // Edge points outside the resolved graph (workspace
+                // `link:`/`file:` deps, or a child pruned by platform
+                // filtering). It has no snapshot to bubble peers through,
+                // so dropping it is correct — log at debug for anyone
+                // chasing a missing `transitivePeerDependencies` entry.
+                tracing::debug!(
+                    parent = %dep_path,
+                    dep = %name,
+                    tail = %tail,
+                    "transitive-peer pass: dependency edge has no graph node, skipping"
+                );
+            }
+        }
+        // Declared peers plus pnpm's meta-only peers (the optional
+        // `peerDependenciesMeta` keys, folded in as `*` by the helper —
+        // e.g. debug's `supports-color`). A resolved peer is mirrored into
+        // `dependencies` (pnpm does the same for active optionals too, so
+        // only `dependencies` needs checking — never `optional_dependencies`),
+        // so subtracting `dependencies` keys leaves exactly the unresolved
+        // set that bubbles up.
+        let own: BTreeSet<String> = pkg
+            .peer_dependencies_with_meta_defaults()
+            .into_keys()
+            .filter(|p| !pkg.dependencies.contains_key(p))
+            .collect();
+        if !own.is_empty() {
+            unresolved.insert(dep_path.clone(), own.into_iter().collect());
+        }
+    }
+
+    // Bubble each package's unresolved peers up to every ancestor. The
+    // originating package is pre-marked visited, so it never collects its
+    // own peers even inside a dependency cycle.
+    let mut acc: FxHashMap<String, BTreeSet<String>> = FxHashMap::default();
+    for (origin, peers) in &unresolved {
+        let mut visited: FxHashSet<String> = FxHashSet::default();
+        visited.insert(origin.clone());
+        let mut stack: Vec<String> = parents.get(origin).cloned().unwrap_or_default();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            let entry = acc.entry(node.clone()).or_default();
+            entry.extend(peers.iter().cloned());
+            if let Some(ps) = parents.get(&node) {
+                stack.extend(ps.iter().cloned());
+            }
+        }
+    }
+
+    for (dep_path, pkg) in graph.packages.iter_mut() {
+        pkg.transitive_peer_dependencies = acc
+            .get(dep_path)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+    }
 }
 
 #[cfg(test)]
@@ -416,55 +528,43 @@ mod tests {
     }
 
     #[test]
-    fn aube_lock_default_accepts_every_common_native() {
-        // A first-time `aube install` run on macOS must still pull the
-        // Linux / Windows native variants into `aube-lock.yaml` so the
-        // committed lockfile installs cleanly on CI — that's the whole
-        // point of the wide default.
-        let sup = SupportedArchitectures::aube_lock_default();
-        assert!(is_supported(&s(&["darwin"]), &s(&["arm64"]), &[], &sup));
+    fn accept_all_accepts_every_arch_including_non_host_triples() {
+        // pnpm/bun parity: `accept_all` records every optional-dep
+        // variant a package declares, even triples a host-only filter
+        // would reject (darwin-x64 on an arm64 mac, freebsd, ppc64,
+        // s390x, …). Without it, a regenerated cross-platform lockfile
+        // loses arches pnpm/bun keep, breaking teammates on those
+        // platforms.
+        let sup = SupportedArchitectures {
+            accept_all: true,
+            ..Default::default()
+        };
+        assert!(is_supported(&s(&["darwin"]), &s(&["x64"]), &[], &sup));
+        assert!(is_supported(&s(&["freebsd"]), &s(&["arm64"]), &[], &sup));
         assert!(is_supported(
             &s(&["linux"]),
-            &s(&["x64"]),
+            &s(&["ppc64"]),
             &s(&["glibc"]),
             &sup
         ));
         assert!(is_supported(
-            &s(&["linux"]),
+            &s(&["openharmony"]),
             &s(&["arm64"]),
-            &s(&["musl"]),
+            &[],
             &sup
         ));
-        assert!(is_supported(&s(&["win32"]), &s(&["x64"]), &[], &sup));
-        assert!(is_supported(&s(&["win32"]), &s(&["arm64"]), &[], &sup));
-    }
-
-    #[test]
-    fn aube_lock_default_always_accepts_host_triple() {
-        // The wide matrix excludes darwin-x64 by design (see
-        // `aube_lock_default`'s doc), but the host's own triple is
-        // unconditionally added to the set. An Intel Mac or a freebsd
-        // box that runs `aube install` must still get its own native
-        // optional deps, regardless of which combinations the baseline
-        // matrix covers.
-        let sup = SupportedArchitectures::aube_lock_default();
-        let (os, cpu, libc) = host_triple();
-        let pkg_libc = if libc.is_empty() { vec![] } else { s(&[libc]) };
-        assert!(is_supported(&s(&[os]), &s(&[cpu]), &pkg_libc, &sup));
-    }
-
-    #[test]
-    fn aube_lock_default_rejects_exotic_non_host_triples() {
-        // Exotic triples the host isn't running as (openbsd, ppc64, …)
-        // stay out of the default set — users targeting them still need
-        // to opt in via `pnpm.supportedArchitectures`.
-        let sup = SupportedArchitectures::aube_lock_default();
-        let (os, _, _) = host_triple();
-        if os != "openbsd" {
-            assert!(!is_supported(&s(&["openbsd"]), &s(&["x64"]), &[], &sup));
-        }
-        if os != "aix" {
-            assert!(!is_supported(&s(&["aix"]), &s(&["ppc64"]), &[], &sup));
+        assert!(is_supported(&s(&["win32"]), &s(&["ia32"]), &[], &sup));
+        // Sanity: a host-only (default) set rejects at least one of
+        // these, so the accept-all branch is doing real work.
+        let host_only = SupportedArchitectures::default();
+        let (host_os, _, _) = host_triple();
+        if host_os != "freebsd" {
+            assert!(!is_supported(
+                &s(&["freebsd"]),
+                &s(&["arm64"]),
+                &[],
+                &host_only
+            ));
         }
     }
 
@@ -534,6 +634,148 @@ mod tests {
         assert!(!host.dependencies.contains_key("native-linux"));
         assert!(graph.packages.contains_key("native-darwin@1.0.0"));
         assert!(!graph.packages.contains_key("native-linux@1.0.0"));
+    }
+
+    fn dep(name: &str, dep_type: aube_lockfile::DepType) -> aube_lockfile::DirectDep {
+        aube_lockfile::DirectDep {
+            name: name.to_string(),
+            dep_path: format!("{name}@1.0.0"),
+            dep_type,
+            specifier: Some("1.0.0".to_string()),
+        }
+    }
+
+    fn pkg(name: &str, deps: &[&str], opt_deps: &[&str]) -> (String, aube_lockfile::LockedPackage) {
+        let dep_path = format!("{name}@1.0.0");
+        (
+            dep_path.clone(),
+            aube_lockfile::LockedPackage {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                dep_path,
+                dependencies: deps
+                    .iter()
+                    .map(|d| ((*d).to_string(), "1.0.0".to_string()))
+                    .collect(),
+                optional_dependencies: opt_deps
+                    .iter()
+                    .map(|d| ((*d).to_string(), "1.0.0".to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn mark_optional_packages_marks_optional_only_reachable() {
+        use aube_lockfile::DepType;
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.importers.insert(
+            ".".to_string(),
+            vec![
+                dep("host", DepType::Production),
+                dep("also-required", DepType::Production),
+                dep("opt-root", DepType::Optional),
+            ],
+        );
+        // `host` has a required prod dep (`shared`), two optional-only
+        // natives, and `dual` reachable both optionally (here) and via a
+        // required edge from `also-required`. pnpm mirrors active optionals
+        // into `dependencies`, so they appear in both maps.
+        graph.packages.extend([
+            pkg(
+                "host",
+                &["shared", "native-darwin", "native-linux", "dual"],
+                &["native-darwin", "native-linux", "dual"],
+            ),
+            pkg("also-required", &["dual"], &[]),
+            pkg("shared", &[], &[]),
+            pkg("native-darwin", &[], &[]),
+            pkg("native-linux", &[], &[]),
+            pkg("dual", &[], &[]),
+            pkg("opt-root", &[], &[]),
+        ]);
+
+        mark_optional_packages(&mut graph);
+
+        let is_opt = |k: &str| graph.packages[k].optional;
+        // Required by a non-optional path.
+        assert!(!is_opt("host@1.0.0"));
+        assert!(!is_opt("also-required@1.0.0"));
+        assert!(!is_opt("shared@1.0.0"));
+        // Reachable both optionally and via a required edge → stays required.
+        assert!(!is_opt("dual@1.0.0"));
+        // Reachable only through optional edges → optional.
+        assert!(is_opt("native-darwin@1.0.0"));
+        assert!(is_opt("native-linux@1.0.0"));
+        // Direct optional importer dep with no required path → optional.
+        assert!(is_opt("opt-root@1.0.0"));
+    }
+
+    fn pkg_with_peers(
+        name: &str,
+        deps: &[&str],
+        peers: &[&str],
+    ) -> (String, aube_lockfile::LockedPackage) {
+        let (key, mut p) = pkg(name, deps, &[]);
+        p.peer_dependencies = peers
+            .iter()
+            .map(|d| ((*d).to_string(), "*".to_string()))
+            .collect();
+        (key, p)
+    }
+
+    #[test]
+    fn transitive_peer_dependencies_bubble_unresolved_peers() {
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.packages.extend([
+            pkg("app", &["host", "mid"], &[]),
+            // `host` declares `core` as a peer AND resolves it (core is in
+            // deps, mirrored like pnpm), so nothing bubbles from host.
+            pkg_with_peers("host", &["core"], &["core"]),
+            pkg("core", &[], &[]),
+            // `mid` -> `leaf`, and `leaf` peers on an unresolved
+            // `supports-color` (not in its deps): it must bubble to ancestors.
+            pkg("mid", &["leaf"], &[]),
+            pkg_with_peers("leaf", &["ms"], &["supports-color"]),
+            pkg("ms", &[], &[]),
+        ]);
+
+        mark_transitive_peer_dependencies(&mut graph);
+
+        let tp = |k: &str| graph.packages[k].transitive_peer_dependencies.clone();
+        // Unresolved peer bubbles to every ancestor of `leaf`.
+        assert_eq!(tp("app@1.0.0"), vec!["supports-color".to_string()]);
+        assert_eq!(tp("mid@1.0.0"), vec!["supports-color".to_string()]);
+        // `leaf` declares the peer itself → not in its OWN transitive list.
+        assert!(tp("leaf@1.0.0").is_empty());
+        assert!(tp("ms@1.0.0").is_empty());
+        // `host` resolves its `core` peer → nothing unresolved to bubble.
+        assert!(tp("host@1.0.0").is_empty());
+        assert!(tp("core@1.0.0").is_empty());
+    }
+
+    #[test]
+    fn transitive_peer_dependencies_handle_cycles_without_self() {
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        // a <-> b dependency cycle, each with a distinct unresolved peer.
+        graph.packages.extend([
+            pkg_with_peers("a", &["b"], &["pa"]),
+            pkg_with_peers("b", &["a"], &["pb"]),
+        ]);
+
+        mark_transitive_peer_dependencies(&mut graph);
+
+        // Each node collects the other's peer through the cycle but never its
+        // own — `a` doesn't list `pa`, `b` doesn't list `pb`.
+        assert_eq!(
+            graph.packages["a@1.0.0"].transitive_peer_dependencies,
+            vec!["pb".to_string()]
+        );
+        assert_eq!(
+            graph.packages["b@1.0.0"].transitive_peer_dependencies,
+            vec!["pa".to_string()]
+        );
     }
 
     #[test]

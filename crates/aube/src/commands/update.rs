@@ -111,7 +111,7 @@ pub struct UpdateArgs {
 pub async fn run(
     args: UpdateArgs,
     mut filter: aube_workspace::selector::EffectiveFilter,
-) -> miette::Result<()> {
+) -> miette::Result<Option<i32>> {
     args.network.install_overrides();
     args.lockfile.install_overrides();
     args.virtual_store.install_overrides();
@@ -124,7 +124,8 @@ pub async fn run(
         // workaround for the genuine refresh-transitives case.
         eprintln!(
             "warn: --depth {depth} is ignored; aube only refreshes direct deps. \
-             For a full refresh, run `rm aube-lock.yaml && aube install`."
+             For a full refresh, run `rm aube-lock.yaml && {}`.",
+            aube_util::cmd("install")
         );
     }
     if args.global {
@@ -441,7 +442,7 @@ pub async fn run(
     };
 
     if args.interactive && !manifest_keys_to_update.is_empty() {
-        let selected = pick_update_interactively(
+        let selected = match pick_update_interactively(
             &manifest_keys_to_update,
             &manifest,
             &all_specifiers,
@@ -451,10 +452,15 @@ pub async fn run(
             &cwd,
             latest,
         )
-        .await?;
+        .await?
+        {
+            Some(sel) => sel,
+            // Picker cancelled (Ctrl-C / Esc): exit 130 via the return path.
+            None => return Ok(Some(130)),
+        };
         if selected.is_empty() && indirect_arg_names.is_empty() {
             eprintln!("No packages selected.");
-            return Ok(());
+            return Ok(None);
         }
         manifest_keys_to_update.retain(|key| selected.contains(key));
     }
@@ -743,7 +749,22 @@ pub async fn run(
         }
     }
 
-    write_update_lockfile(&cwd, &graph, &manifest)?;
+    install::finalize_lockfile_graph(
+        &cwd,
+        &mut graph,
+        &manifest,
+        args.ignore_pnpmfile,
+        args.pnpmfile.as_deref(),
+    )
+    .await?;
+    write_update_lockfile(
+        &cwd,
+        &graph,
+        &manifest,
+        args.ignore_pnpmfile,
+        absolute_cli_pnpmfile(&cwd, args.pnpmfile.as_deref()).as_deref(),
+    )
+    .await?;
 
     // Propagate `--ignore-pnpmfile` / `--pnpmfile` / `--global-pnpmfile`
     // into the chained install. Frozen-prefer normally short-circuits to
@@ -770,10 +791,10 @@ pub async fn run(
     chained.lockfile_only = args.lockfile_only;
     install::run(chained).await?;
 
-    Ok(())
+    Ok(None)
 }
 
-async fn run_global(args: UpdateArgs) -> miette::Result<()> {
+async fn run_global(args: UpdateArgs) -> miette::Result<Option<i32>> {
     reject_unsupported_pkg_specs(&args.packages)?;
 
     let layout = super::global::GlobalLayout::resolve()?;
@@ -836,7 +857,8 @@ async fn run_global(args: UpdateArgs) -> miette::Result<()> {
         Ok(())
     }
     .await;
-    super::finish_filtered_workspace(&original_cwd, result)
+    super::finish_filtered_workspace(&original_cwd, result)?;
+    Ok(None)
 }
 
 fn select_global_updates(
@@ -921,6 +943,11 @@ fn workspace_package_versions(cwd: &std::path::Path) -> miette::Result<HashMap<S
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Interactively pick which dependencies to update. `Ok(Some(set))` is the
+/// selection (possibly empty); `Ok(None)` means the user cancelled the picker
+/// (Ctrl-C / Esc), which the caller maps to exit code 130 — returned up to the
+/// binary's single `std::process::exit` rather than terminating here, keeping
+/// the command embed-safe.
 async fn pick_update_interactively(
     keys: &[String],
     manifest: &aube_manifest::PackageJson,
@@ -930,10 +957,11 @@ async fn pick_update_interactively(
     preserve_pin: &BTreeSet<String>,
     cwd: &std::path::Path,
     latest: bool,
-) -> miette::Result<BTreeSet<String>> {
+) -> miette::Result<Option<BTreeSet<String>>> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Err(miette!(
-            "`aube update --interactive` requires stdin and stderr to be TTYs; pass package names explicitly to update non-interactively"
+            "`{} --interactive` requires stdin and stderr to be TTYs; pass package names explicitly to update non-interactively",
+            aube_util::cmd("update")
         ));
     }
 
@@ -962,7 +990,7 @@ async fn pick_update_interactively(
         })
         .collect();
     if registry_keys.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(Some(BTreeSet::new()));
     }
 
     let client = std::sync::Arc::new(super::make_client(cwd));
@@ -1038,19 +1066,22 @@ async fn pick_update_interactively(
         shown += 1;
     }
     if shown == 0 {
-        return Ok(BTreeSet::new());
+        return Ok(Some(BTreeSet::new()));
     }
 
     let picked: Vec<String> = match picker.run() {
         Ok(picked) => picked,
-        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => std::process::exit(130),
+        // Cancelled (Ctrl-C / Esc): signal to the caller, which returns exit
+        // code 130 via the return path rather than hard-exiting in place,
+        // keeping the command embed-safe.
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(None),
         Err(e) => {
             return Err(e)
                 .into_diagnostic()
                 .wrap_err("failed to read update selection");
         }
     };
-    Ok(picked.into_iter().collect())
+    Ok(Some(picked.into_iter().collect()))
 }
 
 fn dep_bucket(manifest: &aube_manifest::PackageJson, key: &str) -> &'static str {
@@ -1170,7 +1201,7 @@ fn with_update_settings_ctx<T>(
 async fn run_filtered(
     args: UpdateArgs,
     filter: &aube_workspace::selector::EffectiveFilter,
-) -> miette::Result<()> {
+) -> miette::Result<Option<i32>> {
     reject_unsupported_pkg_specs(&args.packages)?;
     let cwd = crate::dirs::cwd()?;
     let (root, matched) = super::select_workspace_packages(&cwd, filter, "update")?;
@@ -1313,25 +1344,31 @@ async fn run_filtered(
                     &pkg.manifest,
                     root_manifest,
                     root_graph,
-                )?;
+                    args.ignore_pnpmfile,
+                    absolute_cli_pnpmfile(&pkg.dir, args.pnpmfile.as_deref()).as_deref(),
+                )
+                .await?;
             }
         }
         Ok(())
     }
     .await;
-    super::finish_filtered_workspace(&cwd, result)
+    super::finish_filtered_workspace(&cwd, result)?;
+    Ok(None)
 }
 
 fn resolve_shared_workspace_lockfile(cwd: &std::path::Path) -> miette::Result<bool> {
     with_update_settings_ctx(cwd, aube_settings::resolved::shared_workspace_lockfile)
 }
 
-fn merge_filtered_update_lockfile(
+async fn merge_filtered_update_lockfile(
     workspace_root: &std::path::Path,
     pkg_dir: &std::path::Path,
     pkg_manifest: &aube_manifest::PackageJson,
     root_manifest: &aube_manifest::PackageJson,
     root_graph: aube_lockfile::LockfileGraph,
+    ignore_pnpmfile: bool,
+    cli_pnpmfile: Option<&std::path::Path>,
 ) -> miette::Result<()> {
     let importer_path = super::workspace_importer_path(workspace_root, pkg_dir)?;
     let remove_pkg_lockfile = importer_path != ".";
@@ -1356,7 +1393,10 @@ fn merge_filtered_update_lockfile(
         root_manifest,
         root_graph,
         pkg_graph,
-    )?;
+        ignore_pnpmfile,
+        cli_pnpmfile,
+    )
+    .await?;
     if remove_pkg_lockfile {
         std::fs::remove_file(&pkg_lockfile)
             .into_diagnostic()
@@ -1365,10 +1405,29 @@ fn merge_filtered_update_lockfile(
     Ok(())
 }
 
-fn write_update_lockfile(
+// Resolve a `--pnpmfile` override to an absolute path against `cwd`. The
+// workspace-merge stamp below detects the pnpmfile against `workspace_root`,
+// not the member `cwd`, so a relative override has to be anchored here or it
+// would resolve against the wrong base.
+fn absolute_cli_pnpmfile(
+    cwd: &std::path::Path,
+    cli: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    cli.map(|p| {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    })
+}
+
+async fn write_update_lockfile(
     cwd: &std::path::Path,
     graph: &aube_lockfile::LockfileGraph,
     manifest: &aube_manifest::PackageJson,
+    ignore_pnpmfile: bool,
+    cli_pnpmfile: Option<&std::path::Path>,
 ) -> miette::Result<()> {
     let Some(workspace_root) = crate::dirs::find_workspace_root(cwd) else {
         super::write_and_log_lockfile(cwd, graph, manifest)?;
@@ -1387,15 +1446,20 @@ fn write_update_lockfile(
         &root_manifest,
         root_graph,
         graph.clone(),
+        ignore_pnpmfile,
+        cli_pnpmfile,
     )
+    .await
 }
 
-fn merge_update_graph_into_workspace_lockfile(
+async fn merge_update_graph_into_workspace_lockfile(
     workspace_root: &std::path::Path,
     pkg_dir: &std::path::Path,
     root_manifest: &aube_manifest::PackageJson,
     mut root_graph: aube_lockfile::LockfileGraph,
     mut pkg_graph: aube_lockfile::LockfileGraph,
+    ignore_pnpmfile: bool,
+    cli_pnpmfile: Option<&std::path::Path>,
 ) -> miette::Result<()> {
     let importer_path = super::workspace_importer_path(workspace_root, pkg_dir)?;
     let pkg_deps = pkg_graph.importers.remove(".").ok_or_else(|| {
@@ -1438,6 +1502,21 @@ fn merge_update_graph_into_workspace_lockfile(
 
     let mut root_graph = root_graph.filter_deps(|_| true);
     retain_package_times(&mut root_graph);
+    // Stamp the *root* lockfile against the workspace-root config
+    // (its package extensions + pnpmfile), matching what an install
+    // from the root would write — otherwise the shared lockfile loses
+    // the checksums on every `aube update` in a member package. Honor the
+    // same `--ignore-pnpmfile` / `--pnpmfile` flags the member resolve
+    // used so the root stamp can't re-add a pnpmfileChecksum the user
+    // opted out of (or stamp the wrong hook).
+    install::finalize_lockfile_graph(
+        workspace_root,
+        &mut root_graph,
+        root_manifest,
+        ignore_pnpmfile,
+        cli_pnpmfile,
+    )
+    .await?;
     super::write_and_log_lockfile(workspace_root, &root_graph, root_manifest)?;
     Ok(())
 }

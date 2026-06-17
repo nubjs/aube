@@ -23,7 +23,9 @@ use crate::local_source::{
     dep_path_for, is_non_registry_specifier, read_local_manifest, rebase_local,
     resolve_exec_manifest, resolve_git_source, resolve_remote_tarball, should_block_exotic_subdep,
 };
-use crate::package_ext::{apply_package_extensions, pick_override_spec};
+use crate::package_ext::{
+    apply_package_extensions, apply_package_extensions_to_deps, pick_override_spec,
+};
 use crate::semver_util::{PickResult, Regime, classify_regime, pick_version, version_satisfies};
 use crate::{
     Error, ExoticSubdepDetails, FxHashMap, FxHashSet, ResolutionMode, ResolveTask, ResolvedPackage,
@@ -935,15 +937,18 @@ impl<'a> ResolveDriver<'a> {
         let version = version_meta.version.clone();
         let dep_path = dep_path_for(&task.name, &version);
 
-        // Record publish time for the cutoff / `time:` block
-        // whenever the packument carries one — matches pnpm,
-        // which populates `publishedAt` opportunistically via
-        // `meta.time?.[version]` regardless of resolution mode.
-        // Corgi packuments from npmjs.org omit `time`, so in
-        // Highest mode this is usually a no-op; Verdaccio
-        // (v5.15.1+) and full-packument fetches do include it,
-        // and then we round-trip it into the lockfile just like
-        // pnpm does.
+        // Record the picked version's publish time so (a) the
+        // time-based cutoff computation at the end of wave 0 can
+        // derive `published_by` from the directs and (b) the
+        // lockfile write emits a `time:` block. Gated on
+        // `should_record_times()` — i.e. `resolution-mode=time-based`
+        // only — because that's the sole case pnpm persists `time:`
+        // to the lockfile (see `should_record_times` for the pnpm
+        // source trail). pnpm captures `publishedAt` per-package
+        // opportunistically in memory regardless of mode, but only
+        // aggregates it into the lockfile under time-based resolution,
+        // so Highest-mode installs (incl. `minimumReleaseAge` /
+        // `trustPolicy`) stay `time:`-free here too.
         //
         // Fall back to the prior lockfile's time when the
         // packument doesn't carry one — `aube update` filters
@@ -1064,10 +1069,25 @@ impl<'a> ResolveDriver<'a> {
                 .await;
         }
 
-        // Capture the declared peer deps now so the post-pass can
-        // compute each consumer's peer context without re-reading
-        // the packument.
-        let peer_deps = version_meta.peer_dependencies.clone();
+        // Capture the declared peer deps now so the post-pass can compute
+        // each consumer's peer context without re-reading the packument.
+        // pnpm records a `peerDependencies: { x: '*' }` entry for every
+        // `peerDependenciesMeta` key a package ships without an explicit
+        // range (debug's optional `supports-color`, typescript-eslint's
+        // optional `typescript`, …). Synthesize the same `*` so peer
+        // context resolves these exactly like pnpm: an optional peer that
+        // a real ancestor / the workspace root provides (typescript) gets
+        // a dep-path suffix, while one nothing on the path provides
+        // (supports-color) is left unresolved and surfaces under
+        // `transitivePeerDependencies`. The optional-peer branch in
+        // `visit_peer_context` is what keeps the graph-wide scan from
+        // binding the latter to an unrelated copy in the tree.
+        let mut peer_deps = version_meta.peer_dependencies.clone();
+        for name in version_meta.peer_dependencies_meta.keys() {
+            peer_deps
+                .entry(name.clone())
+                .or_insert_with(|| "*".to_string());
+        }
         let peer_meta: BTreeMap<String, aube_lockfile::PeerDepMeta> = version_meta
             .peer_dependencies_meta
             .iter()
@@ -1175,7 +1195,24 @@ impl<'a> ResolveDriver<'a> {
                 funding_url: version_meta.funding_url.clone(),
                 optional: false,
                 transitive_peer_dependencies: Vec::new(),
-                extra_meta: BTreeMap::new(),
+                // Record the registry's deprecation reason so the
+                // pnpm/aube writers can emit the `deprecated:` field
+                // pnpm keeps on package entries. Stored on the generic
+                // meta map rather than a typed slot to match how bun
+                // round-trips it. Uses the raw packument message, not
+                // `deprecated_msg`: that one is gated by
+                // `allowedDeprecatedVersions`, which only silences the
+                // install warning — pnpm still records the field.
+                extra_meta: version_meta
+                    .deprecated
+                    .as_deref()
+                    .map(|msg| {
+                        BTreeMap::from([(
+                            "deprecated".to_string(),
+                            serde_json::Value::String(msg.to_string()),
+                        )])
+                    })
+                    .unwrap_or_default(),
             },
         );
 
@@ -1475,7 +1512,7 @@ impl<'a> ResolveDriver<'a> {
                 ),
             ));
         }
-        let (mut local, real_version, target_deps, integrity) = if let LocalSource::Git(ref g) =
+        let (mut local, real_version, mut target_deps, integrity) = if let LocalSource::Git(ref g) =
             raw_local
         {
             let shallow = aube_store::git_host_in_list(&g.url, &self.resolver.git_shallow_hosts);
@@ -1538,6 +1575,19 @@ impl<'a> ResolveDriver<'a> {
             (local, version, deps, None)
         };
         attach_integrity_to_git_source(&mut local, integrity.as_deref());
+        // Apply `packageExtensions` to non-registry packages too. The
+        // registry path applies them to the picked VersionMetadata; git /
+        // remote-tarball / directory packages resolve through this path
+        // with a flat dependency map, so without this an extension
+        // targeting a git dep (e.g. a connector the package require()s at
+        // runtime) is dropped and never linked as a sibling under the
+        // global virtual store.
+        apply_package_extensions_to_deps(
+            &task.name,
+            &real_version,
+            &mut target_deps,
+            &self.resolver.dependency_policy.package_extensions,
+        );
         let dep_path = local.dep_path(&task.name);
         let linked_name = task.name.clone();
 

@@ -1,5 +1,6 @@
 use super::dep_path::{
-    dep_path_tail, parse_dep_path, peerless_alias_target, rewrite_snapshot_alias_deps,
+    dep_path_tail, parse_dep_path, peerless_alias_target, rewrite_peer_suffix,
+    rewrite_snapshot_alias_deps,
     version_to_dep_path,
 };
 use super::raw::{
@@ -602,6 +603,13 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         let cpu = pkg_info.map(|p| p.cpu.clone()).unwrap_or_default();
         let libc = pkg_info.map(|p| p.libc.clone()).unwrap_or_default();
         let engines = pkg_info.map(|p| p.engines.clone()).unwrap_or_default();
+        // pnpm records a registry `deprecated:` reason on package
+        // entries; stash it on the generic meta map so the writer can
+        // re-emit it (matching how bun round-trips the same field).
+        let extra_meta = pkg_info
+            .and_then(|p| p.deprecated.clone())
+            .map(|msg| BTreeMap::from([("deprecated".to_string(), serde_json::Value::String(msg))]))
+            .unwrap_or_default();
         // pnpm's lockfile only stores `hasBin: true/false` (no paths);
         // reconstruct an opaque single-entry map on parse so
         // `!bin.is_empty()` stays equivalent to `hasBin`, then let
@@ -696,7 +704,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 // `None`.
                 license: None,
                 funding_url: None,
-                extra_meta: BTreeMap::new(),
+                extra_meta,
             },
         );
     }
@@ -822,6 +830,79 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         }
     }
 
+    // Normalize git / remote-tarball references so a lockfile round-trip
+    // produces the same graph a fresh resolve does. pnpm (and aube's own
+    // writer) record these deps by their resolved URL, but aube's linker
+    // and graph hasher look them up under the FS-safe hashed form
+    // (`request@url+<hash>` / `request@git+<hash>`) — the same form
+    // `push_direct` already uses for *direct* git/tarball deps. Two
+    // independent rewrites are needed, and both run whenever a git/tarball
+    // dep is present (not only when a peer suffix exists):
+    //
+    //   1. Package keys. A *transitive* git/tarball package keyed by URL
+    //      (`<pkg>@https://codeload.…/<sha>`) has its own virtual-store
+    //      dir materialized at the escaped `https+++…` name, while every
+    //      parent's sibling symlink (and the hasher's child lookup, via
+    //      `shared_local_dep_path`) targets the `url+<hash>` name. The
+    //      symlink then dangles — Node throws `Cannot find module '<dep>'`
+    //      — and the child's content/engine taint never reaches the
+    //      parent's GVS hash. Re-key the head to the canonical hashed form.
+    //   2. Peer suffixes. `request-promise-core@1.1.4(request@https://…/<sha>)`
+    //      → `…(request@url+<hash>)`, the inverse of the writer's
+    //      hashed→spec pass. Without it a registry package that peers with
+    //      a git/tarball dep would re-key on the next install, busting the
+    //      warm path (and emitting a churned lockfile).
+    let spec_peer_to_hashed = |head: &str| -> Option<String> {
+        let (name, value) = parse_dep_path(head)?;
+        crate::shared_local_dep_path(&name, &value)
+    };
+    // Canonicalize a git/remote-tarball package's own `name@<url>` head to
+    // the hashed form, preserving any peer suffix verbatim (URLs aube keys
+    // never contain `(`, so the first `(` always starts the suffix).
+    let canonical_local_head = |key: &str, pkg: &LockedPackage| -> Option<String> {
+        let local @ (LocalSource::Git(_) | LocalSource::RemoteTarball(_)) =
+            pkg.local_source.as_ref()?
+        else {
+            return None;
+        };
+        let suffix = key.find('(').map_or("", |i| &key[i..]);
+        let new_key = format!("{}{suffix}", local.dep_path(&pkg.name));
+        (new_key != key).then_some(new_key)
+    };
+    let has_local_source = packages.values().any(|p| {
+        matches!(
+            p.local_source,
+            Some(LocalSource::Git(_) | LocalSource::RemoteTarball(_))
+        )
+    });
+    if has_local_source {
+        let rekeyed: BTreeMap<String, LockedPackage> = std::mem::take(&mut packages)
+            .into_iter()
+            .map(|(key, mut pkg)| {
+                let head = canonical_local_head(&key, &pkg).unwrap_or(key);
+                let new_key = rewrite_peer_suffix(&head, &spec_peer_to_hashed);
+                pkg.dep_path = new_key.clone();
+                pkg.dependencies = pkg
+                    .dependencies
+                    .into_iter()
+                    .map(|(n, v)| (n, rewrite_peer_suffix(&v, &spec_peer_to_hashed)))
+                    .collect();
+                pkg.optional_dependencies = pkg
+                    .optional_dependencies
+                    .into_iter()
+                    .map(|(n, v)| (n, rewrite_peer_suffix(&v, &spec_peer_to_hashed)))
+                    .collect();
+                (new_key, pkg)
+            })
+            .collect();
+        packages = rekeyed;
+        for deps in importers.values_mut() {
+            for dep in deps {
+                dep.dep_path = rewrite_peer_suffix(&dep.dep_path, &spec_peer_to_hashed);
+            }
+        }
+    }
+
     let settings = raw
         .settings
         .map(|s| crate::LockfileSettings {
@@ -900,6 +981,8 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         packages,
         settings,
         overrides: raw.overrides.unwrap_or_default(),
+        package_extensions_checksum: raw.package_extensions_checksum,
+        pnpmfile_checksum: raw.pnpmfile_checksum,
         ignored_optional_dependencies: raw
             .ignored_optional_dependencies
             .unwrap_or_default()

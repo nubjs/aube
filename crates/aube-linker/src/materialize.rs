@@ -1,9 +1,9 @@
 use tracing::{debug, trace, warn};
 
 use crate::patches::apply_multi_file_patch;
-use crate::sweep::mkdirp;
+use crate::sweep::{EntryState, classify_entry_state, mkdirp, try_remove_entry};
 use crate::{Error, LinkStats, LinkStrategy, Linker, sys};
-use aube_lockfile::LockedPackage;
+use aube_lockfile::{LockedPackage, shared_local_dep_path};
 use aube_store::{PackageIndex, StoredFile};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -242,6 +242,57 @@ impl Linker {
         Ok(())
     }
 
+    /// Materialize a globally-reproducible local source (a `git`
+    /// dependency or a remote `.tgz`) into the shared virtual store and
+    /// point the per-project `.aube/<dep_path>` entry at it — the exact
+    /// arrangement Step 1 produces for a registry package.
+    ///
+    /// Used by the isolated linker in global-virtual-store mode. Plain
+    /// `file:` / `link:` / `portal:` / `exec:` sources resolve against
+    /// a path inside the project and are materialized per-project
+    /// instead (see `materialize_into` with `apply_hashes = false`),
+    /// but git and remote-tarball sources are content-pinned and shared
+    /// like registry packages. They MUST live in the shared store when
+    /// it is enabled: a registry dependent in the shared store links
+    /// its dependency siblings to the hashed global path
+    /// (`virtual_store_subdir(dep_path)`), so a git/tarball dep that
+    /// only existed in the per-project `.aube/` would leave that
+    /// sibling symlink dangling — and Node would resolve whatever
+    /// unrelated `<name>` it found walking up the tree.
+    pub(crate) fn ensure_shared_local_in_global_store(
+        &self,
+        aube_dir: &Path,
+        dep_path: &str,
+        pkg: &LockedPackage,
+        index: &PackageIndex,
+        stats: &mut LinkStats,
+        nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
+    ) -> Result<(), Error> {
+        let local_aube_entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
+        let global_entry = self.virtual_store.join(self.virtual_store_subdir(dep_path));
+        let state = classify_entry_state(&local_aube_entry, &global_entry);
+        if matches!(state, EntryState::Fresh) {
+            stats.packages_cached += 1;
+            return Ok(());
+        }
+        self.ensure_in_virtual_store(dep_path, pkg, index, stats, nested_link_targets)?;
+        if matches!(state, EntryState::Stale) {
+            // A prior install — or an older aube that always
+            // materialized git/remote sources per-project — may have
+            // left a real directory or a stale symlink here. Clear
+            // either shape before pointing the entry at the shared
+            // store (`try_remove_entry` handles dir, symlink, and
+            // dangling-link cases).
+            try_remove_entry(&local_aube_entry);
+        }
+        if let Some(parent) = local_aube_entry.parent() {
+            mkdirp(parent)?;
+        }
+        sys::create_dir_link(&global_entry, &local_aube_entry)
+            .map_err(|e| Error::Io(local_aube_entry.clone(), e))?;
+        Ok(())
+    }
+
     /// Materialize a single package directly into the per-project
     /// virtual store at `aube_dir/<dep_path>/node_modules/<name>/`.
     ///
@@ -469,7 +520,13 @@ impl Linker {
         // a per-project `.aube/<dep_path>` that the caller just
         // ensured is empty), so nothing can be in the way.
         for (dep_name, dep_version) in &pkg.dependencies {
-            let dep_dep_path = format!("{dep_name}@{dep_version}");
+            // Git / remote-tarball deps are recorded by their resolved
+            // URL spec but keyed in the graph under the short
+            // `name@git+<hash>` / `name@url+<hash>` form. Translate so the
+            // sibling symlink targets the same `dep_path` the package was
+            // materialized under; everything else keeps `name@version`.
+            let dep_dep_path = shared_local_dep_path(dep_name, dep_version)
+                .unwrap_or_else(|| format!("{dep_name}@{dep_version}"));
             // Skip any dep whose name matches the package being
             // materialized, regardless of version. The symlink would
             // land at `pkg_nm_parent.join(dep_name)` which is exactly

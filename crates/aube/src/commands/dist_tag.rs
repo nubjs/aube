@@ -85,7 +85,8 @@ fn forbidden_report(name: &str, body: String) -> miette::Report {
         format!("\nregistry: {body}")
     };
     miette!(
-        "forbidden by registry for {name}{detail}\nhelp: your token authenticated but isn\'t allowed to do this — check its permissions/scope (e.g. `read:packages`/`write:packages`) or whether the package is blocked by an org or registry policy. `aube login` won\'t fix a 403."
+        "forbidden by registry for {name}{detail}\nhelp: your token authenticated but isn\'t allowed to do this — check its permissions/scope (e.g. `read:packages`/`write:packages`) or whether the package is blocked by an org or registry policy. `{}` won\'t fix a 403.",
+        aube_util::cmd("login")
     )
 }
 
@@ -102,7 +103,8 @@ async fn add(spec: &str, tag: Option<&str>, otp: Option<&str>) -> miette::Result
     let (name, version) = split_name_spec(spec);
     let version = version.ok_or_else(|| {
         miette!(
-            "expected `name@version`, got `{spec}`\nhelp: `aube dist-tag add` needs an exact version, e.g. `react@18.2.0`"
+            "expected `name@version`, got `{spec}`\nhelp: `{}` needs an exact version, e.g. `react@18.2.0`",
+            aube_util::cmd("dist-tag add")
         )
     })?;
     if version.is_empty() {
@@ -121,7 +123,8 @@ async fn add(spec: &str, tag: Option<&str>, otp: Option<&str>) -> miette::Result
         .map_err(|e| match e {
             aube_registry::Error::NotFound(n) => miette!("package not found: {n}"),
             aube_registry::Error::Unauthorized => miette!(
-                "authentication required for {name}\nhelp: run `aube login` first, then retry"
+                "authentication required for {name}\nhelp: run `{}` first, then retry",
+                aube_util::cmd("login")
             ),
             aube_registry::Error::Forbidden { body } => forbidden_report(name, body),
             other => miette!("failed to set {name}@{tag} -> {version}: {other}"),
@@ -135,7 +138,8 @@ async fn rm(package: &str, tag: &str, otp: Option<&str>) -> miette::Result<()> {
     let (name, version_spec) = split_name_spec(package);
     if version_spec.is_some() {
         return Err(miette!(
-            "expected a bare package name, got `{package}`\nhelp: `aube dist-tag rm` takes just the package name — the tag to remove is a separate argument"
+            "expected a bare package name, got `{package}`\nhelp: `{}` takes just the package name — the tag to remove is a separate argument",
+            aube_util::cmd("dist-tag rm")
         ));
     }
 
@@ -150,7 +154,8 @@ async fn rm(package: &str, tag: &str, otp: Option<&str>) -> miette::Result<()> {
                 miette!("no such tag: {name}@{tag}")
             }
             aube_registry::Error::Unauthorized => miette!(
-                "authentication required for {name}\nhelp: run `aube login` first, then retry"
+                "authentication required for {name}\nhelp: run `{}` first, then retry",
+                aube_util::cmd("login")
             ),
             aube_registry::Error::Forbidden { body } => forbidden_report(name, body),
             other => miette!("failed to remove {name}@{tag}: {other}"),
@@ -171,7 +176,8 @@ async fn ls(package: Option<&str>) -> miette::Result<()> {
             let (n, version_spec) = split_name_spec(pkg);
             if version_spec.is_some() {
                 return Err(miette!(
-                    "expected a bare package name, got `{pkg}`\nhelp: `aube dist-tag ls` takes just the package name"
+                    "expected a bare package name, got `{pkg}`\nhelp: `{}` takes just the package name",
+                    aube_util::cmd("dist-tag ls")
                 ));
             }
             n.to_string()
@@ -183,7 +189,8 @@ async fn ls(package: Option<&str>) -> miette::Result<()> {
                 .wrap_err_with(|| format!("failed to read {}", manifest_path.display()))?;
             manifest.name.ok_or_else(|| {
                 miette!(
-                    "package.json has no `name` field\nhelp: pass a package name explicitly (`aube dist-tag ls <name>`)"
+                    "package.json has no `name` field\nhelp: pass a package name explicitly (`{} <name>`)",
+                    aube_util::cmd("dist-tag ls")
                 )
             })?
         }
@@ -193,7 +200,10 @@ async fn ls(package: Option<&str>) -> miette::Result<()> {
     let tags = client.fetch_dist_tags(&name).await.map_err(|e| match e {
         aube_registry::Error::NotFound(n) => miette!("package not found: {n}"),
         aube_registry::Error::Unauthorized => {
-            miette!("authentication required for {name}\nhelp: run `aube login` first, then retry")
+            miette!(
+                "authentication required for {name}\nhelp: run `{}` first, then retry",
+                aube_util::cmd("login")
+            )
         }
         aube_registry::Error::Forbidden { body } => forbidden_report(&name, body),
         other => miette!("failed to fetch dist-tags for {name}: {other}"),

@@ -1,6 +1,6 @@
 use super::super::{packument_cache_dir, packument_full_cache_dir};
 use super::version_from_dep_path;
-use miette::miette;
+use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
 
 /// Accept pnpm's documented aliases (`highest`, `time-based`, `time`,
@@ -410,8 +410,7 @@ pub(crate) fn resolve_dependency_policy(
 ) -> aube_resolver::DependencyPolicy {
     let mut policy = aube_resolver::DependencyPolicy::default();
 
-    let mut package_extensions = manifest.package_extensions();
-    merge_json_object_setting(ctx, "packageExtensions", &mut package_extensions);
+    let package_extensions = effective_package_extensions(manifest, ctx);
     policy.package_extensions = parse_package_extensions(package_extensions);
 
     let mut allowed_deprecated = manifest.allowed_deprecated_versions();
@@ -449,6 +448,140 @@ pub(crate) fn resolve_dependency_policy(
     policy.block_exotic_subdeps = aube_settings::resolved::block_exotic_subdeps(ctx);
 
     policy
+}
+
+/// Assemble the effective `packageExtensions` object — the root
+/// manifest's `pnpm.packageExtensions` merged with every config source
+/// (`.npmrc`, `pnpm-workspace.yaml`, env), later sources winning per
+/// key. This is the object the resolver parses into typed
+/// `PackageExtension`s *and* the one pnpm hashes into
+/// `packageExtensionsChecksum`, so both must read it from here to stay
+/// in agreement.
+pub(crate) fn effective_package_extensions(
+    manifest: &aube_manifest::PackageJson,
+    ctx: &aube_settings::ResolveCtx<'_>,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut package_extensions = manifest.package_extensions();
+    merge_json_object_setting(ctx, "packageExtensions", &mut package_extensions);
+    package_extensions
+}
+
+/// Stamp pnpm's `packageExtensionsChecksum` / `pnpmfileChecksum` onto
+/// `graph` so a written pnpm-lock.yaml matches what pnpm itself records,
+/// keeping config-drift detection in sync (a wrong/absent value makes
+/// pnpm re-resolve, or abort a frozen install). No-op for non-pnpm
+/// lockfiles: aube-lock.yaml shares the writer and must not grow
+/// pnpm-only fields.
+///
+/// `local_pnpmfile` is the project-local pnpmfile that participates in
+/// the checksum — the caller resolves it via `crate::pnpmfile::detect`
+/// so this stays agnostic to `--ignore-pnpmfile` and the global-pnpmfile
+/// exclusion (pnpm hashes only the local file). Both checksums derive
+/// from the same inputs pnpm uses.
+pub(crate) async fn stamp_pnpm_config_checksums(
+    graph: &mut aube_lockfile::LockfileGraph,
+    write_kind: aube_lockfile::LockfileKind,
+    manifest: &aube_manifest::PackageJson,
+    ctx: &aube_settings::ResolveCtx<'_>,
+    local_pnpmfile: Option<&std::path::Path>,
+) {
+    if !matches!(write_kind, aube_lockfile::LockfileKind::Pnpm) {
+        return;
+    }
+    let package_extensions = effective_package_extensions(manifest, ctx);
+    graph.package_extensions_checksum =
+        aube_lockfile::pnpm::package_extensions_checksum(&package_extensions);
+
+    // Always reflect the *current* pnpmfile state: a missing, hook-less,
+    // or unreadable pnpmfile must clear any checksum the graph carried
+    // over (e.g. from a parsed lockfile), otherwise the written lockfile
+    // keeps a stale `pnpmfileChecksum` that pnpm treats as config drift.
+    //
+    // pnpm records the checksum only when the loaded pnpmfile actually
+    // exports a `hooks` object (`requireHooks` gates
+    // `calculatePnpmfileChecksum` on `entries.some(e => e.hooks != null)`).
+    // A pnpmfile that exists but exports no hooks — e.g. an empty
+    // `.pnpmfile.cjs` — gets no checksum from pnpm; stamping one anyway
+    // aborts pnpm's frozen install with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
+    // So gate on the export, not on file existence.
+    graph.pnpmfile_checksum = match local_pnpmfile {
+        Some(path) => match crate::pnpmfile::exports_hooks(path).await {
+            Ok(true) => match aube_lockfile::pnpm::pnpmfile_checksum(&[path.to_path_buf()]) {
+                Ok(checksum) => checksum,
+                Err(e) => {
+                    tracing::warn!(
+                        code = aube_codes::warnings::WARN_AUBE_PNPMFILE_CHECKSUM_FAILED,
+                        "failed to read pnpmfile {} for checksum: {e}",
+                        path.display()
+                    );
+                    None
+                }
+            },
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(
+                    code = aube_codes::warnings::WARN_AUBE_PNPMFILE_CHECKSUM_FAILED,
+                    "failed to inspect pnpmfile {} for hooks: {e}",
+                    path.display()
+                );
+                None
+            }
+        },
+        None => None,
+    };
+}
+
+/// Finalize a freshly resolved graph for the lockfile write paths that
+/// live *outside* `install` (`update`/`upgrade`, `remove`, `dedupe`,
+/// `audit --fix`). Mirrors the install path's pre-write sequence:
+/// stamp pnpm's config checksums (`packageExtensionsChecksum` +
+/// `pnpmfileChecksum`) then apply the pnpm-parity snapshot passes
+/// (`optional: true`, `transitivePeerDependencies`).
+///
+/// Before this existed, those commands resolved a graph with both
+/// checksum fields `None` and wrote it straight to disk, so e.g.
+/// `aube upgrade` dropped the `packageExtensionsChecksum` /
+/// `pnpmfileChecksum` a prior `aube install` had recorded — and the
+/// chained frozen-prefer install reused the now-stale lockfile without
+/// restamping, so the fields never came back. pnpm writes these on
+/// every command that rewrites the lockfile; matching that keeps
+/// config-drift detection (ours and pnpm's) honest.
+///
+/// `ignore_pnpmfile` / `cli_pnpmfile` mirror the install flags: when a
+/// caller honors `--ignore-pnpmfile` the local pnpmfile is excluded
+/// from the checksum (pnpm clears it in that mode); `cli_pnpmfile` is
+/// the `--pnpmfile` override (only `update` exposes one today).
+///
+/// Fails fast if `pnpm-workspace.yaml` is present but malformed: the
+/// stamped checksums are derived from that config, so falling back to an
+/// empty workspace would persist a checksum computed from the wrong
+/// inputs and desync config-drift detection. This matches the install
+/// entry path, which also propagates the parse error (a missing or empty
+/// workspace file is `Ok(default)`, not an error, so single-package
+/// projects are unaffected).
+pub(crate) async fn finalize_lockfile_graph(
+    cwd: &std::path::Path,
+    graph: &mut aube_lockfile::LockfileGraph,
+    manifest: &aube_manifest::PackageJson,
+    ignore_pnpmfile: bool,
+    cli_pnpmfile: Option<&std::path::Path>,
+) -> miette::Result<()> {
+    let write_kind = aube_lockfile::detect_existing_lockfile_kind(cwd)
+        .unwrap_or(aube_lockfile::LockfileKind::Aube);
+    let files = crate::commands::FileSources::load(cwd);
+    let (ws_config, raw_workspace) = aube_manifest::workspace::load_both(cwd)
+        .into_diagnostic()
+        .wrap_err("failed to load workspace config for lockfile finalization")?;
+    let env = aube_settings::values::process_env();
+    let ctx = files.ctx(&raw_workspace, env, &[]);
+    let local_pnpmfile = if ignore_pnpmfile {
+        None
+    } else {
+        crate::pnpmfile::detect(cwd, cli_pnpmfile, ws_config.pnpmfile_path.as_deref())
+    };
+    stamp_pnpm_config_checksums(graph, write_kind, manifest, &ctx, local_pnpmfile.as_deref()).await;
+    crate::commands::prepare_resolved_graph_for_lockfile_write(graph);
+    Ok(())
 }
 
 fn merge_json_object_setting(
@@ -700,41 +833,49 @@ pub(crate) fn configure_resolver(
     let force_metadata_primer = resolve_force_metadata_primer(settings_ctx);
     let (sup_os, sup_cpu, sup_libc) =
         aube_manifest::effective_supported_architectures(manifest, workspace_config);
-    // aube-lock.yaml, pnpm-lock.yaml, bun.lock, and package-lock.json
-    // are all committed, cross-platform artifacts that carry
-    // per-package os/cpu metadata: if the user hasn't declared
-    // `pnpm.supportedArchitectures` we widen the resolver's platform
-    // filter to cover every common OS/CPU/libc so Linux-native
-    // optionals (e.g. `@rollup/rollup-linux-x64-gnu`) land in the
-    // lockfile even when `aube install` is run on macOS, and
-    // macOS-native optionals (`@esbuild/darwin-arm64`) land in a
-    // Linux-CI-generated lockfile. pnpm, bun, and npm all do the same
-    // — they record every optional-dep variant regardless of host — so
-    // withholding them from the committed lockfile leaves
-    // cross-platform teammates with "Cannot find native binding" on
-    // install. For package-lock.json the stakes are higher still: a
-    // platform-mismatched *root* optional dependency (fsevents on
-    // Linux) that's missing from the lockfile makes `npm ci` refuse
-    // the whole install with EUSAGE "Missing: fsevents@x.y.z from lock
-    // file". Install-time filtering (see `filter_graph` call on the
-    // lockfile branch) still runs against the unmodified manifest
-    // setting, so `node_modules` stays trimmed to the host. Yarn
-    // classic lockfiles have no per-package os/cpu metadata, so
-    // widening there would only bloat the file — keep pnpm's host-only
-    // default for that one.
+    // pnpm-lock.yaml, aube-lock.yaml, bun.lock, and package-lock.json are
+    // all committed, cross-platform artifacts that carry per-package os/cpu
+    // metadata. When the user hasn't declared
+    // `pnpm.supportedArchitectures`, record EVERY optional-dep variant a
+    // package declares (`accept_all`) so the committed lockfile installs
+    // cleanly on every contributor's platform — withholding variants leaves
+    // teammates with "Cannot find native binding". This matches what pnpm
+    // AND bun both write verbatim (all 26 `@esbuild/*` / `@rollup/rollup-*`
+    // natives, freebsd/ppc64/s390x and all), so a lockfile aube regenerates
+    // stays diff-clean against the native tool. For package-lock.json the
+    // stakes are higher still: a platform-mismatched *root* optional
+    // dependency (fsevents on Linux) missing from the lockfile makes
+    // `npm ci` refuse the whole install with EUSAGE "Missing:
+    // fsevents@x.y.z from lock file", so npm is widened too. Install-time
+    // filtering (`filter_graph`) and the streaming-fetch gate run against
+    // the unmodified host triple, so `node_modules` and tarball downloads
+    // stay trimmed to the host — the wider lockfile costs only bytes, never
+    // extra installs. Yarn classic lockfiles have no per-package os/cpu
+    // metadata, so widening there would only bloat them — keep pnpm's
+    // host-only default.
     let manifest_set_supported_arch =
         !(sup_os.is_empty() && sup_cpu.is_empty() && sup_libc.is_empty());
     let writes_cross_platform_lock = matches!(
         target_lockfile_kind,
         Some(
-            aube_lockfile::LockfileKind::Aube
-                | aube_lockfile::LockfileKind::Pnpm
+            aube_lockfile::LockfileKind::Pnpm
+                | aube_lockfile::LockfileKind::Aube
                 | aube_lockfile::LockfileKind::Bun
                 | aube_lockfile::LockfileKind::Npm
         )
     );
-    let supported_architectures = if !manifest_set_supported_arch && writes_cross_platform_lock {
-        aube_resolver::SupportedArchitectures::aube_lock_default()
+    let supported_architectures = if manifest_set_supported_arch {
+        aube_resolver::SupportedArchitectures {
+            os: sup_os,
+            cpu: sup_cpu,
+            libc: sup_libc,
+            ..Default::default()
+        }
+    } else if writes_cross_platform_lock {
+        aube_resolver::SupportedArchitectures {
+            accept_all: true,
+            ..Default::default()
+        }
     } else {
         aube_resolver::SupportedArchitectures {
             os: sup_os,
@@ -1154,5 +1295,130 @@ mod peer_dependency_rules_tests {
         // match" rather than panicking or silencing everything.
         let r = rules(&[], &[], &[("react", "not-a-range")]);
         assert!(!r.silences(&unmet("parent", "react", "^18.0.0", Some("19.0.0"))));
+    }
+}
+
+#[cfg(test)]
+mod finalize_lockfile_graph_tests {
+    use super::*;
+
+    fn node_available() -> bool {
+        std::process::Command::new(crate::runtime::node_program())
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn manifest() -> aube_manifest::PackageJson {
+        aube_manifest::PackageJson {
+            name: Some("x".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Regression for `aube upgrade`/`dedupe`/`remove`/`audit` dropping
+    /// `packageExtensionsChecksum`: every command that rewrites a
+    /// pnpm-lock.yaml must stamp the checksum just like `aube install`.
+    #[tokio::test]
+    async fn finalize_stamps_package_extensions_checksum_on_pnpm_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(cwd.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"name":"x","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("pnpm-workspace.yaml"),
+            "packageExtensions:\n  foo@*:\n    dependencies:\n      bar: 1.0.0\n",
+        )
+        .unwrap();
+
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        assert!(graph.package_extensions_checksum.is_none());
+        // ignore_pnpmfile=true keeps this assertion node-free.
+        finalize_lockfile_graph(cwd, &mut graph, &manifest(), true, None)
+            .await
+            .unwrap();
+        assert!(
+            graph.package_extensions_checksum.is_some(),
+            "packageExtensions checksum must be stamped on pnpm-lock writes"
+        );
+    }
+
+    /// aube-lock.yaml must never grow pnpm-only checksum fields — the
+    /// stamp is a no-op when no pnpm lockfile is present.
+    #[tokio::test]
+    async fn finalize_skips_checksums_on_aube_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"name":"x","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("pnpm-workspace.yaml"),
+            "packageExtensions:\n  foo@*:\n    dependencies:\n      bar: 1.0.0\n",
+        )
+        .unwrap();
+
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        finalize_lockfile_graph(cwd, &mut graph, &manifest(), false, None)
+            .await
+            .unwrap();
+        assert!(
+            graph.package_extensions_checksum.is_none(),
+            "aube-lock.yaml must not grow pnpm-only checksum fields"
+        );
+        assert!(graph.pnpmfile_checksum.is_none());
+    }
+
+    /// The pnpmfile half of the same regression: a local pnpmfile that
+    /// exports hooks gets its `pnpmfileChecksum` recorded on a pnpm-lock
+    /// rewrite (matching pnpm + a fresh `aube install`).
+    #[tokio::test]
+    async fn finalize_stamps_pnpmfile_checksum_on_pnpm_lock() {
+        if !node_available() {
+            eprintln!("skipping: `node` not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(cwd.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"name":"x","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".pnpmfile.cjs"),
+            "module.exports = { hooks: { readPackage: (pkg) => pkg } }\n",
+        )
+        .unwrap();
+
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        finalize_lockfile_graph(cwd, &mut graph, &manifest(), false, None)
+            .await
+            .unwrap();
+        assert!(
+            graph.pnpmfile_checksum.is_some(),
+            "pnpmfile checksum must be stamped when a hook-exporting pnpmfile is present"
+        );
+
+        // --ignore-pnpmfile clears it, matching pnpm.
+        let mut ignored = aube_lockfile::LockfileGraph::default();
+        finalize_lockfile_graph(cwd, &mut ignored, &manifest(), true, None)
+            .await
+            .unwrap();
+        assert!(
+            ignored.pnpmfile_checksum.is_none(),
+            "--ignore-pnpmfile must not record a pnpmfile checksum"
+        );
     }
 }

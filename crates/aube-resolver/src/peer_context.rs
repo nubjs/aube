@@ -336,8 +336,9 @@ pub struct PeerContextOptions {
     /// module for the owning implementation (intentionally crate-
     /// private; the public API here is the option flag itself).
     pub resolve_from_workspace_root: bool,
-    /// Byte cap on the peer-ID suffix after which the entire suffix
-    /// is hashed to `_<10-char-sha256-hex>`. pnpm's default is 1000.
+    /// Byte cap on the peer-ID suffix body after which the entire
+    /// suffix is replaced by a parenthesized short hash `(<short-hash>)`
+    /// (pnpm's `createPeerDepGraphHash`). pnpm's default is 1000.
     pub peers_suffix_max_length: usize,
 }
 
@@ -580,6 +581,8 @@ pub(crate) fn dedupe_peer_variants(graph: LockfileGraph) -> LockfileGraph {
         packages,
         settings,
         overrides,
+        package_extensions_checksum,
+        pnpmfile_checksum,
         ignored_optional_dependencies,
         times,
         skipped_optional_dependencies,
@@ -628,6 +631,8 @@ pub(crate) fn dedupe_peer_variants(graph: LockfileGraph) -> LockfileGraph {
         packages: new_packages,
         settings,
         overrides,
+        package_extensions_checksum,
+        pnpmfile_checksum,
         ignored_optional_dependencies,
         times,
         skipped_optional_dependencies,
@@ -760,6 +765,8 @@ fn apply_peer_contexts_once(
         // from the input graph untouched.
         settings: canonical.settings,
         overrides: canonical.overrides,
+        package_extensions_checksum: canonical.package_extensions_checksum,
+        pnpmfile_checksum: canonical.pnpmfile_checksum,
         ignored_optional_dependencies: canonical.ignored_optional_dependencies,
         runtimes: canonical.runtimes,
         times: canonical.times,
@@ -782,14 +789,6 @@ fn apply_peer_contexts_once(
 /// `(` / `)` / end-of-string)? Used by the peer-context pass to detect
 /// when a nested tail loops back to the current package so it can
 /// short-circuit the chain instead of growing the suffix forever.
-/// If `s` ends with `_<10 lowercase hex>` (the marker written by
-/// `hash_peer_suffix`), strip it and return the prefix. Otherwise
-/// return `s` unchanged.
-///
-/// Safe against false positives: `s` here is always a post-split
-/// `name@version` base, and semver forbids `_` inside a version, so
-/// an underscore 10 chars from the end of `name@version` can only be
-/// our marker.
 /// Everything before the first `(` — i.e. the canonical `name@version`
 /// part of a dep-path with the peer-context suffix stripped. Returns
 /// the original string when no `(` is present. Borrowed; callers that
@@ -820,39 +819,58 @@ fn scope_map_from_deps(deps: &[DirectDep]) -> FxHashMap<String, String> {
     out
 }
 
-fn strip_hashed_peer_suffix(s: &str) -> &str {
-    const MARKER_LEN: usize = 11; // `_` + 10 hex chars
-    if s.len() < MARKER_LEN {
-        return s;
-    }
-    let tail = &s[s.len() - MARKER_LEN..];
-    if !tail.starts_with('_') {
-        return s;
-    }
-    if tail[1..]
-        .chars()
-        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-    {
-        &s[..s.len() - MARKER_LEN]
-    } else {
-        s
-    }
+/// True when `s` is a single hashed peer suffix `(<32 lowercase hex>)`
+/// as emitted by [`effective_peer_suffix`] once a suffix exceeds
+/// `peersSuffixMaxLength`. The hashed form discards the textual peer
+/// set, so the propagation pass recognizes such keys and leaves them
+/// untouched (their per-peer contribution can't be recovered). A real
+/// peer segment always contains `@`, so the all-hex check can't
+/// false-positive on a `(name@version)` group.
+pub(crate) fn is_hashed_peer_suffix(s: &str) -> bool {
+    let Some(inner) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) else {
+        return false;
+    };
+    inner.len() == 32
+        && inner
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Hash a peer-ID suffix with SHA-256 and return `_<10-char-hex>`.
-/// Used by the peer-context pass when the raw suffix length exceeds
-/// `peersSuffixMaxLength`. Matches pnpm's format so lockfile dep_path
-/// keys stay portable.
-pub(crate) fn hash_peer_suffix(suffix: &str) -> String {
+/// pnpm's `createShortHash`: the lowercase SHA-256 hex digest of
+/// `input`, truncated to its first 32 characters (16 bytes).
+fn short_peer_hash(input: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(suffix.as_bytes());
-    let mut out = String::with_capacity(11);
-    out.push('_');
-    for byte in digest.iter().take(5) {
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
         use std::fmt::Write;
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Final peer-context tail for an already-built `(name@version)…`
+/// `suffix`, mirroring pnpm's `createPeerDepGraphHash`. pnpm derives
+/// `dirName` by joining the sorted peer ids with `)(` — i.e. the suffix
+/// without its outer parens — hashes it with `createShortHash` when it
+/// exceeds `peersSuffixMaxLength`, and always re-wraps the result in a
+/// single `(...)`. Keeping that shape means a capped suffix aube writes
+/// into `pnpm-lock.yaml` is `(<short-hash>)` — byte-compatible with
+/// pnpm — never a bare `_<hex>` marker.
+pub(crate) fn effective_peer_suffix(suffix: &str, max_length: usize) -> String {
+    // `dir_name` == pnpm's `dirName`: the suffix without the outer `(`
+    // and `)` that wrap the first and last peer segment. `suffix` is
+    // always a concatenation of `(…)` groups here, so stripping one
+    // byte off each end is safe; an empty suffix degrades to empty.
+    let dir_name = suffix
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(suffix);
+    if dir_name.len() > max_length {
+        format!("({})", short_peer_hash(dir_name))
+    } else {
+        suffix.to_string()
+    }
 }
 
 pub(crate) fn contains_canonical_back_ref(value: &str, canonical: &str) -> bool {
@@ -1139,10 +1157,10 @@ fn propagate_peer_suffixes_to_ancestors(
         }
         if let Some(children) = forward.get(key) {
             for child in children {
-                if let Some((child_name, _ver)) = canonical_tail(child).rsplit_once('@') {
-                    if !child_name.is_empty() {
-                        suppressed.insert(child_name.to_string());
-                    }
+                if let Some((child_name, _ver)) = canonical_tail(child).rsplit_once('@')
+                    && !child_name.is_empty()
+                {
+                    suppressed.insert(child_name.to_string());
                 }
             }
         }
@@ -1184,7 +1202,7 @@ fn propagate_peer_suffixes_to_ancestors(
     // cumulative is identical to its self set the rewrite is a no-op
     // and we skip it.
     //
-    // Hashed-suffix keys (`name@version_<10hex>`, produced when a
+    // Hashed-suffix keys (`name@version(<short-hash>)`, produced when a
     // package's own peer suffix exceeded `peersSuffixMaxLength`) are
     // left untouched. The hash form discards the textual peer set
     // by design — `outer_paren_segments` can't recover its
@@ -1202,19 +1220,38 @@ fn propagate_peer_suffixes_to_ancestors(
         let Some(segments) = cumulative.get(key) else {
             continue;
         };
-        let original_tail = canonical_tail(key);
-        let canonical = strip_hashed_peer_suffix(original_tail);
-        if canonical.len() != original_tail.len() {
-            // Original key already has the hashed marker. Skip — see
-            // comment above.
+        // Git / remote-tarball (globally-shareable) packages keep a bare
+        // dep_path keyed solely by their content-pinned URL — pnpm never
+        // appends a `(peer@ver)` suffix to a non-registry depPath. Every
+        // git/tarball key in a real pnpm-lock.yaml is bare even when its
+        // subtree resolves peers: e.g. `<pkg>@<url>` sits bare above a
+        // registry descendant like `<child>@6.5.1(@types/node@…)`.
+        // Absorbing a descendant's `(@types/node@…)` here would (a) diverge
+        // from the lockfile and (b) give the same content-identical tarball
+        // a different dep_path per consuming subtree, splitting the single
+        // shared global-virtual-store entry into duplicates (so one
+        // content-pinned singleton would load twice → "Cannot find
+        // module"). The descendant peers still propagate onto this node's
+        // *registry* ancestors through `cumulative`, so a registry parent
+        // keeps its own `(@types/node@…)` suffix; only the git/tarball node
+        // itself stays bare.
+        if graph
+            .packages
+            .get(key)
+            .and_then(|p| p.local_source.as_ref())
+            .is_some_and(|s| s.is_globally_shareable())
+        {
+            continue;
+        }
+        let canonical = canonical_tail(key);
+        if is_hashed_peer_suffix(&key[canonical.len()..]) {
+            // Original key already carries the hashed suffix `(…)` — see
+            // comment above. Its textual peer set is irrecoverable, so
+            // leave the key untouched.
             continue;
         }
         let suffix: String = segments.values().cloned().collect();
-        let effective_suffix = if suffix.len() > options.peers_suffix_max_length {
-            hash_peer_suffix(&suffix)
-        } else {
-            suffix
-        };
+        let effective_suffix = effective_peer_suffix(&suffix, options.peers_suffix_max_length);
         let new_key = format!("{canonical}{effective_suffix}");
         if new_key != *key {
             rewrite.insert(key.clone(), new_key);
@@ -1245,6 +1282,8 @@ fn propagate_peer_suffixes_to_ancestors(
         packages,
         settings,
         overrides,
+        package_extensions_checksum,
+        pnpmfile_checksum,
         ignored_optional_dependencies,
         times,
         skipped_optional_dependencies,
@@ -1303,6 +1342,8 @@ fn propagate_peer_suffixes_to_ancestors(
         packages: new_packages,
         settings,
         overrides,
+        package_extensions_checksum,
+        pnpmfile_checksum,
         ignored_optional_dependencies,
         times,
         skipped_optional_dependencies,
@@ -1471,6 +1512,8 @@ pub(crate) fn dedupe_peer_suffixes(graph: LockfileGraph) -> LockfileGraph {
         packages: new_packages,
         settings: graph.settings,
         overrides: graph.overrides,
+        package_extensions_checksum: graph.package_extensions_checksum,
+        pnpmfile_checksum: graph.pnpmfile_checksum,
         ignored_optional_dependencies: graph.ignored_optional_dependencies,
         runtimes: graph.runtimes,
         times: graph.times,
@@ -1545,16 +1588,13 @@ fn visit_peer_context<'g>(
     // append the new suffix on top of the old and grow unboundedly
     // across iterations (classic mutual-peer-cycle blow-up).
     //
-    // Two suffix forms can be present from a prior pass:
-    //   1. `(name@version)(…)` — the normal nested peer suffix. Stripped
-    //      by splitting on the first `(`.
-    //   2. `_<10-char-sha256-hex>` — the hashed form produced when the
-    //      normal suffix exceeded `peersSuffixMaxLength`. Must also be
-    //      stripped; otherwise each pass re-hashes the already-hashed
-    //      key and appends another marker (exposed by the
-    //      `peer_suffix_is_hashed_when_exceeding_cap` unit test).
-    let canonical_base = canonical_tail(input_dep_path);
-    let canonical_base = strip_hashed_peer_suffix(canonical_base).to_string();
+    // Both suffix forms are parenthesized — the normal nested
+    // `(name@version)(…)` and the capped `(<short-hash>)` that
+    // `effective_peer_suffix` emits past `peersSuffixMaxLength` — so
+    // splitting on the first `(` strips either one. Otherwise each
+    // pass would re-hash the already-hashed key and grow it (covered
+    // by the `peer_suffix_is_hashed_when_exceeding_cap` unit test).
+    let canonical_base = canonical_tail(input_dep_path).to_string();
 
     // Compute peer context: walk declared peers, resolve from ancestors
     // (nearest wins — the scope is rebuilt as we recurse) or from the
@@ -1598,6 +1638,23 @@ fn visit_peer_context<'g>(
     // If nothing in the graph holds a version of this peer at all,
     // it's left out of the context entirely — `detect_unmet_peers`
     // will surface it as a warning after the pass.
+    //
+    // Only peers the package actually *declares* in `peerDependencies`
+    // build a dep_path suffix here. A name present solely in
+    // `peerDependenciesMeta` (a meta-only optional peer — the way
+    // `follow-redirects` declares `debug`, for instance) is deliberately
+    // NOT folded in: pnpm treats such a peer as resolvable but then
+    // collapses the binding back out via `dedupe-peer-dependents`
+    // whenever a peer-free path exists, so the realistic lockfile leaves
+    // the whole chain bare even when a distant ancestor carries that peer
+    // as a plain dependency. Eagerly binding the meta-only peer from that
+    // ancestor scope produced `(peer@ver)`-suffixed variants that aube's
+    // dedupe pass (which only collapses *declared*-peer variants) never
+    // merged, so the same subtree hashed differently per install scope
+    // (whole-workspace vs single-member), splitting a shared
+    // global-virtual-store singleton in two and surfacing at runtime as a
+    // duplicate-instance "Cannot find module". Matching pnpm's *deduped*
+    // output — bare — keeps the singleton intact.
     let mut peer_context: Vec<(String, String)> = Vec::new();
     for (peer_name, declared_range) in &pkg.peer_dependencies {
         let satisfies_declared = |v: &str| -> bool {
@@ -1671,14 +1728,32 @@ fn visit_peer_context<'g>(
                 .map(|(_, tail)| tail)
         };
 
-        if let Some(version) = from_ancestor
-            .or(from_pkg_deps)
-            .or(from_ancestor_incompatible)
-            .or(from_pkg_deps_incompatible)
-            .or(from_root)
-            .or_else(from_graph_scan)
-            .or(from_root_incompatible)
-        {
+        // pnpm resolves an *optional* peer (one flagged
+        // `peerDependenciesMeta.optional`) only from the resolution path it
+        // is actually on — the nearest ancestor, the package's own
+        // auto-installed deps, or the workspace root — and otherwise leaves
+        // it unresolved so it surfaces under `transitivePeerDependencies`.
+        // It never reaches for a range-incompatible version or scans the
+        // whole graph for an unrelated copy. Mirroring that is what lets
+        // `typescript` (an optional peer the root provides) take a dep-path
+        // suffix while debug's optional `supports-color` (which nothing on
+        // the path provides) bubbles up instead of binding to a cousin.
+        let is_optional = pkg
+            .peer_dependencies_meta
+            .get(peer_name)
+            .is_some_and(|m| m.optional);
+        let resolved = if is_optional {
+            from_ancestor.or(from_pkg_deps).or(from_root)
+        } else {
+            from_ancestor
+                .or(from_pkg_deps)
+                .or(from_ancestor_incompatible)
+                .or(from_pkg_deps_incompatible)
+                .or(from_root)
+                .or_else(from_graph_scan)
+                .or(from_root_incompatible)
+        };
+        if let Some(version) = resolved {
             peer_context.push((peer_name.clone(), version));
         }
     }
@@ -1715,15 +1790,11 @@ fn visit_peer_context<'g>(
             format!("({n}@{display_v})")
         })
         .collect();
-    // pnpm's `peersSuffixMaxLength`: when the built suffix exceeds the
-    // cap, replace the entire suffix with `_<10-char-sha256-hex>` so the
-    // lockfile key stays bounded. Matches pnpm's lockfile format, so
-    // lockfiles shared between aube and pnpm stay comparable.
-    let effective_suffix = if suffix.len() > options.peers_suffix_max_length {
-        hash_peer_suffix(&suffix)
-    } else {
-        suffix
-    };
+    // pnpm's `peersSuffixMaxLength`: when the suffix body exceeds the
+    // cap, `effective_peer_suffix` replaces the whole suffix with a
+    // parenthesized short hash `(<hash>)` so the lockfile key stays
+    // bounded and byte-compatible with pnpm's `createPeerDepGraphHash`.
+    let effective_suffix = effective_peer_suffix(&suffix, options.peers_suffix_max_length);
     let contextualized = format!("{canonical_base}{effective_suffix}");
 
     if out_packages.contains_key(&contextualized) || visiting.contains(&contextualized) {
@@ -1872,4 +1943,92 @@ fn visit_peer_context<'g>(
         },
     );
     Some(contextualized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aube_lockfile::{DepType, DirectDep, PeerDepMeta};
+
+    fn locked(name: &str, deps: &[(&str, &str)]) -> LockedPackage {
+        LockedPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: format!("{name}@1.0.0"),
+            dependencies: deps
+                .iter()
+                .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// `root -> app -> {plugin, sibling}` and `sibling -> theme`. `theme`
+    /// is only ever a *cousin* of `plugin` (never an ancestor, the root,
+    /// or one of plugin's own deps), so the single way to reach it from
+    /// plugin's peer is the graph-wide scan.
+    fn graph_with_cousin_peer() -> LockfileGraph {
+        let mut g = LockfileGraph::default();
+        g.importers.insert(
+            ".".to_string(),
+            vec![DirectDep {
+                name: "app".to_string(),
+                dep_path: "app@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("1.0.0".to_string()),
+            }],
+        );
+        for p in [
+            locked("app", &[("plugin", "1.0.0"), ("sibling", "1.0.0")]),
+            locked("plugin", &[]),
+            locked("sibling", &[("theme", "1.0.0")]),
+            locked("theme", &[]),
+        ] {
+            g.packages.insert(p.dep_path.clone(), p);
+        }
+        g
+    }
+
+    #[test]
+    fn optional_peer_is_not_bound_via_graph_scan() {
+        let mut g = graph_with_cousin_peer();
+        let plugin = g.packages.get_mut("plugin@1.0.0").expect("plugin present");
+        plugin
+            .peer_dependencies
+            .insert("theme".to_string(), "*".to_string());
+        plugin
+            .peer_dependencies_meta
+            .insert("theme".to_string(), PeerDepMeta { optional: true });
+
+        let out = apply_peer_contexts(g, &PeerContextOptions::default()).expect("peer pass");
+
+        assert!(
+            out.packages.contains_key("plugin@1.0.0"),
+            "plugin keeps bare key"
+        );
+        assert!(
+            !out.packages.contains_key("plugin@1.0.0(theme@1.0.0)"),
+            "an optional peer reachable only via the graph scan must stay \
+             unresolved so it surfaces under transitivePeerDependencies"
+        );
+    }
+
+    #[test]
+    fn required_peer_still_binds_via_graph_scan() {
+        // Same shape, but `theme` is a *required* peer (no meta entry):
+        // the graph-wide scan still binds it, proving the narrowing above
+        // is specific to optional peers and not a regression.
+        let mut g = graph_with_cousin_peer();
+        let plugin = g.packages.get_mut("plugin@1.0.0").expect("plugin present");
+        plugin
+            .peer_dependencies
+            .insert("theme".to_string(), "*".to_string());
+
+        let out = apply_peer_contexts(g, &PeerContextOptions::default()).expect("peer pass");
+
+        assert!(
+            out.packages.contains_key("plugin@1.0.0(theme@1.0.0)"),
+            "a required peer should still resolve through the graph-wide scan"
+        );
+    }
 }

@@ -114,6 +114,30 @@ impl LocalSource {
         }
     }
 
+    /// Whether this source is pinned to immutable, globally
+    /// reproducible content and can therefore be shared across
+    /// projects inside aube's global virtual store, exactly like a
+    /// registry package.
+    ///
+    /// `Git` is pinned to a 40-char commit SHA and `RemoteTarball` to
+    /// a fetched URL (and, once resolved, an integrity hash), so two
+    /// projects that depend on the same one resolve to the same files.
+    /// `file:` / `link:` / `portal:` / `exec:` all resolve against a
+    /// path inside the depending project, so they stay per-project and
+    /// are never promoted into the shared store.
+    ///
+    /// Load-bearing for global-virtual-store correctness: a registry
+    /// package materialized into the shared store points its
+    /// dependency siblings at the hashed global path
+    /// (`virtual_store_subdir(dep_path)`). If one of those deps were a
+    /// git/tarball source that only ever landed in the per-project
+    /// `.aube/`, the sibling symlink would dangle and Node's module
+    /// walk would silently fall back to some unrelated `<name>` found
+    /// higher up the tree.
+    pub fn is_globally_shareable(&self) -> bool {
+        matches!(self, LocalSource::Git(_) | LocalSource::RemoteTarball(_))
+    }
+
     /// The path as a POSIX-style string with forward-slash separators.
     /// `Path::display()` and `to_string_lossy()` honor the host's
     /// separator (backslash on Windows), which would make `dep_path`
@@ -263,6 +287,93 @@ impl LocalSource {
         let lower = name.to_ascii_lowercase();
         lower.ends_with(".tgz") || lower.ends_with(".tar.gz")
     }
+}
+
+/// Resolve a transitive dependency's recorded spec *value* to the same
+/// `dep_path` key the lockfile parser assigns the target package, for
+/// the two content-pinned source kinds that get shared globally (git
+/// and remote tarball).
+///
+/// pnpm records a git / remote-tarball dependency inside a snapshot's
+/// `dependencies:` map by its *resolved spec* — `<url>#<sha>` for git,
+/// the tarball URL for remote tarballs (e.g. request-promise-core lists
+/// `request: https://github.com/request/request.git#<sha>`). The parser,
+/// however, keys the package itself under [`LocalSource::dep_path`] — the
+/// short `name@git+<hash>` / `name@url+<hash>` form. A naive
+/// `format!("{name}@{value}")` lookup therefore points at a key that was
+/// never inserted into the graph, so:
+///
+/// * the linker's sibling symlink dangles (Node resolves the wrong
+///   `<name>` or none — the request-promise-core crash), and
+/// * the graph hasher skips the child entirely, so neither its content
+///   fingerprint nor its build/engine taint cascades into the parent's
+///   global-virtual-store hash.
+///
+/// Mirror `pnpm::read::push_direct`'s keying so the resolved value lands
+/// on the exact `dep_path` the package was materialized under. Returns
+/// `None` for every other value (plain semver, `file:`, `link:`, npm
+/// aliases, …) so callers keep the verbatim `name@value` key those
+/// already resolve correctly with.
+pub fn shared_local_dep_path(dep_name: &str, dep_value: &str) -> Option<String> {
+    // pnpm appends a `(peer@ver)` suffix to some spec values; the parser
+    // strips it before classifying the source, so strip it here too.
+    //
+    // This MUST stay byte-for-byte identical to `pnpm::read::push_direct`'s
+    // `classify_version` (`info.version.split('(').next()`), which is what
+    // produced the `dep_path` keys in `graph.packages` we're matching
+    // against. A "smarter" strip (e.g. only a trailing `(peer@…)` via
+    // rfind) would *desync* the two: any value with a non-peer `(` would
+    // hash differently here than the key the parser inserted, silently
+    // re-skipping that child in the linker and graph hasher. If the
+    // first-`(` truncation is ever wrong for a real spec, fix it in
+    // `push_direct` and here together — never in isolation.
+    let classify = dep_value.split('(').next().unwrap_or(dep_value);
+    match LocalSource::parse(classify, Path::new("")) {
+        Some(LocalSource::Git(mut git)) => {
+            // Snapshot specs carry the pinned commit after `#`, which
+            // `parse` records as `committish` rather than `resolved`. The
+            // package was keyed with that commit promoted to `resolved`
+            // (see `push_direct`), so promote it here too — otherwise the
+            // `url#resolved` hash diverges from the package's dep_path.
+            if git.resolved.is_empty() {
+                git.resolved = git.committish.take()?;
+            }
+            Some(LocalSource::Git(git).dep_path(dep_name))
+        }
+        Some(tarball @ LocalSource::RemoteTarball(_)) => Some(tarball.dep_path(dep_name)),
+        _ => None,
+    }
+}
+
+/// Resolve a dependency edge `(name, tail)` to the graph key of the child
+/// package node, honoring every reader's storage convention. Returns the
+/// first candidate that satisfies `contains` (the caller's "is this a real
+/// package key?" predicate), or `None` when the edge points outside the
+/// graph (a pruned optional, an unresolved peer, a `link:` target, …).
+///
+/// Three conventions coexist because the readers disagree on what a
+/// dependency *value* holds, and a graph walker that only knows one of
+/// them silently drops the others:
+///   1. `tail` verbatim — npm/yarn/bun store the full dep_path as the
+///      value (`"foo@1.2.3"`).
+///   2. `name@tail` — the pnpm reader stores only the tail (`"1.2.3"`),
+///      so the key is the name re-joined to it.
+///   3. [`shared_local_dep_path`] — git / remote-tarball deps store the
+///      resolved URL as the tail, but the node is keyed under the short
+///      `name@git+<hash>` / `name@url+<hash>` form. The linker's
+///      `materialize` already bridges the edge this way; reachability /
+///      marking walkers that skip it prune the entire git/tarball subtree
+///      (a content-pinned git/tarball child and everything under it
+///      vanishes from the walk once the node is keyed canonically).
+pub fn resolve_dep_edge(name: &str, tail: &str, contains: impl Fn(&str) -> bool) -> Option<String> {
+    if contains(tail) {
+        return Some(tail.to_string());
+    }
+    let rejoined = format!("{name}@{tail}");
+    if contains(&rejoined) {
+        return Some(rejoined);
+    }
+    shared_local_dep_path(name, tail).filter(|key| contains(key))
 }
 
 /// Parse a git dependency specifier into `(clone_url, committish)`.
@@ -1024,5 +1135,114 @@ mod tests {
             subpath: Some("packages/b".to_string()),
         });
         assert_ne!(a.dep_path("dep"), b.dep_path("dep"));
+    }
+
+    const SHARED_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// The dep_path the lockfile parser keys a git package under, given
+    /// its normalized clone URL and pinned commit.
+    fn git_key(url: &str, resolved: &str) -> String {
+        LocalSource::Git(GitSource {
+            url: url.to_string(),
+            committish: None,
+            resolved: resolved.to_string(),
+            integrity: None,
+            subpath: None,
+        })
+        .dep_path("request")
+    }
+
+    /// The dep_path the lockfile parser keys a remote-tarball package
+    /// under, given its fetch URL.
+    fn tarball_key(url: &str) -> String {
+        LocalSource::RemoteTarball(RemoteTarballSource {
+            url: url.to_string(),
+            integrity: String::new(),
+            git_hosted: false,
+        })
+        .dep_path("request")
+    }
+
+    #[test]
+    fn shared_github_shorthand_maps_to_git_dep_path() {
+        // A dependent records its git `request` via the `github:` spec,
+        // but the package is keyed under the hashed `git+` dep_path. The
+        // sibling symlink / hasher lookup must use that same key or it
+        // dangles / silently skips the child.
+        let got = shared_local_dep_path("request", &format!("github:request/request#{SHARED_SHA}"))
+            .expect("github: spec is a shareable local source");
+        assert_eq!(
+            got,
+            git_key("https://github.com/request/request.git", SHARED_SHA)
+        );
+        assert!(got.starts_with("request@git+"), "unexpected key: {got}");
+    }
+
+    #[test]
+    fn shared_git_url_and_shorthand_converge() {
+        // Whether the dependent recorded the shorthand or the resolved
+        // `<url>.git#<sha>` form, both must canonicalize to one key.
+        let from_shorthand =
+            shared_local_dep_path("request", &format!("github:request/request#{SHARED_SHA}"))
+                .unwrap();
+        let from_url = shared_local_dep_path(
+            "request",
+            &format!("https://github.com/request/request.git#{SHARED_SHA}"),
+        )
+        .unwrap();
+        assert_eq!(from_shorthand, from_url);
+    }
+
+    #[test]
+    fn shared_missing_resolved_is_promoted_from_committish() {
+        // A lockfile round-trip that never re-resolved leaves `resolved`
+        // empty and only carries `#<committish>`; the helper must promote
+        // it so the hash matches the package's `<url>#<sha>` key.
+        let got = shared_local_dep_path(
+            "request",
+            &format!("https://github.com/request/request.git#{SHARED_SHA}"),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            git_key("https://github.com/request/request.git", SHARED_SHA)
+        );
+    }
+
+    #[test]
+    fn shared_codeload_tarball_maps_to_url_dep_path() {
+        // The exact form pnpm records for a `github:` dep that resolves to
+        // a codeload archive. This is the case that crashed
+        // request-promise-core under the global virtual store.
+        let url = format!("https://codeload.github.com/request/request/tar.gz/{SHARED_SHA}");
+        let got = shared_local_dep_path("request", &url).unwrap();
+        assert_eq!(got, tarball_key(&url));
+        assert!(got.starts_with("request@url+"), "unexpected key: {got}");
+    }
+
+    #[test]
+    fn shared_strips_peer_suffix_before_classifying() {
+        let url = format!("https://codeload.github.com/request/request/tar.gz/{SHARED_SHA}");
+        let with_peer = format!("{url}(typescript@5.8.3)");
+        assert_eq!(
+            shared_local_dep_path("request", &with_peer),
+            shared_local_dep_path("request", &url),
+        );
+    }
+
+    #[test]
+    fn shared_returns_none_for_non_shareable_specs() {
+        for value in [
+            "4.18.1",
+            "^1.2.3",
+            "link:../sibling",
+            "file:./vendor/x",
+            "npm:lodash@4.18.1",
+        ] {
+            assert!(
+                shared_local_dep_path("dep", value).is_none(),
+                "{value:?} must not be treated as a shareable local source",
+            );
+        }
     }
 }

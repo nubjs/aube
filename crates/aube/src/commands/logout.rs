@@ -1,8 +1,9 @@
 //! `aube logout` — remove a registry auth token from the user's `~/.npmrc`.
 //!
-//! Inverse of `aube login`. Strips `//host/:_authToken` (and, when a
-//! `--scope` is passed, the matching `@scope:registry` mapping) from the
-//! user-level `.npmrc` in place, leaving every other entry untouched.
+//! Inverse of `aube login`. Strips `//host/:_authToken` or
+//! `//host/:@scope:_authToken` (and, when a `--scope` is passed, the
+//! matching `@scope:registry` mapping) from the user-level `.npmrc` in
+//! place, leaving every other entry untouched.
 
 use crate::commands::npmrc::{NpmrcEdit, registry_host_key, resolve_registry, user_npmrc_path};
 use clap::Args;
@@ -35,9 +36,29 @@ pub async fn run(args: LogoutArgs) -> miette::Result<()> {
     }
 
     let mut edit = NpmrcEdit::load(&path)?;
-    let removed_token = edit.remove(&format!("{host_key}:_authToken"));
+    let removed_token = match &args.scope {
+        Some(scope) => {
+            let scoped_token_prefix = format!("{host_key}:");
+            edit.remove_matching(|key| {
+                key.strip_prefix(&scoped_token_prefix)
+                    .and_then(|rest| rest.strip_suffix(":_authToken"))
+                    .is_some_and(|stored_scope| stored_scope.eq_ignore_ascii_case(scope))
+            })
+        }
+        None => {
+            let unscoped_token_key = format!("{host_key}:_authToken");
+            let scoped_token_prefix = format!("{host_key}:@");
+            edit.remove_matching(|key| {
+                key == unscoped_token_key.as_str()
+                    || (key.starts_with(&scoped_token_prefix) && key.ends_with(":_authToken"))
+            })
+        }
+    };
     let removed_scope = match &args.scope {
-        Some(scope) => edit.remove(&format!("{scope}:registry")),
+        Some(scope) => edit.remove_matching(|key| {
+            key.strip_suffix(":registry")
+                .is_some_and(|stored_scope| stored_scope.eq_ignore_ascii_case(scope))
+        }),
         None => false,
     };
 

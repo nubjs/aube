@@ -1,7 +1,7 @@
 //! Integration test for the env-prefix brand boundary under a nub-shaped
 //! embedder — `env_prefix = None` (no branded debug-toggle family) but
-//! `config_env_prefix = Some("NUB")` (the three first-class config knobs read
-//! under the host's own brand).
+//! `config_env_prefix = Some("NUB")` (the first-class config knobs read under
+//! the host's own brand).
 //!
 //! Lives in its own integration-test binary (= its own process) because the
 //! active `Embedder` is once-per-process (`set_embedder` is first-write-wins):
@@ -15,7 +15,7 @@ use aube_util::Embedder;
 use aube_util::env::{config_env, embedder_env};
 
 /// A nub-shaped embedder: hides the branded debug-toggle family
-/// (`env_prefix = None`) but owns three first-class config knobs under its own
+/// (`env_prefix = None`) but owns the first-class config knobs under its own
 /// brand (`config_env_prefix = Some("NUB")`).
 static NUBLIKE: Embedder = Embedder {
     name: "nublike",

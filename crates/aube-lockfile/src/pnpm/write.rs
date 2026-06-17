@@ -1,4 +1,6 @@
-use super::dep_path::{dep_path_tail, parse_dep_path, peerless_dep_path, version_to_dep_path};
+use super::dep_path::{
+    dep_path_tail, parse_dep_path, peerless_dep_path, rewrite_peer_suffix, version_to_dep_path,
+};
 use super::format::reformat_for_pnpm_parity;
 use crate::{DepType, Error, LocalSource, LockfileGraph};
 use aube_manifest::PackageJson;
@@ -86,6 +88,26 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 .map(|hash| (dep_path.as_str(), hash.as_str()))
         })
         .collect();
+    // Translate a *flat* peer reference from aube's internal FS-safe
+    // hashed dep_path (`request@url+<hash>` / `request@git+<hash>`) to the
+    // resolved spec pnpm writes inside a peer suffix
+    // (`request@https://codeload.…/tar.gz/<sha>`). The reference is itself a
+    // package key, so a direct lookup yields the target's source. Registry
+    // peers aren't in the table under their suffix head (or carry no
+    // `local_source`) and return `None`, leaving `react@18.2.0` untouched.
+    // Restricted to git / remote-tarball so it stays the exact inverse of
+    // the reader's `shared_local_dep_path` pass (which only re-derives those
+    // two kinds); `file:` / `link:` peers never occur in practice and a
+    // one-sided translation would break the round-trip.
+    let peer_suffix_to_spec = |head: &str| -> Option<String> {
+        let pkg = graph.packages.get(head)?;
+        match pkg.local_source.as_ref()? {
+            local @ (LocalSource::Git(_) | LocalSource::RemoteTarball(_)) => {
+                Some(format!("{}@{}", pkg.name, local.specifier()))
+            }
+            _ => None,
+        }
+    };
     let mut importers = BTreeMap::new();
     let exclude_links = graph.settings.exclude_links_from_lockfile;
     for (importer_path, deps) in &graph.importers {
@@ -171,10 +193,14 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             {
                 format!("{real_name}@{}", dep_path_tail(&dep.dep_path, &dep.name))
             } else {
-                dep.dep_path
-                    .strip_prefix(&format!("{}@", dep.name))
-                    .unwrap_or(&dep.dep_path)
-                    .to_string()
+                // Registry dep: the tail may carry a `(git/tarball@hash)`
+                // peer suffix that must render as the resolved spec.
+                rewrite_peer_suffix(
+                    dep.dep_path
+                        .strip_prefix(&format!("{}@", dep.name))
+                        .unwrap_or(&dep.dep_path),
+                    &peer_suffix_to_spec,
+                )
             };
             let version = match patched_by_dep_path.get(dep.dep_path.as_str()) {
                 Some(hash) => with_patch_hash(&version, hash),
@@ -301,10 +327,17 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 }
             }
         };
-        let peer_deps = if pkg.peer_dependencies.is_empty() {
-            None
-        } else {
-            Some(pkg.peer_dependencies.clone())
+        // pnpm records a `peerDependencies: { x: '*' }` entry for every
+        // `peerDependenciesMeta` key a package declares without an explicit
+        // range (the classic case is debug's optional `supports-color`,
+        // shipped only under `peerDependenciesMeta`). `LockedPackage`'s
+        // helper folds those `*` ranges in so the packages entry matches
+        // pnpm byte-for-byte; doing it at write time keeps the optional
+        // peer out of peer-context resolution (which would bind it to an
+        // unrelated copy in the tree and grow spurious dep-path suffixes).
+        let peer_deps = {
+            let deps = pkg.peer_dependencies_with_meta_defaults();
+            if deps.is_empty() { None } else { Some(deps) }
         };
         let peer_meta = if pkg.peer_dependencies_meta.is_empty() {
             None
@@ -460,20 +493,47 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
         // semver. Ordinary registry entries skip this — the key already
         // carries the version, and adding a field would diverge from
         // byte-for-byte pnpm output.
-        let write_version = url_keyed.then(|| pkg.version.clone());
+        //
+        // Freshly-resolved remote tarballs (codeload hosted-git deps,
+        // pkg.pr.new, etc.) key their `packages:` entry by the URL via
+        // `specifier()`, but their internal `dep_path` is the hashed
+        // `url+<hash>` form, so `url_keyed` is false. pnpm still records
+        // the real semver in a `version:` field next to the codeload
+        // resolution (`node-expat@https://codeload…: { …, version: 2.4.3 }`),
+        // so emit it for `RemoteTarball` too — otherwise a fresh resolve
+        // drops the field and drifts from a re-read lockfile (and pnpm).
+        let write_version = (url_keyed
+            || matches!(pkg.local_source, Some(LocalSource::RemoteTarball(_))))
+        .then(|| pkg.version.clone());
         packages.insert(
             canonical,
             WritablePackageInfo {
                 resolution,
                 version: write_version,
-                engines: if pkg.engines.is_empty() {
-                    None
-                } else {
-                    Some(pkg.engines.clone())
+                // pnpm drops every engines entry whose value is exactly
+                // `*` and omits the field when nothing survives
+                // (updateLockfile.ts: `if (version === '*') continue`).
+                // Mirror that so e.g. `engines: {node: '*'}` never lands
+                // in the lockfile, while real constraints (including the
+                // array-shaped `{'0': node >=0.6.0}` pnpm keeps verbatim)
+                // are preserved.
+                engines: {
+                    let filtered: BTreeMap<String, String> = pkg
+                        .engines
+                        .iter()
+                        .filter(|(_, v)| v.as_str() != "*")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    (!filtered.is_empty()).then_some(filtered)
                 },
-                os: pkg.os.to_vec(),
                 cpu: pkg.cpu.to_vec(),
+                os: pkg.os.to_vec(),
                 libc: pkg.libc.to_vec(),
+                deprecated: pkg
+                    .extra_meta
+                    .get("deprecated")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 has_bin: !pkg.bin.is_empty(),
                 peer_dependencies: peer_deps,
                 peer_dependencies_meta: peer_meta,
@@ -542,9 +602,10 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 }),
                 version: Some(pin.version.clone()),
                 engines: None,
-                os: Vec::new(),
                 cpu: Vec::new(),
+                os: Vec::new(),
                 libc: Vec::new(),
+                deprecated: None,
                 has_bin: pin.has_bin,
                 peer_dependencies: None,
                 peer_dependencies_meta: None,
@@ -582,7 +643,10 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     // suffixed dep path, same as the snapshots key.
                     (name, with_patch_hash(&value, hash))
                 } else {
-                    (name, value)
+                    // Registry dep whose value may carry a
+                    // `(git/tarball@hash)` peer suffix — render the suffix
+                    // as the resolved spec (`1.1.4(request@https://…)`).
+                    (name, rewrite_peer_suffix(&value, &peer_suffix_to_spec))
                 }
             })
             .collect()
@@ -601,7 +665,10 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 if native_pnpm_aliases && let Some(real_name) = pkg.alias_of.as_deref() {
                     format!("{real_name}@{}", dep_path_tail(dep_path, &pkg.name))
                 } else {
-                    dep_path.clone()
+                    // Registry snapshot key whose `(git/tarball@hash)` peer
+                    // suffix must render as the resolved spec to match pnpm
+                    // (`request-promise-core@1.1.4(request@https://…)`).
+                    rewrite_peer_suffix(dep_path, &peer_suffix_to_spec)
                 }
             }
         };
@@ -699,6 +766,11 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
         } else {
             Some(graph.overrides.clone())
         },
+        // Already `sha256-`-prefixed (or `None`) on the graph; emitted
+        // verbatim. pnpm omits these when absent, and `skip_serializing_if`
+        // mirrors that.
+        package_extensions_checksum: graph.package_extensions_checksum.clone(),
+        pnpmfile_checksum: graph.pnpmfile_checksum.clone(),
         ignored_optional_dependencies: if graph.ignored_optional_dependencies.is_empty() {
             None
         } else {
@@ -861,26 +933,42 @@ fn pruned_time_entries(
 struct WritablePnpmLockfile {
     lockfile_version: String,
     settings: WritableSettings,
-    // pnpm v9 places `overrides:` immediately after `settings:` and
-    // before `importers:`. Field order matters because we serialize
-    // through yaml_serde and want byte-for-byte parity with pnpm output
-    // for the no-overrides case (the field is skipped when empty).
+    /// pnpm v9 emits a top-level `catalogs:` map immediately after
+    /// `settings:` and before `overrides:` — see pnpm's
+    /// `sortLockfileKeys` ROOT_KEYS order (lockfileVersion, settings,
+    /// catalogs, overrides, packageExtensionsChecksum, pnpmfileChecksum,
+    /// patchedDependencies, importers, packages). Field order matters
+    /// because we serialize through yaml_serde and want byte-for-byte
+    /// parity with pnpm. Skipped when empty so a no-catalogs install
+    /// stays byte-identical to pnpm output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalogs: Option<BTreeMap<String, BTreeMap<String, WritableCatalogEntry>>>,
+    // pnpm v9 places `overrides:` after `catalogs:` and before
+    // `packageExtensionsChecksum:`. Field order matters because we
+    // serialize through yaml_serde and want byte-for-byte parity with
+    // pnpm output (the field is skipped when empty).
     #[serde(skip_serializing_if = "Option::is_none")]
     overrides: Option<BTreeMap<String, String>>,
+    /// pnpm v9's top-level `packageExtensionsChecksum:` — emitted right
+    /// after `overrides:` and before `pnpmfileChecksum:` when the
+    /// effective config declares any `packageExtensions`. Already
+    /// carries pnpm's `sha256-` prefix. Skipped when absent so a
+    /// no-extensions install stays byte-identical to pnpm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_extensions_checksum: Option<String>,
+    /// pnpm v9's top-level `pnpmfileChecksum:` — emitted immediately
+    /// after `packageExtensionsChecksum:` and before
+    /// `patchedDependencies:` when a local pnpmfile participates.
+    /// Skipped when absent for byte-identical output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pnpmfile_checksum: Option<String>,
     /// pnpm v9+ top-level `patchedDependencies:` — preserved so a
     /// bun→aube-lock conversion keeps the user's patches and a
     /// re-emit doesn't strip the block. pnpm emits this block right
-    /// after `overrides:` and before `catalogs:`, so the field order
-    /// here follows the same sequence for byte-identical output.
+    /// after `pnpmfileChecksum:` and before `importers:`, so the field
+    /// order here follows the same sequence for byte-identical output.
     #[serde(skip_serializing_if = "Option::is_none")]
     patched_dependencies: Option<BTreeMap<String, WritablePatchedDependency>>,
-    /// pnpm v9 emits a top-level `catalogs:` map after
-    /// `overrides:` and before `importers:` when `pnpm-workspace.yaml`
-    /// declares any referenced catalog entries.
-    /// Skipped when empty so a no-catalogs install stays byte-identical
-    /// to pnpm output.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    catalogs: Option<BTreeMap<String, BTreeMap<String, WritableCatalogEntry>>>,
     /// pnpm v9 emits a top-level `time:` map when `resolution-mode=time-based`
     /// is active. Keyed by canonical `name@version`; values are ISO-8601
     /// publish timestamps pulled from the registry packument. Placed
@@ -942,27 +1030,38 @@ struct WritableCatalogEntry {
     version: String,
 }
 
+// Field order is alphabetical by *serialized* key name to match pnpm's
+// sorted-key lockfile emitter (it runs every `resolution:` map through
+// `sortKeys`). The cases this spans:
+//   registry  → {integrity}  /  {integrity, tarball}
+//   directory → {directory, type: directory}
+//   git       → {commit, integrity?, path?, repo, type: git}
+//   codeload  → {gitHosted, integrity, tarball}   (hosted-git tarball)
+//   runtime   → {type: variations, variants}
+// Serde serializes in declaration order regardless of `rename`, so the
+// fields are declared in the order of their renamed names (`gitHosted`,
+// `type`) — not the Rust identifiers.
 #[derive(Debug, Serialize)]
 struct WritableResolution {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    integrity: Option<String>,
-    #[serde(skip_serializing_if = "std::ops::Not::not", rename = "gitHosted")]
-    git_hosted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    directory: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tarball: Option<String>,
     // Git resolution fields (pnpm v9 `{type: git, repo, commit}` form).
     #[serde(skip_serializing_if = "Option::is_none")]
     commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    repo: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
-    type_: Option<String>,
+    directory: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not", rename = "gitHosted")]
+    git_hosted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity: Option<String>,
     /// pnpm `&path:/<sub>` selector — emitted with leading `/` to
     /// match pnpm's own writer.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tarball: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
+    type_: Option<String>,
     /// `type: variations` artifact list for runtime pins. `None` for
     /// every ordinary package resolution.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1037,20 +1136,31 @@ struct WritablePackageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     /// pnpm writes `engines: {node: '>=8'}` in flow form immediately
-    /// after `resolution:` when the package declared any engines.
+    /// after `resolution:` when the package declared any engines —
+    /// minus entries whose value is exactly `*`, which pnpm drops (so a
+    /// manifest's `engines: {node: '*'}` yields no `engines:` line).
     /// Emitted as a block map here — `reformat_for_pnpm_parity` flips it
     /// to flow form to match pnpm byte-for-byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     engines: Option<BTreeMap<String, String>>,
-    // pnpm v9 emits os/cpu/libc after `engines` and before `hasBin`.
-    // Keep this order to stay byte-identical with pnpm-written lockfiles
-    // for native packages.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    os: Vec<String>,
+    // pnpm v9 emits `cpu`, then `os`, then `libc` after `engines` and
+    // before `hasBin` (see pnpm's `sortLockfileKeys` ORDERED_KEYS:
+    // cpu=6, os=7, libc=8). Keep this order to stay byte-identical with
+    // pnpm-written lockfiles for native packages. `reformat_for_pnpm_parity`
+    // flips each of these block sequences to flow form (`cpu: [arm64]`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cpu: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    os: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     libc: Vec<String>,
+    /// Registry deprecation reason. pnpm emits `deprecated: <reason>`
+    /// right after `cpu`/`os`/`libc` and before `hasBin` (verified
+    /// against pnpm v11 output for `request` / `coffee-script` /
+    /// `fsevents`). Skipped when absent so non-deprecated packages stay
+    /// byte-identical to pnpm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deprecated: Option<String>,
     /// pnpm emits `hasBin: true` only when the package has executables;
     /// `hasBin: false` is never written. Skip the default to match.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

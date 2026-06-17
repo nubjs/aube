@@ -22,7 +22,7 @@ use cas::copy_dir_recursive;
 use git::{
     codeload_cache_paths, extract_codeload_tarball_at, git_commit_matches, validate_git_positional,
 };
-pub use index::{PackageIndex, StoredFile};
+pub use index::{PackageIndex, StoredFile, index_content_fingerprint};
 pub use integrity::{
     SHA512_INTEGRITY_PREFIX, integrity_to_hex, sha512_integrity, validate_and_encode_name,
     validate_pkg_content, validate_version, verify_integrity, verify_precomputed_sha512,
@@ -1164,7 +1164,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path().join("files"));
         let index = index_with_manifest(&store, "datejs", "1.0.0-rc3");
-        let url = "https://codeload.github.com/PruvoNet/datejs/tar.gz/e2cde1e";
+        let url = "https://codeload.github.com/abritinthebay/datejs/tar.gz/3675d46ed96d57e30aeddf9b1d1026ac81d37ae3";
         assert!(validate_pkg_content(&index, "datejs", url).is_ok());
         // Name mismatch still rejects.
         let err = validate_pkg_content(&index, "evil", url).unwrap_err();

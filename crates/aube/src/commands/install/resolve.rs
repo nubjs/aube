@@ -6,7 +6,10 @@ use std::path::Path;
 
 use super::frozen::FrozenMode;
 use super::lockfile_dir::{parse_lockfile_dir_remapped_with_kind, write_lockfile_dir_remapped};
-use super::settings::{ResolverConfigInputs, configure_resolver, maybe_cleanup_unused_catalogs};
+use super::settings::{
+    ResolverConfigInputs, configure_resolver, maybe_cleanup_unused_catalogs,
+    stamp_pnpm_config_checksums,
+};
 use super::workspace::write_per_project_lockfiles;
 
 pub(super) type ParsedLockfile = Option<(LockfileGraph, LockfileKind)>;
@@ -39,6 +42,7 @@ pub(super) struct LockfileOnlyInput<'a> {
     pub lockfile_importer_key: &'a str,
     pub manifest: &'a aube_manifest::PackageJson,
     pub manifests: &'a [(String, aube_manifest::PackageJson)],
+    pub per_project_write_selection: Option<&'a std::collections::BTreeSet<String>>,
     pub ws_config: &'a aube_manifest::workspace::WorkspaceConfig,
     pub workspace_catalogs: &'a crate::commands::CatalogMap,
     pub settings_ctx: &'a aube_settings::ResolveCtx<'a>,
@@ -69,6 +73,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
         lockfile_importer_key,
         manifest,
         manifests,
+        per_project_write_selection,
         ws_config,
         workspace_catalogs,
         settings_ctx,
@@ -286,6 +291,26 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
         lo_write_kind,
     )
     .await?;
+    // Mirror the streaming path: stamp pnpm's config checksums (pnpm-lock
+    // only) before the graph hits disk so `--lockfile-only` and a regular
+    // install stay byte-identical.
+    let lo_local_pnpmfile = if ignore_pnpmfile {
+        None
+    } else {
+        crate::pnpmfile::detect(cwd, pnpmfile, ws_config.pnpmfile_path.as_deref())
+    };
+    stamp_pnpm_config_checksums(
+        &mut graph,
+        lo_write_kind,
+        manifest,
+        settings_ctx,
+        lo_local_pnpmfile.as_deref(),
+    )
+    .await;
+    // Annotate the resolved graph with pnpm-parity snapshot metadata
+    // (`optional: true`, `transitivePeerDependencies`) so `--lockfile-only`
+    // output stays byte-identical to a regular install.
+    crate::commands::prepare_resolved_graph_for_lockfile_write(&mut graph);
     if shared_workspace_lockfile || !has_workspace {
         let lo_written = write_lockfile_dir_remapped(
             lockfile_dir,
@@ -304,7 +329,13 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
                 .unwrap_or_else(|| lo_written.display().to_string())
         );
     } else {
-        write_per_project_lockfiles(cwd, &graph, manifests, lo_write_kind)?;
+        write_per_project_lockfiles(
+            cwd,
+            &graph,
+            manifests,
+            lo_write_kind,
+            per_project_write_selection,
+        )?;
     }
     // Prune unused catalog entries *after* the lockfile hits disk —
     // same ordering as the main install path below, so a
@@ -392,7 +423,8 @@ pub(super) fn select_lockfile_result(
                         code = aube_codes::errors::ERR_AUBE_OUTDATED_LOCKFILE,
                         "lockfile is out of date with package.json: {reason}\n\
                          help: run without --frozen-lockfile to update the lockfile, \
-                         or run `aube install --no-frozen-lockfile` to regenerate it"
+                         or run `{} --no-frozen-lockfile` to regenerate it",
+                        aube_util::cmd("install")
                     ));
                 }
                 // Same hard-fail for patch-config drift — pnpm rejects

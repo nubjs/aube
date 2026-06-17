@@ -454,6 +454,66 @@ fn package_extension_selector_matches_scoped_and_versioned_names() {
 }
 
 #[test]
+fn package_extension_selector_matches_wildcard_on_unparseable_version() {
+    // A `name@*` selector must match even when the version isn't valid
+    // semver — git/tarball packages can carry odd version strings, and
+    // `*` means "any version" regardless. Regression guard for
+    // packageExtensions targeting git deps (e.g. injecting a runtime
+    // connector into a github: package) being silently skipped.
+    assert!(package_selector_matches("host@*", "host", "not-a-semver"));
+    assert!(package_selector_matches("host@*", "host", "2.59.3"));
+    assert!(package_selector_matches("host", "host", "whatever-ref"));
+    assert!(!package_selector_matches("host@*", "other", "1.0.0"));
+}
+
+#[test]
+fn package_extensions_inject_into_flat_dep_map() {
+    // The non-registry (git/tarball/dir) resolve path carries a flat
+    // `name -> range` dep map. A matching `@*` extension must inject its
+    // `dependencies` so they get resolved + linked as siblings.
+    let mut deps = BTreeMap::new();
+    deps.insert("existing".to_string(), "1.0.0".to_string());
+    let extension = PackageExtension {
+        selector: "juggler@*".to_string(),
+        dependencies: [
+            (
+                "connector".to_string(),
+                "github:org/connector#abc".to_string(),
+            ),
+            ("existing".to_string(), "9.9.9".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        optional_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        peer_dependencies_meta: BTreeMap::new(),
+    };
+
+    apply_package_extensions_to_deps("juggler", "0.0.0-git", &mut deps, &[extension]);
+
+    // Injected dep is added...
+    assert_eq!(deps.get("connector").unwrap(), "github:org/connector#abc");
+    // ...but the package's own declared dep stays authoritative.
+    assert_eq!(deps.get("existing").unwrap(), "1.0.0");
+}
+
+#[test]
+fn package_extensions_skip_flat_dep_map_on_selector_mismatch() {
+    let mut deps = BTreeMap::new();
+    let extension = PackageExtension {
+        selector: "other@*".to_string(),
+        dependencies: [("connector".to_string(), "1.0.0".to_string())]
+            .into_iter()
+            .collect(),
+        optional_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        peer_dependencies_meta: BTreeMap::new(),
+    };
+    apply_package_extensions_to_deps("juggler", "1.0.0", &mut deps, &[extension]);
+    assert!(deps.is_empty());
+}
+
+#[test]
 fn package_extensions_merge_dependency_maps() {
     let mut pkg = make_version("host", "1.0.0");
     let extension = PackageExtension {
@@ -3447,6 +3507,8 @@ async fn resolve_handles_lockfile_reused_name_with_incompatible_transitive_range
         importers: BTreeMap::new(),
         settings: Default::default(),
         overrides: BTreeMap::new(),
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
         ignored_optional_dependencies: BTreeSet::new(),
         times: BTreeMap::new(),
         skipped_optional_dependencies: BTreeMap::new(),
@@ -3522,6 +3584,8 @@ async fn lockfile_reuse_preserves_transitive_optional_edges() {
         importers: BTreeMap::new(),
         settings: Default::default(),
         overrides: BTreeMap::new(),
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
         ignored_optional_dependencies: BTreeSet::new(),
         times: BTreeMap::new(),
         skipped_optional_dependencies: BTreeMap::new(),
@@ -3623,29 +3687,125 @@ async fn lockfile_reuse_handles_name_at_version_dep_form() {
     );
 }
 
-// ===== peersSuffixMaxLength =====
-//
-// Helpers exercised directly: `hash_peer_suffix` for the format
-// invariant; `apply_peer_contexts` for the integration path that
-// reads the cap and decides whether to swap the suffix.
+// A fresh resolve must stash the packument's `deprecated` reason on the
+// LockedPackage (via `extra_meta`) so the pnpm/aube lockfile writer can
+// emit pnpm's `deprecated:` field. Without this the reason is dropped
+// and aube's lockfile drifts from pnpm's for every deprecated dep.
+#[tokio::test]
+async fn fresh_resolve_records_deprecated_reason_on_extra_meta() {
+    let mut foo = make_packument("foo", &["1.0.0"], "1.0.0");
+    foo.versions.get_mut("1.0.0").unwrap().deprecated = Some("use bar instead".to_string());
 
-#[test]
-fn hash_peer_suffix_matches_expected_format() {
-    let out = hash_peer_suffix("(react@18.2.0)");
-    // `_` prefix, 10 hex chars, nothing else.
-    assert!(out.starts_with('_'), "expected `_` prefix: {out:?}");
-    assert_eq!(out.len(), 11, "expected `_` + 10 hex chars: {out:?}");
-    assert!(
-        out[1..]
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "expected lowercase hex after `_`: {out:?}"
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client);
+    resolver.cache.insert("foo".to_string(), foo);
+
+    let mut manifest = PackageJson::default();
+    manifest
+        .dependencies
+        .insert("foo".to_string(), "1.0.0".to_string());
+
+    let graph = resolver
+        .resolve(&manifest, None)
+        .await
+        .expect("resolve failed");
+
+    let foo_pkg = graph.packages.get("foo@1.0.0").expect("foo resolved");
+    assert_eq!(
+        foo_pkg
+            .extra_meta
+            .get("deprecated")
+            .and_then(|v| v.as_str()),
+        Some("use bar instead"),
+        "fresh resolve must record the deprecation reason on extra_meta"
     );
-    // Stable output — regression guard against accidental format changes.
-    assert_eq!(hash_peer_suffix("(react@18.2.0)"), out);
 }
 
-// Small cap forces the suffix to collapse to `_<hex>`. Uses the
+// `allowedDeprecatedVersions` only silences the install *warning* — it
+// must not strip the `deprecated:` field from the lockfile. pnpm keeps
+// recording the reason on the package entry regardless, so the resolver
+// stores the raw packument message rather than the warning-gated one.
+#[tokio::test]
+async fn deprecated_reason_recorded_even_when_warning_suppressed() {
+    let mut foo = make_packument("foo", &["1.0.0"], "1.0.0");
+    foo.versions.get_mut("1.0.0").unwrap().deprecated = Some("use bar instead".to_string());
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client).with_dependency_policy(DependencyPolicy {
+        allowed_deprecated_versions: [("foo".to_string(), "*".to_string())].into_iter().collect(),
+        ..Default::default()
+    });
+    resolver.cache.insert("foo".to_string(), foo);
+
+    let mut manifest = PackageJson::default();
+    manifest
+        .dependencies
+        .insert("foo".to_string(), "1.0.0".to_string());
+
+    let graph = resolver
+        .resolve(&manifest, None)
+        .await
+        .expect("resolve failed");
+
+    let foo_pkg = graph.packages.get("foo@1.0.0").expect("foo resolved");
+    assert_eq!(
+        foo_pkg
+            .extra_meta
+            .get("deprecated")
+            .and_then(|v| v.as_str()),
+        Some("use bar instead"),
+        "lockfile must record deprecated even when the warning is suppressed"
+    );
+}
+
+// ===== peersSuffixMaxLength =====
+//
+// Helpers exercised directly: `effective_peer_suffix` for the pnpm
+// format invariant; `apply_peer_contexts` for the integration path
+// that reads the cap and decides whether to swap the suffix.
+
+#[test]
+fn effective_peer_suffix_hashes_to_pnpm_parenthesized_form() {
+    // Cap of 0 forces hashing of any non-empty body. pnpm's
+    // `createPeerDepGraphHash` wraps the short hash in a single
+    // `(...)`, never a bare `_<hex>` marker.
+    let out = effective_peer_suffix("(react@18.2.0)", 0);
+    assert!(
+        out.starts_with('(') && out.ends_with(')'),
+        "parens: {out:?}"
+    );
+    let inner = &out[1..out.len() - 1];
+    // `createShortHash` = sha256 hex truncated to 32 chars.
+    assert_eq!(inner.len(), 32, "expected 32 hex chars: {out:?}");
+    assert!(
+        inner
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "expected lowercase hex inside parens: {out:?}"
+    );
+    // The hash input is the body (suffix without the outer parens),
+    // matching pnpm's `dirName = peers.join(')(')`.
+    assert_eq!(
+        out,
+        effective_peer_suffix("(react@18.2.0)", 0),
+        "stable output"
+    );
+    assert!(is_hashed_peer_suffix(&out), "must be recognized as hashed");
+}
+
+#[test]
+fn effective_peer_suffix_is_identity_within_cap() {
+    // Within the cap the suffix is returned verbatim (the common case).
+    let suffix = "(react@18.2.0)(redux@4.0.5)";
+    assert_eq!(effective_peer_suffix(suffix, 1000), suffix);
+    assert!(!is_hashed_peer_suffix(suffix), "real peers aren't hashed");
+}
+
+// Small cap forces the suffix to collapse to `(<short-hash>)`. Uses the
 // nested-peer fixture that already proves correct behavior at the
 // default cap — same fixture, different cap, different output.
 #[test]
@@ -3701,8 +3861,8 @@ fn peer_suffix_is_hashed_when_exceeding_cap() {
         .expect("consumer@1.0.0 variant missing");
     let suffix = consumer_key.strip_prefix("consumer@1.0.0").unwrap();
     assert!(
-        suffix.starts_with('_') && suffix.len() == 11,
-        "expected hashed suffix _<10-hex>, got {suffix:?} from {consumer_key:?}"
+        is_hashed_peer_suffix(suffix),
+        "expected parenthesized hashed suffix (<32-hex>), got {suffix:?} from {consumer_key:?}"
     );
 }
 
@@ -4476,6 +4636,181 @@ fn peer_suffix_propagation_dedupes_nested_self_segments() {
             .contains_key("consumer@1.0.0(core@1.0.0)(helper@1.0.0(core@1.0.0))"),
         "propagation must not double-emit a peer name already covered transitively in the self suffix"
     );
+}
+
+// A peer suffix must stop at the package that *supplies* the peer.
+// Real-world chain: `xml2json -> node-expat -> node-gyp -> tinyglobby ->
+// fdir`, where `fdir` declares an OPTIONAL `picomatch` peer and
+// `tinyglobby` lists `picomatch` in its own `dependencies`. pnpm tags
+// only `fdir@6.5.0(picomatch@4.0.4)`; every ancestor — including the
+// supplier `tinyglobby` — stays bare. The
+// `propagate_peer_suffixes_to_ancestors` post-pass used to leak
+// `(picomatch@4.0.4)` all the way up to `xml2json@0.12.0`; suppressing a
+// peer that the absorbing package supplies itself restores pnpm parity.
+#[test]
+fn peer_suffix_stops_at_supplier_of_the_peer() {
+    let xml2json = mk_locked("xml2json", "0.12.0", &[("node-expat", "2.4.3")], &[]);
+    let node_expat = mk_locked("node-expat", "2.4.3", &[("node-gyp", "12.3.0")], &[]);
+    let node_gyp = mk_locked("node-gyp", "12.3.0", &[("tinyglobby", "0.2.17")], &[]);
+    // tinyglobby supplies `picomatch` (resolving fdir's optional peer).
+    let tinyglobby = mk_locked(
+        "tinyglobby",
+        "0.2.17",
+        &[("fdir", "6.5.0"), ("picomatch", "4.0.4")],
+        &[],
+    );
+    // fdir only *declares* the optional peer — it doesn't supply it.
+    let mut fdir = mk_locked("fdir", "6.5.0", &[], &[("picomatch", "^3 || ^4")]);
+    fdir.peer_dependencies_meta.insert(
+        "picomatch".to_string(),
+        aube_lockfile::PeerDepMeta { optional: true },
+    );
+    let picomatch = mk_locked("picomatch", "4.0.4", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    for p in [xml2json, node_expat, node_gyp, tinyglobby, fdir, picomatch] {
+        packages.insert(p.dep_path.clone(), p);
+    }
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "xml2json".to_string(),
+            dep_path: "xml2json@0.12.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^0.12.0".to_string()),
+        }],
+    );
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default())
+        .expect("test graph should converge");
+
+    let keys: Vec<&String> = out.packages.keys().collect();
+    // Only fdir — the peer *declarer* — carries the suffix.
+    assert!(
+        out.packages.contains_key("fdir@6.5.0(picomatch@4.0.4)"),
+        "fdir keeps its own optional-peer suffix; got {keys:?}"
+    );
+    // The supplier and every ancestor above it stay bare (pnpm parity).
+    for bare in [
+        "tinyglobby@0.2.17",
+        "node-gyp@12.3.0",
+        "node-expat@2.4.3",
+        "xml2json@0.12.0",
+    ] {
+        assert!(
+            out.packages.contains_key(bare),
+            "{bare} must stay bare; got {keys:?}"
+        );
+    }
+    assert!(
+        !out.packages
+            .contains_key("tinyglobby@0.2.17(picomatch@4.0.4)"),
+        "tinyglobby supplies picomatch, so the suffix must stop there; got {keys:?}"
+    );
+    assert!(
+        !out.packages
+            .contains_key("xml2json@0.12.0(picomatch@4.0.4)"),
+        "xml2json must not inherit a transitive optional peer; got {keys:?}"
+    );
+}
+
+// A META-ONLY optional peer (declared in `peerDependenciesMeta` but absent
+// from `peerDependencies`, exactly how `follow-redirects` declares `debug`)
+// must NOT be eagerly bound from a distant ancestor's *regular* dependency.
+// pnpm treats such a peer as resolvable but then collapses the binding back
+// out via `dedupe-peer-dependents` whenever a peer-free path exists, so the
+// realistic lockfile keeps the whole chain bare:
+//   provider        (carries debug@3.2.7 as a plain dep)
+//     mid_a          (bare)
+//       mid_b        (bare)
+//         mid_c      (bare)
+//           axios    (bare)
+//             fr     (bare — follow-redirects; debug stays a transitive peer)
+// Binding `(debug@3.2.7)` onto that chain (as a since-reverted experiment did)
+// produced suffixed variants that aube's dedupe pass — which only collapses
+// *declared*-peer variants — never merged. The same subtree then hashed
+// differently per install scope (whole-workspace vs single-member), splitting
+// a shared global-virtual-store singleton in two and surfacing at runtime as a
+// duplicate-instance "Cannot find module". This test pins the bare shape so
+// the over-binding can't regress.
+#[test]
+fn meta_only_optional_peer_stays_bare_to_keep_singleton_shared() {
+    // provider carries debug as a plain (regular) dependency.
+    let provider = mk_locked(
+        "provider",
+        "1.0.0",
+        &[("mid_a", "1.0.0"), ("debug", "3.2.7")],
+        &[],
+    );
+    let mid_a = mk_locked("mid_a", "1.0.0", &[("mid_b", "1.0.0")], &[]);
+    let mid_b = mk_locked("mid_b", "1.0.0", &[("mid_c", "1.0.0")], &[]);
+    let mid_c = mk_locked("mid_c", "1.0.0", &[("axios", "1.0.0")], &[]);
+    let axios = mk_locked("axios", "1.0.0", &[("fr", "1.0.0")], &[]);
+    // fr = follow-redirects: debug ONLY in meta (optional), NOT in peer_deps.
+    let mut fr = mk_locked("fr", "1.0.0", &[], &[]);
+    fr.peer_dependencies_meta.insert(
+        "debug".to_string(),
+        aube_lockfile::PeerDepMeta { optional: true },
+    );
+    let debug = mk_locked("debug", "3.2.7", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    for p in [provider, mid_a, mid_b, mid_c, axios, fr, debug] {
+        packages.insert(p.dep_path.clone(), p);
+    }
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "provider".to_string(),
+            dep_path: "provider@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^1".to_string()),
+        }],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default()).expect("should converge");
+    let mut keys: Vec<&String> = out.packages.keys().collect();
+    keys.sort();
+    // Expected: the meta-only optional `debug` peer is NOT folded into any
+    // dep_path, so every node on the chain has a single bare instance and the
+    // subtree hashes identically regardless of install scope.
+    for bare in [
+        "provider@1.0.0",
+        "mid_a@1.0.0",
+        "mid_b@1.0.0",
+        "mid_c@1.0.0",
+        "axios@1.0.0",
+        "fr@1.0.0",
+    ] {
+        assert!(
+            out.packages.contains_key(bare),
+            "{bare} must exist as the single bare instance; got {keys:#?}"
+        );
+    }
+    for suffixed in [
+        "fr@1.0.0(debug@3.2.7)",
+        "axios@1.0.0(debug@3.2.7)",
+        "mid_c@1.0.0(debug@3.2.7)",
+        "mid_b@1.0.0(debug@3.2.7)",
+        "mid_a@1.0.0(debug@3.2.7)",
+    ] {
+        assert!(
+            !out.packages.contains_key(suffixed),
+            "{suffixed} must NOT be created from a meta-only optional peer; got {keys:#?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

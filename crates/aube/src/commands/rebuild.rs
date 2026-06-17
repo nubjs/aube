@@ -54,7 +54,7 @@ pub async fn run(
         .wrap_err("failed to load workspace config")?;
     let env_snapshot = aube_settings::values::capture_env();
     let settings_ctx = files.ctx(&raw_workspace, &env_snapshot, &[]);
-    super::configure_script_settings(&settings_ctx);
+    super::configure_script_settings(&settings_ctx, Some("rebuild"));
 
     let graph = match aube_lockfile::parse_lockfile(&cwd, &manifest) {
         Ok(graph) => Some(graph),
@@ -68,8 +68,9 @@ pub async fn run(
     // exit Ok with no scripts run and no diagnostic — invisible in CI.
     if selected.is_some() && graph.is_none() {
         return Err(miette!(
-            "no lockfile found at {} — run `aube install` before targeting specific packages",
-            cwd.display()
+            "no lockfile found at {} — run `{}` before targeting specific packages",
+            cwd.display(),
+            aube_util::cmd("install")
         ));
     }
 

@@ -133,6 +133,14 @@ fn find_workspace_root_uncached(start: &Path) -> Option<PathBuf> {
     // a workspaces field, and attach to that workspace. Cap the walk
     // at $HOME so that never happens.
     let stop = home_stop_boundary();
+    // Any `pnpm-workspace.yaml` is a hard workspace boundary, matching
+    // pnpm: a file with no `packages:` list configures a single-package
+    // workspace (just the root package) — it does not mean "ignore this
+    // file and keep walking to an enclosing workspace". So `cd member &&
+    // aube install` anchors on the member's own yaml rather than the
+    // outer root; per-member lockfile freshness (tracked in install
+    // state) is what keeps repeat installs warm under
+    // `sharedWorkspaceLockfile=false`.
     for dir in start.ancestors() {
         if aube_manifest::workspace::workspace_yaml_existing(dir).is_some() {
             return Some(dir.to_path_buf());
@@ -357,6 +365,67 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("package.json"), r#"{"name":"solo"}"#);
         assert!(find_workspace_root(dir.path()).is_none());
+    }
+
+    #[test]
+    fn find_workspace_root_stops_at_member_settings_only_yaml() {
+        // A `pnpm-workspace.yaml` is a hard boundary even when it declares
+        // no `packages:` list. pnpm treats a memberless yaml as a
+        // single-package workspace (just the root package), not as "ignore
+        // this file and keep walking to the enclosing workspace". So a
+        // member that drops its own settings-only yaml resolves to
+        // *itself*, not the outer `packages:`-declaring root.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'services/*'\n",
+        );
+        let member = dir.path().join("services/svc-a");
+        write(&member.join("package.json"), r#"{"name":"@t/svc-a"}"#);
+        write(
+            &member.join("pnpm-workspace.yaml"),
+            "# per-service settings, no packages:\nenableGlobalVirtualStore: true\n",
+        );
+
+        assert_eq!(find_workspace_root(&member).unwrap(), member);
+    }
+
+    #[test]
+    fn find_workspace_root_keeps_standalone_settings_only_yaml() {
+        // With no members-declaring ancestor, a settings-only
+        // `pnpm-workspace.yaml` is a standalone single-package root (the
+        // pnpm v9+ "keep config in pnpm-workspace.yaml" shape). It must
+        // still resolve to itself, not fall through to None.
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("package.json"), r#"{"name":"solo"}"#);
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "enableGlobalVirtualStore: true\n",
+        );
+
+        assert_eq!(find_workspace_root(dir.path()).unwrap(), dir.path());
+    }
+
+    #[test]
+    fn find_workspace_root_stops_at_member_with_broken_yaml() {
+        // A `pnpm-workspace.yaml` is a hard boundary regardless of whether
+        // it parses: its mere presence anchors discovery on this directory
+        // rather than the enclosing members-declaring workspace, and the
+        // parse error surfaces later when the config is loaded for real.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'services/*'\n",
+        );
+        let member = dir.path().join("services/svc-a");
+        write(&member.join("package.json"), r#"{"name":"@t/svc-a"}"#);
+        // Tab as the first indent char is a spec-level YAML syntax error.
+        write(
+            &member.join("pnpm-workspace.yaml"),
+            "packages:\n\t- broken\n",
+        );
+
+        assert_eq!(find_workspace_root(&member).unwrap(), member);
     }
 
     #[test]

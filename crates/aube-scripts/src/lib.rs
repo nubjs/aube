@@ -61,6 +61,18 @@ pub struct ScriptSettings {
     /// uses it to place a runtime shim dir first so a bare `node` in a build
     /// script resolves to the augmented runtime. Default-empty = no-op.
     pub path_prepends: Vec<PathBuf>,
+    /// The top-level package-manager command, exported as `npm_command`
+    /// (npm/pnpm parity): `"run-script"` for `aube run`, `"install"`
+    /// for install lifecycle hooks, `"rebuild"`, `"pack"`, etc. `None`
+    /// leaves `npm_command` unset.
+    pub command: Option<String>,
+    /// Path to a runnable `node-gyp` stand-in, exported as
+    /// `npm_config_node_gyp` (npm/pnpm parity). npm/pnpm point this at
+    /// their bundled `node-gyp/bin/node-gyp.js`; aube bootstraps node-gyp
+    /// lazily, so this is a tiny shim that resolves (and bootstraps on
+    /// first use) the real node-gyp and forwards argv. `None` leaves
+    /// `npm_config_node_gyp` unset.
+    pub node_gyp_js: Option<PathBuf>,
 }
 
 /// Native build jail applied to dependency lifecycle scripts.
@@ -528,6 +540,41 @@ fn apply_script_settings_env(cmd: &mut tokio::process::Command, settings: &Scrip
     // spawn time) so it flows through both the jailed and the
     // non-jailed paths.
     cmd.env("npm_config_user_agent", aube_user_agent());
+    // `npm_execpath`: the package-manager binary that drove the script.
+    // Tools (and pnpm's own `$npm_execpath run …` postinstalls) read it
+    // to re-invoke the *same* PM. `current_exe()` is the aube binary;
+    // ignore the rare resolution failure rather than abort the script.
+    // Reused below for `AUBE_NODE_GYP_EXE` (same binary), so resolve once.
+    let aube_exe = std::env::current_exe().ok();
+    if let Some(exe) = aube_exe.as_deref() {
+        cmd.env("npm_execpath", exe);
+    }
+    // `npm_node_execpath` / `NODE`: the node binary scripts should use
+    // — the switched runtime's node, or the ambient `node` on PATH.
+    // Set here (not at spawn) so it survives the jail's `env_clear`.
+    if let Some(node_exe) = settings.node_exe.as_deref() {
+        cmd.env("npm_node_execpath", node_exe).env("NODE", node_exe);
+    }
+    // `npm_command`: the top-level PM command (run-script / install / …).
+    if let Some(command) = settings.command.as_deref() {
+        cmd.env("npm_command", command);
+    }
+    // `npm_config_node_gyp`: path to a runnable node-gyp. npm/pnpm bundle
+    // node-gyp and point this at its `bin/node-gyp.js`; aube hands out a
+    // lazy shim that resolves the bootstrapped node-gyp on first use. The
+    // shim trampolines back into aube via `AUBE_NODE_GYP_EXE`, so always
+    // stamp the running aube — it must be a real aube that implements
+    // `__node-gyp-bootstrap`, never an inherited/user-set value (which
+    // could be stale or wrong). `aube run` stamps the same value at its
+    // own spawn site; keeping both unconditional holds the two paths in
+    // lockstep. `AUBE_NODE_GYP_PROJECT_DIR` is optional — the shim falls
+    // back to the script's cwd.
+    if let Some(node_gyp_js) = settings.node_gyp_js.as_deref() {
+        cmd.env("npm_config_node_gyp", node_gyp_js);
+        if let Some(exe) = aube_exe.as_deref() {
+            cmd.env("AUBE_NODE_GYP_EXE", exe);
+        }
+    }
     if let Some(node_options) = settings.node_options.as_deref() {
         cmd.env("NODE_OPTIONS", node_options);
     }
@@ -560,6 +607,42 @@ fn compose_overlay_path(prepends: &[PathBuf], existing: &std::ffi::OsStr) -> std
     let mut entries: Vec<PathBuf> = prepends.to_vec();
     entries.extend(std::env::split_paths(existing));
     std::env::join_paths(entries).unwrap_or_else(|_| existing.to_owned())
+}
+
+/// Apply the manifest-derived `npm_package_*` env (name, version,
+/// absolute `npm_package_json` path, and the deep-flattened
+/// `engines`/`config`/`bin`) plus `npm_lifecycle_script` (the raw
+/// script body) to a lifecycle or `aube run` command. Call last so the
+/// values land *after* any jail `env_clear`. `script_dir` is the
+/// directory the script runs in, whose `package.json` is the manifest
+/// being executed; `lifecycle_script` is the raw script body exported
+/// as `npm_lifecycle_script`.
+///
+/// pnpm rebuilds the `npm_package_*` namespace per package: it drops
+/// every inherited `npm_package_*` key and stamps only the running
+/// manifest's allowlist. We mirror that — scrub first, then re-stamp —
+/// so a script never sees a parent/sibling package's fields (verified
+/// against pnpm 11.5). Without the scrub, non-allowlisted inherited
+/// keys (e.g. an outer `npm run`'s `npm_package_description`) would
+/// leak through on the unjailed path and break allowlist parity. On
+/// the jailed path the prior `env_clear` already dropped them, so the
+/// scrub is a harmless no-op there.
+pub fn apply_npm_manifest_env(
+    cmd: &mut tokio::process::Command,
+    manifest: &PackageJson,
+    script_dir: &Path,
+    lifecycle_script: &str,
+) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("npm_package_")) {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("npm_lifecycle_script", lifecycle_script);
+    cmd.env("npm_package_json", script_dir.join("package.json"));
+    for (key, value) in manifest.npm_package_env() {
+        cmd.env(key, value);
+    }
 }
 
 fn safe_jail_env_key(key: &str) -> bool {
@@ -945,11 +1028,6 @@ pub async fn run_script(
         .stderr(child_stderr())
         .env("PATH", &new_path)
         .env("npm_lifecycle_event", script_name);
-    // Set after the jail's env_clear (builder env calls compose in
-    // order), so jailed builds see the pinned node too.
-    if let Some(node_exe) = &settings.node_exe {
-        cmd.env("npm_node_execpath", node_exe).env("NODE", node_exe);
-    }
 
     // Pass INIT_CWD the way npm/pnpm do — the directory the user
     // invoked the package manager from, *not* the script's own cwd.
@@ -961,12 +1039,6 @@ pub async fn run_script(
         cmd.env("INIT_CWD", project_root);
     }
 
-    if let Some(ref name) = manifest.name {
-        cmd.env("npm_package_name", name);
-    }
-    if let Some(ref version) = manifest.version {
-        cmd.env("npm_package_version", version);
-    }
     if let (Some(jail), Some(home)) = (jail, jail_home.as_deref()) {
         apply_jail_env(
             &mut cmd,
@@ -979,6 +1051,11 @@ pub async fn run_script(
         );
         apply_script_settings_env(&mut cmd, &settings);
     }
+
+    // npm-compat manifest env, applied last so it survives the jail's
+    // `env_clear`: name/version/json plus the deep-flattened
+    // engines/config/bin, and the raw script body (`npm_lifecycle_script`).
+    apply_npm_manifest_env(&mut cmd, manifest, script_dir, script_cmd);
 
     tracing::debug!("lifecycle: {script_name} → {script_cmd}");
     let status = run_command_killing_descendants(cmd, script_name).await?;

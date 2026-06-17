@@ -335,8 +335,9 @@ fn random_byte() -> u8 {
 
 fn primer_cache_dir() -> Option<PathBuf> {
     // First-class config knob, read under the active embedder's brand
-    // (`AUBE_CACHE_DIR` for standalone aube, `NUB_CACHE_DIR` for nub) via the
-    // `config_env` prefix — never the branded `AUBE_*` form under nub.
+    // (`AUBE_CACHE_DIR` for standalone aube, `<BRAND>_CACHE_DIR` for an embedder
+    // with its own `config_env_prefix`) via `config_env` — never the branded
+    // `AUBE_*` form under such a host.
     if let Some(base) = aube_util::env::config_env("CACHE_DIR") {
         return Some(PathBuf::from(base).join("primer"));
     }

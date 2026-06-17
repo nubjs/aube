@@ -60,7 +60,7 @@ use materialize::{
     GvsPrewarmInputs, combine_install_pipeline_errors, materialize_channel, spawn_gvs_prewarm,
 };
 pub(crate) use settings::PeerDependencyRules;
-pub(crate) use settings::{ResolverConfigInputs, configure_resolver};
+pub(crate) use settings::{ResolverConfigInputs, configure_resolver, finalize_lockfile_graph};
 pub(crate) use side_effects_cache::{SideEffectsCacheConfig, side_effects_cache_root};
 
 use settings::{
@@ -77,7 +77,8 @@ use startup::{
 use summary::print_already_up_to_date;
 use workspace::{
     discover_workspace_plan, filter_graph_to_importers, filter_graph_to_workspace_selection,
-    importer_project_dir, write_per_project_lockfiles,
+    importer_project_dir, merge_member_lockfile_graphs, per_project_write_selection,
+    write_per_project_lockfiles,
 };
 
 /// Process-global toggle for the warm-relink store verification depth.
@@ -205,7 +206,7 @@ impl InstallPhaseTimings {
         let payload = serde_json::json!({
             "cwd": cwd,
             "scenario": aube_util::env::embedder_env("BENCH_SCENARIO")
-                .map(|s| s.to_string_lossy().into_owned()),
+                .and_then(|s| s.into_string().ok()),
             "total_ms": total.as_millis(),
             "packages": packages,
             "cached": cached,
@@ -290,7 +291,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         crate::runtime::lockfile_node_pin(&cwd, &manifest).as_ref(),
     )
     .await?;
-    super::configure_script_settings(&settings_ctx);
+    super::configure_script_settings(&settings_ctx, Some("install"));
 
     let layout::InstallLayoutConfig {
         lockfile_dir,
@@ -382,6 +383,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let ws_dirs = workspace_plan.ws_dirs;
     let lifecycle_manifests = workspace_plan.lifecycle_manifests;
     let default_trust_enabled = aube_settings::resolved::default_trust(&settings_ctx);
+    // Importer keys whose per-project lockfiles a filtered install may
+    // (re)write. `None` for an unfiltered install (write every importer).
+    // Computed once and shared by the `--lockfile-only` short-circuit and
+    // the streaming-install write so both paths stay scoped identically.
+    let per_project_write_selection =
+        per_project_write_selection(&cwd, &workspace_packages, &opts.workspace_filter)?;
     let (build_policy, policy_warnings) =
         if let Some(override_policy) = opts.build_policy_override.as_deref() {
             (override_policy.clone(), Vec::new())
@@ -521,6 +528,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             lockfile_importer_key: &lockfile_importer_key,
             manifest: &manifest,
             manifests: &manifests,
+            per_project_write_selection: per_project_write_selection.as_ref(),
             ws_config: &ws_config_shared,
             workspace_catalogs: &workspace_catalogs,
             settings_ctx: &settings_ctx,
@@ -672,7 +680,19 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // `wiki/commands/pm/supply-chain-posture.md` Decision 2.
     let lockfile_vetted;
     let (graph, package_indices, cached_count, fetch_count) = match lockfile_result {
-        Ok((graph, kind)) => {
+        Ok((mut graph, kind)) => {
+            // Under `sharedWorkspaceLockfile=false` the project's own
+            // lockfile only carries the `.` importer, so the reuse path
+            // would hand the linker a root-only graph and never relink
+            // members (a deleted/incomplete member `node_modules` would
+            // be reported "up to date" yet stay broken). Fold every
+            // member's per-project lockfile back in so the linker sees
+            // all importers. No-op for shared lockfiles, non-workspace
+            // projects, and the cold resolve path (which already
+            // produces every importer).
+            if !shared_workspace_lockfile && has_workspace {
+                merge_member_lockfile_graphs(&cwd, &mut graph, &manifests);
+            }
             let graph = resolve::apply_lockfile_graph_platform_rules(
                 graph,
                 kind,
@@ -1733,6 +1753,31 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                     write_kind,
                 )
                 .await?;
+                // Record pnpm's config checksums (pnpm-lock.yaml only) so
+                // the written lockfile carries the same drift markers pnpm
+                // would. Resolve the local pnpmfile here where `opts` /
+                // `ws_config_shared` live; the helper skips non-pnpm formats.
+                let local_pnpmfile = if opts.ignore_pnpmfile {
+                    None
+                } else {
+                    crate::pnpmfile::detect(
+                        &cwd,
+                        opts.pnpmfile.as_deref(),
+                        ws_config_shared.pnpmfile_path.as_deref(),
+                    )
+                };
+                settings::stamp_pnpm_config_checksums(
+                    &mut graph,
+                    write_kind,
+                    &manifest,
+                    &settings_ctx,
+                    local_pnpmfile.as_deref(),
+                )
+                .await;
+                // Annotate the full (pre-host-filter) graph with pnpm-parity
+                // snapshot metadata (`optional: true`, `transitivePeerDependencies`)
+                // before the write and before the host-only `filter_graph` below.
+                crate::commands::prepare_resolved_graph_for_lockfile_write(&mut graph);
                 if shared_workspace_lockfile || !has_workspace {
                     let written_path = write_lockfile_dir_remapped(
                         &lockfile_dir,
@@ -1753,7 +1798,13 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                             .unwrap_or_else(|| written_path.display().to_string())
                     );
                 } else {
-                    write_per_project_lockfiles(&cwd, &graph, &manifests, write_kind)?;
+                    write_per_project_lockfiles(
+                        &cwd,
+                        &graph,
+                        &manifests,
+                        write_kind,
+                        per_project_write_selection.as_ref(),
+                    )?;
                 }
             } else {
                 tracing::debug!("lockfile=false: skipping lockfile write");
@@ -1815,7 +1866,18 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             let missing_packages: BTreeMap<String, aube_lockfile::LockedPackage> = graph
                 .packages
                 .iter()
-                .filter(|(dep_path, _)| !indices.contains_key(*dep_path))
+                // Only non-local registry tarballs are ever deferred by
+                // the streaming platform-skip above (it fires solely for
+                // `local_source.is_none()`), so the catch-up must scope to
+                // those. Local `file:`/`link:` deps already ran their
+                // `import_local_source` + `inc_reused` up front; link-only
+                // deps legitimately leave no `indices` entry, so a plain
+                // `!indices.contains_key` filter would re-import them and
+                // double-credit `reused` (reused > resolved →
+                // WARN_AUBE_PROGRESS_OVERFLOW).
+                .filter(|(dep_path, pkg)| {
+                    !indices.contains_key(*dep_path) && pkg.local_source.is_none()
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             if !missing_packages.is_empty() {
@@ -1871,7 +1933,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             return Err(miette!(
                 "no lockfile found and --frozen-lockfile is set\n\
                  help: commit pnpm-lock.yaml to your repository, or run \
-                 `aube install --no-frozen-lockfile` to generate one"
+                 `{} --no-frozen-lockfile` to generate one",
+                aube_util::cmd("install")
             ));
         }
         Err(e) => {

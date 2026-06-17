@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0](https://github.com/jdx/aube/compare/aube-settings-v1.21.0...aube-settings-v1.22.0) - 2026-06-17
+
+### Other
+
+- refresh benchmarks for v1.21.0 ([#890](https://github.com/jdx/aube/pull/890))
+
+## [1.21.0](https://github.com/jdx/aube/compare/aube-settings-v1.20.0...aube-settings-v1.21.0) - 2026-06-13
+
+### Fixed
+
+- *(install)* map peer-suffixed source deps to their canonical store index ([#885](https://github.com/jdx/aube/pull/885))
+- *(packaging)* restore endevco npm scope ([#887](https://github.com/jdx/aube/pull/887))
+
+## [1.20.0](https://github.com/jdx/aube/compare/aube-settings-v1.19.0...aube-settings-v1.20.0) - 2026-06-13
+
+### Added
+
+- embeddable Embedder profile (compile-time pluggability) ([#862](https://github.com/jdx/aube/pull/862))
+
+### Fixed
+
+- *(registry)* honor pnpm url-scoped auth env ([#863](https://github.com/jdx/aube/pull/863))
+
+### Other
+
+- link to all sponsors ([#876](https://github.com/jdx/aube/pull/876))
+- refresh benchmarks for v1.19.0 ([#866](https://github.com/jdx/aube/pull/866))
+
 ## [1.19.0](https://github.com/jdx/aube/compare/aube-settings-v1.18.2...aube-settings-v1.19.0) - 2026-06-11
 
 ### Added

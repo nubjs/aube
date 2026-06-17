@@ -1292,6 +1292,35 @@ fn auth_token_resolves_for_path_scoped_registry_with_default_port() {
 }
 
 #[test]
+fn scoped_auth_token_resolves_for_full_tarball_url_under_path_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "registry=https://registry.example.com/\n\
+             //registry.example.com/:_authToken=registry-token\n\
+             //registry.example.com/npm:@myorg:_authToken=scoped-token\n",
+    )
+    .unwrap();
+
+    let config = NpmConfig::load_isolated(dir.path());
+
+    assert_eq!(
+        config.auth_token_for_package(
+            "https://registry.example.com/npm/@myorg/pkg/-/pkg-1.0.0.tgz",
+            "@myorg/pkg",
+        ),
+        Some("scoped-token"),
+    );
+    assert_eq!(
+        config.auth_token_for_package(
+            "https://registry.example.com/npm-release/@myorg/pkg/-/pkg-1.0.0.tgz",
+            "@myorg/pkg",
+        ),
+        Some("registry-token"),
+    );
+}
+
+#[test]
 fn npmrc_key_with_default_port_is_normalized_on_ingest() {
     // User wrote `:443` explicitly in `.npmrc`. Lookups that don't
     // carry the port must still resolve.
@@ -1426,6 +1455,37 @@ fn token_helper_from_project_npmrc_is_refused() {
         config.token_helper_for("https://registry.example.com/"),
         None,
         "project-scope tokenHelper must be refused"
+    );
+}
+
+#[test]
+fn untrusted_scoped_token_helper_does_not_shadow_registry_token() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".npmrc"),
+        "//npm.pkg.github.com/:_authToken=broad-token\n",
+    )
+    .unwrap();
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "//npm.pkg.github.com/:@myorg:tokenHelper=/tmp/evil.sh\n",
+    )
+    .unwrap();
+
+    let mut config = NpmConfig::default();
+    config.apply_tagged(load_npmrc_entries_tagged_with_home(
+        Some(home.path()),
+        None,
+        project.path(),
+        None,
+    ));
+
+    assert_eq!(
+        config.auth_token_for_package("https://npm.pkg.github.com/", "@myorg/pkg"),
+        Some("broad-token"),
+        "ignored project tokenHelper must not create an empty scoped auth entry"
     );
 }
 
@@ -2900,4 +2960,147 @@ fn fetch_policy_clamps_giant_retry_counts_into_u32() {
     let ctx = aube_settings::ResolveCtx::files_only(&entries, &ws);
     let p = FetchPolicy::from_ctx(&ctx);
     assert_eq!(p.retries, u32::MAX);
+}
+
+#[test]
+fn scoped_auth_token_overrides_registry_token_for_matching_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "registry=https://npm.pkg.github.com/\n\
+         //npm.pkg.github.com/:_authToken=registry-token\n\
+         //npm.pkg.github.com/:@org-a:_authToken=org-a-token\n",
+    )
+    .unwrap();
+
+    let config = NpmConfig::load_isolated(dir.path());
+
+    assert_eq!(
+        config.auth_token_for_package("https://npm.pkg.github.com/", "@org-a/pkg"),
+        Some("org-a-token")
+    );
+    assert_eq!(
+        config.auth_token_for_package("https://npm.pkg.github.com/", "@org-b/pkg"),
+        Some("registry-token")
+    );
+}
+
+#[test]
+fn scoped_tls_config_does_not_shadow_registry_token() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "registry=https://npm.pkg.github.com/\n\
+         //npm.pkg.github.com/:_authToken=registry-token\n\
+         //npm.pkg.github.com/:@org-a:ca=-----BEGIN CERTIFICATE-----\\nca\\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+
+    let config = NpmConfig::load_isolated(dir.path());
+
+    assert_eq!(
+        config.auth_token_for_package("https://npm.pkg.github.com/", "@org-a/pkg"),
+        Some("registry-token")
+    );
+}
+
+#[test]
+fn longer_scoped_tls_config_does_not_shadow_shorter_scoped_token() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "registry=https://registry.example.com/npm/\n\
+         //registry.example.com/:_authToken=registry-token\n\
+         //registry.example.com/:@org-a:_authToken=org-a-token\n\
+         //registry.example.com/npm/:@org-a:cafile=/etc/ssl/org-a.pem\n",
+    )
+    .unwrap();
+
+    let config = NpmConfig::load_isolated(dir.path());
+
+    assert_eq!(
+        config.auth_token_for_package(
+            "https://registry.example.com/npm/@org-a/pkg/-/pkg-1.0.0.tgz",
+            "@org-a/pkg"
+        ),
+        Some("org-a-token")
+    );
+}
+
+#[test]
+fn scoped_auth_token_honors_path_scoped_registry_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "@org-a:registry=https://registry.example.com/npm/\n\
+         //registry.example.com/npm/:@org-a:_authToken=org-a-token\n\
+         //registry.example.com/:_authToken=root-token\n",
+    )
+    .unwrap();
+
+    let config = NpmConfig::load_isolated(dir.path());
+
+    assert_eq!(
+        config.auth_token_for_package(
+            "https://registry.example.com/npm/@org-a/pkg/-/pkg-1.0.0.tgz",
+            "@org-a/pkg"
+        ),
+        Some("org-a-token")
+    );
+    assert_eq!(
+        config.auth_token_for_package(
+            "https://registry.example.com/other/@org-a/pkg/-/pkg-1.0.0.tgz",
+            "@org-a/pkg"
+        ),
+        Some("root-token")
+    );
+}
+
+#[test]
+fn scoped_auth_token_requires_path_prefix_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "//registry.example.com/npm:@org-a:_authToken=org-a-token\n\
+         //registry.example.com/:_authToken=root-token\n",
+    )
+    .unwrap();
+
+    let config = NpmConfig::load_isolated(dir.path());
+
+    assert_eq!(
+        config.auth_token_for_package(
+            "https://registry.example.com/npm/@org-a/pkg/-/pkg-1.0.0.tgz",
+            "@org-a/pkg"
+        ),
+        Some("org-a-token")
+    );
+    assert_eq!(
+        config.auth_token_for_package(
+            "https://registry.example.com/npm-release/@org-a/pkg/-/pkg-1.0.0.tgz",
+            "@org-a/pkg"
+        ),
+        Some("root-token")
+    );
+}
+
+#[test]
+fn scoped_auth_lookup_checks_shorter_prefixes_before_unscoped_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "//registry.example.com/npm/private/:_authToken=private-root-token\n\
+         //registry.example.com/npm/:@org-a:_authToken=org-a-token\n",
+    )
+    .unwrap();
+
+    let config = NpmConfig::load_isolated(dir.path());
+
+    assert_eq!(
+        config.auth_token_for_package(
+            "https://registry.example.com/npm/private/@org-a/pkg/-/pkg-1.0.0.tgz",
+            "@org-a/pkg"
+        ),
+        Some("org-a-token")
+    );
 }

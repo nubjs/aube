@@ -104,6 +104,16 @@ pub(super) struct RawPnpmLockfile {
     pub(super) settings: Option<RawSettings>,
     #[serde(default)]
     pub(super) overrides: Option<BTreeMap<String, String>>,
+    /// `sha256-` prefixed `object-hash` of the effective
+    /// `packageExtensions`. Round-tripped verbatim so a parse/write
+    /// cycle preserves the value pnpm wrote and drift detection can
+    /// compare it against a freshly computed hash.
+    #[serde(default)]
+    pub(super) package_extensions_checksum: Option<String>,
+    /// `sha256-` prefixed hash of the local pnpmfile contents.
+    /// Round-tripped verbatim alongside `package_extensions_checksum`.
+    #[serde(default)]
+    pub(super) pnpmfile_checksum: Option<String>,
     #[serde(default)]
     pub(super) catalogs: Option<BTreeMap<String, BTreeMap<String, RawCatalogEntry>>>,
     /// pnpm v9+ top-level `patchedDependencies:` block. Map of
@@ -197,6 +207,12 @@ pub(super) struct RawPackageInfo {
     pub(super) libc: Vec<String>,
     #[serde(default)]
     pub(super) has_bin: bool,
+    /// Registry deprecation message pnpm records on a `packages:` entry
+    /// (`deprecated: <reason>`). Round-tripped so a parse/write cycle
+    /// keeps the field pnpm wrote; carried on the shared graph via
+    /// `LockedPackage::extra_meta["deprecated"]`.
+    #[serde(default)]
+    pub(super) deprecated: Option<String>,
     /// Paired writer field. See `WritablePackageInfo::alias_of`. `None`
     /// for ordinary (non-aliased) packages.
     #[serde(default)]

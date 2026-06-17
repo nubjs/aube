@@ -7,7 +7,7 @@ use miette::miette;
 /// alone is equivalent. We emit a one-line hint pointing users at the shorter
 /// form and still honor the explicit install so the command behaves the way
 /// a pnpm muscle-memory user expects.
-pub async fn run(script_args: ScriptArgs) -> miette::Result<()> {
+pub async fn run(script_args: ScriptArgs) -> miette::Result<Option<i32>> {
     script_args.network.install_overrides();
     script_args.lockfile.install_overrides();
     script_args.virtual_store.install_overrides();
@@ -20,8 +20,11 @@ pub async fn run(script_args: ScriptArgs) -> miette::Result<()> {
     } = script_args;
 
     eprintln!(
-        "aube: `install-test` is redundant — aube auto-installs before scripts, \
-         so `aube test` on its own does the same thing."
+        "{}: `install-test` is redundant — {} auto-installs before scripts, \
+         so `{}` on its own does the same thing.",
+        aube_util::prog(),
+        aube_util::prog(),
+        aube_util::cmd("test")
     );
 
     // Fail fast when there's no `test` script so a project with a large

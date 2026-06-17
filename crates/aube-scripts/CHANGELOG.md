@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0](https://github.com/jdx/aube/compare/aube-scripts-v1.21.0...aube-scripts-v1.22.0) - 2026-06-17
+
+### Fixed
+
+- *(embedder)* honor the embedder profile in the install banner and cache/name sites ([#888](https://github.com/jdx/aube/pull/888))
+
+### Other
+
+- refresh benchmarks for v1.21.0 ([#890](https://github.com/jdx/aube/pull/890))
+
+## [1.21.0](https://github.com/jdx/aube/compare/aube-scripts-v1.20.0...aube-scripts-v1.21.0) - 2026-06-13
+
+### Fixed
+
+- *(packaging)* restore endevco npm scope ([#887](https://github.com/jdx/aube/pull/887))
+
+## [1.20.0](https://github.com/jdx/aube/compare/aube-scripts-v1.19.0...aube-scripts-v1.20.0) - 2026-06-13
+
+### Added
+
+- *(scripts)* match pnpm's full npm_* env for lifecycle & run scripts ([#879](https://github.com/jdx/aube/pull/879))
+- embeddable Embedder profile (compile-time pluggability) ([#862](https://github.com/jdx/aube/pull/862))
+
+### Other
+
+- link to all sponsors ([#876](https://github.com/jdx/aube/pull/876))
+- refresh benchmarks for v1.19.0 ([#866](https://github.com/jdx/aube/pull/866))
+
 ## [1.19.0](https://github.com/jdx/aube/compare/aube-scripts-v1.18.2...aube-scripts-v1.19.0) - 2026-06-11
 
 ### Added

@@ -41,9 +41,13 @@ impl RegistryClient {
         (url, registry_url)
     }
 
-    /// Build a GET request with auth headers for the given registry URL.
-    pub(super) fn authed_get(&self, url: &str, registry_url: &str) -> reqwest::RequestBuilder {
-        self.authed_request(reqwest::Method::GET, url, registry_url)
+    pub(super) fn authed_get_for_package(
+        &self,
+        url: &str,
+        registry_url: &str,
+        package_name: &str,
+    ) -> reqwest::RequestBuilder {
+        self.authed_request_for_package(reqwest::Method::GET, url, registry_url, package_name)
     }
 
     /// Build an HTTP request using this registry's configured TLS client
@@ -57,6 +61,21 @@ impl RegistryClient {
         self.authed(
             self.http_for(registry_url).request(method, url),
             registry_url,
+        )
+    }
+
+    pub fn authed_request_for_package(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        registry_url: &str,
+        package_name: &str,
+    ) -> reqwest::RequestBuilder {
+        self.authed_for_package(
+            self.http_for_package(registry_url, package_name)
+                .request(method, url),
+            registry_url,
+            package_name,
         )
     }
 
@@ -76,6 +95,15 @@ impl RegistryClient {
     pub fn has_resolved_auth_for(&self, registry_url: &str) -> bool {
         self.registry_auth_token_for(registry_url).is_some()
             || self.config.basic_auth_for(registry_url).is_some()
+    }
+
+    pub fn has_resolved_auth_for_package(&self, registry_url: &str, package_name: &str) -> bool {
+        self.registry_auth_token_for_package(registry_url, Some(package_name))
+            .is_some()
+            || self
+                .config
+                .basic_auth_for_package(registry_url, package_name)
+                .is_some()
     }
 
     /// Attach auth headers to any `RequestBuilder` keyed off the registry
@@ -98,14 +126,49 @@ impl RegistryClient {
     }
 
     fn registry_auth_token_for(&self, registry_url: &str) -> Option<String> {
+        self.registry_auth_token_for_package(registry_url, None)
+    }
+
+    pub(super) fn authed_for_package(
+        &self,
+        req: reqwest::RequestBuilder,
+        registry_url: &str,
+        package_name: &str,
+    ) -> reqwest::RequestBuilder {
+        if let Some(token) = self.registry_auth_token_for_package(registry_url, Some(package_name))
+        {
+            req.bearer_auth(token)
+        } else if let Some(auth) = self
+            .config
+            .basic_auth_for_package(registry_url, package_name)
+        {
+            req.header("Authorization", format!("Basic {auth}"))
+        } else {
+            req
+        }
+    }
+
+    fn registry_auth_token_for_package(
+        &self,
+        registry_url: &str,
+        package_name: Option<&str>,
+    ) -> Option<String> {
+        let cache_key = match package_name {
+            Some(name) => format!("{registry_url}\0{name}"),
+            None => registry_url.to_string(),
+        };
         // Fast path: memoized result. Hit on the second-and-later
         // request to the same registry URL within one process.
         if let Ok(cache) = self.auth_token_by_url.lock()
-            && let Some(cached) = cache.get(registry_url)
+            && let Some(cached) = cache.get(&cache_key)
         {
             return cached.clone();
         }
-        let resolved = if let Some(auth) = self.config.registry_config_for(registry_url) {
+        let auth_config = match package_name {
+            Some(name) => self.config.registry_config_for_package(registry_url, name),
+            None => self.config.registry_config_for(registry_url),
+        };
+        let resolved = if let Some(auth) = auth_config {
             if let Some(token) = auth.auth_token.as_ref() {
                 Some(token.to_string())
             } else if let Some(helper) = auth.token_helper.as_deref() {
@@ -117,7 +180,7 @@ impl RegistryClient {
             None
         };
         if let Ok(mut cache) = self.auth_token_by_url.lock() {
-            cache.insert(registry_url.to_string(), resolved.clone());
+            cache.insert(cache_key, resolved.clone());
         }
         resolved
     }
@@ -147,6 +210,24 @@ impl RegistryClient {
         crate::config::lookup_by_uri_prefix(&self.http_by_uri, &uri_key).unwrap_or(&self.http)
     }
 
+    pub(super) fn http_for_package(
+        &self,
+        registry_url: &str,
+        package_name: &str,
+    ) -> &reqwest::Client {
+        if let Some((prefix, scope, _)) = self
+            .config
+            .scoped_tls_config_for_package(registry_url, package_name)
+            && let Some(client) = self
+                .http_by_uri_scope
+                .get(prefix)
+                .and_then(|by_scope| by_scope.get(scope))
+        {
+            return client;
+        }
+        self.http_for(registry_url)
+    }
+
     /// Pick the right HTTP client for tarball body downloads. The
     /// default registry uses the dedicated h1 client. Per-uri
     /// authed registries (corporate Artifactory, GitHub Packages)
@@ -159,6 +240,24 @@ impl RegistryClient {
             .unwrap_or(&self.http_tarball)
     }
 
+    pub(super) fn http_tarball_for_package(
+        &self,
+        registry_url: &str,
+        package_name: &str,
+    ) -> &reqwest::Client {
+        if let Some((prefix, scope, _)) = self
+            .config
+            .scoped_tls_config_for_package(registry_url, package_name)
+            && let Some(client) = self
+                .http_by_uri_scope
+                .get(prefix)
+                .and_then(|by_scope| by_scope.get(scope))
+        {
+            return client;
+        }
+        self.http_tarball_for(registry_url)
+    }
+
     /// Authed RequestBuilder routed through the tarball-specific
     /// client. Mirrors [`Self::authed_get`] but picks
     /// [`Self::http_tarball_for`] instead of [`Self::http_for`].
@@ -167,11 +266,17 @@ impl RegistryClient {
         url: &str,
         registry_url: &str,
     ) -> reqwest::RequestBuilder {
-        self.authed(
-            self.http_tarball_for(registry_url)
-                .request(reqwest::Method::GET, url),
-            registry_url,
-        )
+        if let Some(package_name) = package_name_from_tarball_url(url) {
+            let req = self
+                .http_tarball_for_package(registry_url, &package_name)
+                .request(reqwest::Method::GET, url);
+            self.authed_for_package(req, registry_url, &package_name)
+        } else {
+            let req = self
+                .http_tarball_for(registry_url)
+                .request(reqwest::Method::GET, url);
+            self.authed(req, registry_url)
+        }
     }
 
     /// Same as [`Self::send_with_retry`] but also returns wall-clock
@@ -453,5 +558,155 @@ impl RegistryClient {
             }
         }
         unreachable!("retry loop exited without returning; max_attempts was {max_attempts}")
+    }
+}
+
+fn package_name_from_tarball_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let segments: Vec<&str> = parsed.path_segments()?.collect();
+    if let Some(dash_idx) = segments.iter().position(|segment| *segment == "-")
+        && dash_idx >= 1
+    {
+        let name = segments[dash_idx - 1];
+        if let Some((scope, name)) = name.split_once("%2F").or_else(|| name.split_once("%2f"))
+            && scope.starts_with('@')
+        {
+            return Some(format!("{scope}/{name}"));
+        }
+        if dash_idx >= 2 && segments[dash_idx - 2].starts_with('@') {
+            return Some(format!("{}/{}", segments[dash_idx - 2], name));
+        }
+        return Some(name.to_string());
+    }
+    for (idx, segment) in segments.iter().enumerate() {
+        if let Some((scope, name)) = segment
+            .split_once("%2F")
+            .or_else(|| segment.split_once("%2f"))
+            && scope.starts_with('@')
+        {
+            return Some(format!("{scope}/{name}"));
+        }
+        if segment.starts_with('@') {
+            let name = segments.get(idx + 1)?;
+            return Some(format!("{segment}/{name}"));
+        }
+    }
+    segments.first().map(|segment| (*segment).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RegistryClient, package_name_from_tarball_url};
+    use crate::config::{AuthConfig, NpmConfig};
+
+    #[test]
+    fn package_name_from_tarball_url_handles_scoped_paths() {
+        assert_eq!(
+            package_name_from_tarball_url("https://registry.example.com/@org/pkg/-/pkg-1.0.0.tgz")
+                .as_deref(),
+            Some("@org/pkg")
+        );
+        assert_eq!(
+            package_name_from_tarball_url(
+                "https://registry.example.com/@org%2Fpkg/-/pkg-1.0.0.tgz"
+            )
+            .as_deref(),
+            Some("@org/pkg")
+        );
+        assert_eq!(
+            package_name_from_tarball_url(
+                "https://registry.example.com/npm/@org/pkg/-/pkg-1.0.0.tgz"
+            )
+            .as_deref(),
+            Some("@org/pkg")
+        );
+        assert_eq!(
+            package_name_from_tarball_url("https://registry.example.com/lodash/-/lodash-1.0.0.tgz")
+                .as_deref(),
+            Some("lodash")
+        );
+        assert_eq!(
+            package_name_from_tarball_url(
+                "https://registry.example.com/npm/lodash/-/lodash-1.0.0.tgz"
+            )
+            .as_deref(),
+            Some("lodash")
+        );
+    }
+
+    #[test]
+    fn http_for_package_uses_scoped_tls_client() {
+        let mut config = NpmConfig {
+            registry: "https://registry.example.com/".to_string(),
+            ..Default::default()
+        };
+        let mut scoped = AuthConfig::default();
+        scoped.tls.cafile = Some(std::path::PathBuf::from("org-a-ca.pem"));
+        config
+            .scoped_auth_by_uri
+            .entry("//registry.example.com/".to_string())
+            .or_default()
+            .insert("@org-a".to_string(), scoped);
+        let client = RegistryClient::from_config(config);
+
+        let default_client = client.http_for("https://registry.example.com/") as *const _;
+        let org_client =
+            client.http_for_package("https://registry.example.com/", "@org-a/pkg") as *const _;
+        let other_client =
+            client.http_for_package("https://registry.example.com/", "@org-b/pkg") as *const _;
+
+        assert_ne!(org_client, default_client);
+        assert_eq!(other_client, default_client);
+    }
+
+    #[test]
+    fn tarball_request_uses_scoped_auth_for_path_registry() {
+        let mut config = NpmConfig::default();
+        let registry_auth = AuthConfig {
+            auth_token: Some("registry-token".to_string()),
+            ..Default::default()
+        };
+        config
+            .auth_by_uri
+            .insert("//registry.example.com/".to_string(), registry_auth);
+
+        let scoped_auth = AuthConfig {
+            auth_token: Some("scoped-token".to_string()),
+            ..Default::default()
+        };
+        config
+            .scoped_auth_by_uri
+            .entry("//registry.example.com/npm".to_string())
+            .or_default()
+            .insert("@myorg".to_string(), scoped_auth);
+        let client = RegistryClient::from_config(config);
+
+        let req = client
+            .authed_tarball_get(
+                "https://registry.example.com/npm/@myorg/pkg/-/pkg-1.0.0.tgz",
+                "https://registry.example.com/npm/@myorg/pkg/-/pkg-1.0.0.tgz",
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get(reqwest::header::AUTHORIZATION),
+            Some(&reqwest::header::HeaderValue::from_static(
+                "Bearer scoped-token"
+            )),
+        );
+
+        let req = client
+            .authed_tarball_get(
+                "https://registry.example.com/npm-release/@myorg/pkg/-/pkg-1.0.0.tgz",
+                "https://registry.example.com/npm-release/@myorg/pkg/-/pkg-1.0.0.tgz",
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get(reqwest::header::AUTHORIZATION),
+            Some(&reqwest::header::HeaderValue::from_static(
+                "Bearer registry-token"
+            )),
+        );
     }
 }

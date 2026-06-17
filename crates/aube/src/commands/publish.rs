@@ -31,7 +31,7 @@
 use crate::commands::pack::{
     BuiltArchive, build_archive, build_archive_with_package_json, tarball_filename,
 };
-use crate::commands::{encode_package_name, ensure_registry_auth};
+use crate::commands::{encode_package_name, ensure_registry_auth_for_package};
 use aube_manifest::PackageJson;
 use aube_registry::client::RegistryClient;
 use aube_registry::config::{NpmConfig, normalize_registry_url_pub};
@@ -182,8 +182,9 @@ fn enforce_git_checks(cwd: &Path) -> miette::Result<()> {
     let dirty = String::from_utf8_lossy(&status.stdout);
     if !dirty.trim().is_empty() {
         return Err(miette!(
-            "aube publish: working tree has uncommitted changes:\n{}\n\
+            "{}: working tree has uncommitted changes:\n{}\n\
              help: commit or stash them, or pass --no-git-checks to override",
+            aube_util::cmd("publish"),
             dirty.trim_end()
         ));
     }
@@ -225,8 +226,9 @@ fn enforce_git_checks(cwd: &Path) -> miette::Result<()> {
         || is_version_branch(&branch, "release");
     if !ok {
         return Err(miette!(
-            "aube publish: current branch `{branch}` is not a release branch\n\
-             help: switch to main/master or pass --no-git-checks to override"
+            "{}: current branch `{branch}` is not a release branch\n\
+             help: switch to main/master or pass --no-git-checks to override",
+            aube_util::cmd("publish")
         ));
     }
     Ok(())
@@ -245,8 +247,9 @@ async fn run_recursive(
         .map_err(|e| miette!("failed to discover workspace packages: {e}"))?;
     if workspace_pkgs.is_empty() {
         return Err(miette!(
-            "aube publish: no workspace packages found. \
+            "{}: no workspace packages found. \
              `--recursive` / `--filter` requires a workspace root (aube-workspace.yaml, pnpm-workspace.yaml, or package.json with a `workspaces` field) at {}",
+            aube_util::cmd("publish"),
             source_root.display()
         ));
     }
@@ -255,12 +258,14 @@ async fn run_recursive(
     if selected.is_empty() {
         if !filter.is_empty() {
             return Err(miette!(
-                "aube publish: --filter {:?} did not match any workspace package",
+                "{}: --filter {:?} did not match any workspace package",
+                aube_util::cmd("publish"),
                 filter
             ));
         }
         return Err(miette!(
-            "aube publish: no publishable workspace packages (all private or empty)"
+            "{}: no publishable workspace packages (all private or empty)",
+            aube_util::cmd("publish")
         ));
     }
 
@@ -300,7 +305,8 @@ async fn run_recursive(
             .collect::<Vec<_>>()
             .join("\n");
         return Err(miette!(
-            "aube publish: {} failed:\n{joined}",
+            "{}: {} failed:\n{joined}",
+            aube_util::cmd("publish"),
             pluralizer::pluralize("package", failures.len() as isize, true)
         ));
     }
@@ -466,8 +472,9 @@ async fn publish_one(
             });
         }
         return Err(miette!(
-            "aube publish: {name}@{version} is already on {registry_url}\n\
-             help: pass --force to republish (the registry must allow it; npm's public registry does not)"
+            "{}: {name}@{version} is already on {registry_url}\n\
+             help: pass --force to republish (the registry must allow it; npm's public registry does not)",
+            aube_util::cmd("publish")
         ));
     }
 
@@ -535,13 +542,14 @@ async fn publish_one(
     let url = put_url(&registry_url, &archive.name);
     let trusted_publish_token = trusted_publish_token(client, &registry_url, &archive.name).await?;
     if trusted_publish_token.is_none() {
-        ensure_registry_auth(client, &registry_url)?;
+        ensure_registry_auth_for_package(client, &registry_url, &archive.name)?;
     }
     let body_bytes = serde_json::to_vec(&body).into_diagnostic()?;
     match send_publish_put(
         client,
         &url,
         &registry_url,
+        &archive.name,
         body_bytes.clone(),
         trusted_publish_token.as_deref(),
         args.otp.as_deref(),
@@ -555,6 +563,7 @@ async fn publish_one(
                 client,
                 &url,
                 &registry_url,
+                &archive.name,
                 body_bytes,
                 trusted_publish_token.as_deref(),
                 Some(&otp),
@@ -756,6 +765,7 @@ async fn send_publish_put(
     client: &RegistryClient,
     url: &str,
     registry_url: &str,
+    name: &str,
     body: Vec<u8>,
     trusted_publish_token: Option<&str>,
     otp: Option<&str>,
@@ -765,7 +775,7 @@ async fn send_publish_put(
             .request(reqwest::Method::PUT, url, registry_url)
             .bearer_auth(token)
     } else {
-        client.authed_request(reqwest::Method::PUT, url, registry_url)
+        client.authed_request_for_package(reqwest::Method::PUT, url, registry_url, name)
     }
     .header("content-type", "application/json")
     .body(body);
@@ -891,7 +901,7 @@ async fn version_on_registry(
 ) -> bool {
     let url = put_url(registry_url, name);
     let Ok(resp) = client
-        .authed_request(reqwest::Method::GET, &url, registry_url)
+        .authed_request_for_package(reqwest::Method::GET, &url, registry_url, name)
         .send()
         .await
     else {

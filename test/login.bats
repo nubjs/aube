@@ -63,8 +63,22 @@ teardown() {
 		--registry=https://myorg.example.com/ \
 		--scope=@myorg
 	assert_success
-	assert_file_contains "$HOME/.npmrc" "//myorg.example.com/:_authToken=scoped"
+	run cat "$HOME/.npmrc"
+	assert_success
+	assert_output --partial "//myorg.example.com/:@myorg:_authToken=scoped"
 	assert_file_contains "$HOME/.npmrc" "@myorg:registry=https://myorg.example.com/"
+}
+
+@test "aube login normalizes scope casing" {
+	AUBE_AUTH_TOKEN=scoped run aube login \
+		--registry=https://myorg.example.com/ \
+		--scope=@MyOrg
+	assert_success
+	run cat "$HOME/.npmrc"
+	assert_success
+	assert_output --partial "//myorg.example.com/:@myorg:_authToken=scoped"
+	assert_output --partial "@myorg:registry=https://myorg.example.com/"
+	refute_output --partial "@MyOrg"
 }
 
 @test "aube login replaces an existing token" {
@@ -108,8 +122,10 @@ teardown() {
 		--registry="http://127.0.0.1:$MOCK_WEB_LOGIN_PORT/" \
 		--scope=@myorg
 	assert_success
-	assert_file_contains "$HOME/.npmrc" \
-		"//127.0.0.1:$MOCK_WEB_LOGIN_PORT/:_authToken=mock-web-token"
+	run cat "$HOME/.npmrc"
+	assert_success
+	assert_output --partial \
+		"//127.0.0.1:$MOCK_WEB_LOGIN_PORT/:@myorg:_authToken=mock-web-token"
 	assert_file_contains "$HOME/.npmrc" \
 		"@myorg:registry=http://127.0.0.1:$MOCK_WEB_LOGIN_PORT/"
 }
@@ -148,7 +164,7 @@ teardown() {
 @test "aube logout --scope strips the scope mapping too" {
 	printf '%s\n' \
 		'@myorg:registry=https://myorg.example.com/' \
-		'//myorg.example.com/:_authToken=tok' >"$HOME/.npmrc"
+		'//myorg.example.com/:@myorg:_authToken=tok' >"$HOME/.npmrc"
 
 	run aube logout --scope=@myorg --registry=https://myorg.example.com/
 	assert_success
@@ -157,6 +173,36 @@ teardown() {
 	assert_success
 	refute_output --partial "_authToken"
 	refute_output --partial "@myorg:registry"
+}
+
+@test "aube logout --scope matches scope casing insensitively" {
+	printf '%s\n' \
+		'@MyOrg:registry=https://myorg.example.com/' \
+		'//myorg.example.com/:@MyOrg:_authToken=tok' >"$HOME/.npmrc"
+
+	run aube logout --scope=@myorg --registry=https://myorg.example.com/
+	assert_success
+
+	run cat "$HOME/.npmrc"
+	assert_success
+	refute_output --partial "_authToken"
+	refute_output --partial "@MyOrg:registry"
+}
+
+@test "aube logout without scope removes scoped tokens for the registry" {
+	printf '%s\n' \
+		'@myorg:registry=https://myorg.example.com/' \
+		'//myorg.example.com/:@myorg:_authToken=scoped' \
+		'//myorg.example.com/:_authToken=unscoped' >"$HOME/.npmrc"
+
+	run aube logout --registry=https://myorg.example.com/
+	assert_success
+	assert_output --partial "Logged out of https://myorg.example.com/"
+
+	run cat "$HOME/.npmrc"
+	assert_success
+	refute_output --partial "_authToken"
+	assert_output --partial "@myorg:registry=https://myorg.example.com/"
 }
 
 @test "aube logout is a no-op when no credentials exist" {

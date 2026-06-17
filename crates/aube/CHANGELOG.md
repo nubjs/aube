@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0](https://github.com/jdx/aube/compare/v1.21.0...v1.22.0) - 2026-06-17
+
+### Added
+
+- *(registry)* support scope-specific auth tokens ([#899](https://github.com/jdx/aube/pull/899))
+
+### Fixed
+
+- *(install)* verify tarball urls against packuments ([#905](https://github.com/jdx/aube/pull/905))
+- *(embedder)* honor the embedder profile in the install banner and cache/name sites ([#888](https://github.com/jdx/aube/pull/888))
+- *(install)* close pnpm-lock.yaml parity and re-resolution gaps ([#896](https://github.com/jdx/aube/pull/896))
+- *(install)* keep nested pnpm-workspace.yaml as a hard workspace boundary ([#889](https://github.com/jdx/aube/pull/889))
+- *(lockfile)* close pnpm-lock.yaml formatting and field parity gaps ([#893](https://github.com/jdx/aube/pull/893))
+- *(install)* repair member installs under sharedWorkspaceLockfile=false ([#891](https://github.com/jdx/aube/pull/891))
+
+### Other
+
+- *(commands)* return exit codes instead of process::exit (lib-embed safety) ([#897](https://github.com/jdx/aube/pull/897))
+- refresh benchmarks for v1.21.0 ([#890](https://github.com/jdx/aube/pull/890))
+
+## [1.21.0](https://github.com/jdx/aube/compare/v1.20.0...v1.21.0) - 2026-06-13
+
+### Added
+
+- *(lockfile)* emit packageExtensionsChecksum and pnpmfileChecksum for pnpm parity ([#883](https://github.com/jdx/aube/pull/883))
+
+### Fixed
+
+- *(install)* map peer-suffixed source deps to their canonical store index ([#885](https://github.com/jdx/aube/pull/885))
+- *(install)* write the root workspace lockfile under sharedWorkspaceLockfile=false ([#882](https://github.com/jdx/aube/pull/882))
+- *(packaging)* restore endevco npm scope ([#887](https://github.com/jdx/aube/pull/887))
+- *(install)* stop double-counting link deps in the progress bar ([#884](https://github.com/jdx/aube/pull/884))
+
+## [1.20.0](https://github.com/jdx/aube/compare/v1.19.0...v1.20.0) - 2026-06-13
+
+### Added
+
+- *(scripts)* match pnpm's full npm_* env for lifecycle & run scripts ([#879](https://github.com/jdx/aube/pull/879))
+- embeddable Embedder profile (compile-time pluggability) ([#862](https://github.com/jdx/aube/pull/862))
+
+### Fixed
+
+- *(install)* preserve each member's lockfile format under sharedWorkspaceLockfile=false ([#880](https://github.com/jdx/aube/pull/880))
+- *(linker)* resolve git deps in global virtual store ([#857](https://github.com/jdx/aube/pull/857))
+
+### Other
+
+- link to all sponsors ([#876](https://github.com/jdx/aube/pull/876))
+- refresh benchmarks for v1.19.0 ([#866](https://github.com/jdx/aube/pull/866))
+
 ## [1.19.0](https://github.com/jdx/aube/compare/v1.18.2...v1.19.0) - 2026-06-11
 
 ### Added

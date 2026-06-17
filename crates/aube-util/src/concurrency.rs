@@ -5,13 +5,11 @@
 //! in-flight requests trigger 429/503 throttling on slow private
 //! registries (Artifactory, Nexus). Read under the active embedder's
 //! config-env brand via [`config_env`](crate::env::config_env) — so it's
-//! `AUBE_CONCURRENCY` for standalone aube and `NUB_CONCURRENCY` for nub,
-//! and the branded `AUBE_*` form is never read under nub. It maps onto
-//! the same underlying setting aube exposes neutrally as
-//! `network-concurrency` (the env override of that). The override is a
-//! knob, not a probe — when AIMD ramping lands it will live alongside the
-//! semaphore in `aube-registry::concurrency` (the layer that owns retry
-//! signals).
+//! `AUBE_CONCURRENCY` for standalone aube and `<BRAND>_CONCURRENCY` for an
+//! embedder with its own `config_env_prefix`, and the branded `AUBE_*`
+//! form is never read under such a host. The override is a knob, not a
+//! probe — when AIMD ramping lands it will live alongside the semaphore in
+//! `aube-registry::concurrency` (the layer that owns retry signals).
 //!
 //! Range-clamped to `[CONCURRENCY_FLOOR, CONCURRENCY_CEILING]` so a
 //! hostile or typo'd value can't exhaust file descriptors on Windows
@@ -25,8 +23,8 @@ pub const CONCURRENCY_FLOOR: u32 = 8;
 /// value cannot exhaust the Windows default fd ulimit.
 pub const CONCURRENCY_CEILING: u32 = 256;
 
-/// Read the `{config_env_prefix}_CONCURRENCY` override (`AUBE_CONCURRENCY` /
-/// `NUB_CONCURRENCY`) as a clamped integer.
+/// Read the `{config_env_prefix}_CONCURRENCY` override (`AUBE_CONCURRENCY`
+/// under standalone aube) as a clamped integer.
 /// Returns `None` when the variable is unset, missing, or outside
 /// the range — callers fall back to the default (`network-concurrency`
 /// npmrc / setting / hard-coded). Out-of-range and non-numeric values warn.

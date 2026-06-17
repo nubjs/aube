@@ -104,6 +104,14 @@ impl NpmConfig {
             .and_then(|auth| auth.auth_token.as_deref())
     }
 
+    /// Get the auth token for a package request, preferring
+    /// scope-specific credentials when `.npmrc` configured
+    /// `//registry/:@scope:_authToken=...`.
+    pub fn auth_token_for_package(&self, registry_url: &str, package_name: &str) -> Option<&str> {
+        self.registry_config_for_package(registry_url, package_name)
+            .and_then(|auth| auth.auth_token.as_deref())
+    }
+
     pub fn token_helper_for(&self, registry_url: &str) -> Option<&str> {
         self.registry_config_for(registry_url)
             .and_then(|auth| auth.token_helper.as_deref())
@@ -111,7 +119,14 @@ impl NpmConfig {
 
     /// Get the basic auth (_auth) for a given registry URL.
     pub fn basic_auth_for(&self, registry_url: &str) -> Option<String> {
-        let auth = self.registry_config_for(registry_url)?;
+        self.basic_auth_from_config(self.registry_config_for(registry_url)?)
+    }
+
+    pub fn basic_auth_for_package(&self, registry_url: &str, package_name: &str) -> Option<String> {
+        self.basic_auth_from_config(self.registry_config_for_package(registry_url, package_name)?)
+    }
+
+    fn basic_auth_from_config(&self, auth: &AuthConfig) -> Option<String> {
         if let Some(ref a) = auth.auth {
             return Some(a.clone());
         }
@@ -130,6 +145,63 @@ impl NpmConfig {
     pub fn registry_config_for(&self, registry_url: &str) -> Option<&AuthConfig> {
         let uri_key = registry_uri_key(registry_url);
         lookup_by_uri_prefix(&self.auth_by_uri, &uri_key)
+    }
+
+    pub fn registry_config_for_package(
+        &self,
+        registry_url: &str,
+        package_name: &str,
+    ) -> Option<&AuthConfig> {
+        if let Some((_, _, auth)) =
+            self.scoped_config_for_package_matching(registry_url, package_name, |auth| {
+                has_credential_material(auth)
+            })
+        {
+            return Some(auth);
+        }
+        self.registry_config_for(registry_url)
+    }
+
+    pub(crate) fn scoped_tls_config_for_package(
+        &self,
+        registry_url: &str,
+        package_name: &str,
+    ) -> Option<(&str, &str, &AuthConfig)> {
+        self.scoped_config_for_package_matching(
+            registry_url,
+            package_name,
+            AuthConfig::has_tls_material,
+        )
+    }
+
+    fn scoped_config_for_package_matching(
+        &self,
+        registry_url: &str,
+        package_name: &str,
+        matches: impl Fn(&AuthConfig) -> bool,
+    ) -> Option<(&str, &str, &AuthConfig)> {
+        if let Some(scope) = package_scope(package_name) {
+            let scope = scope.to_lowercase();
+            let uri_key = registry_uri_key(registry_url);
+            if let Some((_, prefix, scope, auth)) = self
+                .scoped_auth_by_uri
+                .iter()
+                .filter_map(|(prefix, auth_by_scope)| {
+                    if uri_key_matches_prefix(&uri_key, prefix) {
+                        auth_by_scope.get_key_value(&scope).map(|(scope, auth)| {
+                            (prefix.len(), prefix.as_str(), scope.as_str(), auth)
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .filter(|(_, _, _, auth)| matches(auth))
+                .max_by_key(|(prefix_len, _, _, _)| *prefix_len)
+            {
+                return Some((prefix, scope, auth));
+            }
+        }
+        None
     }
 
     /// Test-only compatibility shim. Production code must go through
@@ -358,28 +430,60 @@ impl NpmConfig {
             } else if key.starts_with("//") {
                 // URI-specific config: //registry.url/:_authToken=TOKEN
                 if let Some((uri, suffix)) = key.rsplit_once(':') {
+                    let (uri, scope) = split_uri_scope_key(uri);
                     // Normalize so `//host:443/x/` and `//host/x/` collapse
                     // to the same key — matches what `registry_uri_key`
                     // produces on the lookup side after stripping the
                     // scheme's default port.
                     let uri_key = normalize_npmrc_uri_key(uri);
-                    let entry = self.auth_by_uri.entry(uri_key.clone()).or_default();
                     match suffix {
                         "_authToken" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
                             entry.auth_token = Some(value);
-                            explicit_uri_fields.insert((uri_key, "_authToken"));
+                            if scope.is_none() {
+                                explicit_uri_fields.insert((uri_key, "_authToken"));
+                            }
                         }
                         "_auth" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
                             entry.auth = Some(value);
-                            explicit_uri_fields.insert((uri_key, "_auth"));
+                            if scope.is_none() {
+                                explicit_uri_fields.insert((uri_key, "_auth"));
+                            }
                         }
                         "username" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
                             entry.username = Some(value);
-                            explicit_uri_fields.insert((uri_key, "username"));
+                            if scope.is_none() {
+                                explicit_uri_fields.insert((uri_key, "username"));
+                            }
                         }
                         "_password" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
                             entry.password = Some(value);
-                            explicit_uri_fields.insert((uri_key, "_password"));
+                            if scope.is_none() {
+                                explicit_uri_fields.insert((uri_key, "_password"));
+                            }
                         }
                         "tokenHelper" | "token-helper" => {
                             // CVE-2025-69262 (pnpm GHSA-2phv-j68v-wwqx)
@@ -404,18 +508,58 @@ impl NpmConfig {
                                 );
                                 continue;
                             };
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
                             entry.token_helper = Some(sanitized);
-                            explicit_uri_fields.insert((uri_key, "tokenHelper"));
+                            if scope.is_none() {
+                                explicit_uri_fields.insert((uri_key, "tokenHelper"));
+                            }
                         }
-                        "ca" | "ca[]" => entry.tls.ca.push(pem_value(value)),
-                        "cafile" | "caFile" => entry.tls.cafile = Some(PathBuf::from(value)),
+                        "ca" | "ca[]" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
+                            entry.tls.ca.push(pem_value(value));
+                        }
+                        "cafile" | "caFile" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
+                            entry.tls.cafile = Some(PathBuf::from(value));
+                        }
                         "cert" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
                             entry.tls.cert = Some(pem_value(value));
-                            explicit_uri_fields.insert((uri_key, "cert"));
+                            if scope.is_none() {
+                                explicit_uri_fields.insert((uri_key, "cert"));
+                            }
                         }
                         "key" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
                             entry.tls.key = Some(pem_value(value));
-                            explicit_uri_fields.insert((uri_key, "key"));
+                            if scope.is_none() {
+                                explicit_uri_fields.insert((uri_key, "key"));
+                            }
                         }
                         _ => {} // Ignore unknown suffixes for now
                     }
@@ -463,6 +607,53 @@ impl NpmConfig {
             .or_default();
         apply(entry);
     }
+}
+
+fn has_credential_material(auth: &AuthConfig) -> bool {
+    auth.auth_token.is_some()
+        || auth.auth.is_some()
+        || auth.token_helper.is_some()
+        || (auth.username.is_some() && auth.password.is_some())
+}
+
+fn uri_key_matches_prefix(uri_key: &str, prefix: &str) -> bool {
+    if uri_key == prefix || (uri_key.starts_with(prefix) && prefix.ends_with('/')) {
+        return true;
+    }
+    uri_key
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn auth_entry_for_uri<'a>(
+    auth_by_uri: &'a mut std::collections::BTreeMap<String, AuthConfig>,
+    scoped_auth_by_uri: &'a mut std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, AuthConfig>,
+    >,
+    uri_key: &str,
+    scope: Option<&str>,
+) -> &'a mut AuthConfig {
+    if let Some(scope) = scope {
+        scoped_auth_by_uri
+            .entry(uri_key.to_string())
+            .or_default()
+            .entry(scope.to_lowercase())
+            .or_default()
+    } else {
+        auth_by_uri.entry(uri_key.to_string()).or_default()
+    }
+}
+
+fn split_uri_scope_key(uri: &str) -> (&str, Option<&str>) {
+    if let Some((base, scope)) = uri.rsplit_once(':')
+        && scope.starts_with('@')
+        && scope.len() > 1
+        && !scope.contains('/')
+    {
+        return (base, Some(scope));
+    }
+    (uri, None)
 }
 
 fn canonical_rescoped_suffix(suffix: &str) -> Option<&'static str> {

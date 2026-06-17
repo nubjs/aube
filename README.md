@@ -30,7 +30,7 @@
 ## Why Try It
 
 <!-- BENCH_RATIOS:START -->
-**[Fast installs](https://aube.jdx.dev/benchmarks).** Warm installs are about 8x faster than pnpm and about 6x faster than Bun in the current benchmarks. Repeat test commands run up to 34x faster than pnpm and up to 5x faster than Bun.
+**[Fast installs](https://aube.jdx.dev/benchmarks).** Warm installs are about 3x faster than pnpm and about 2x faster than Bun in the current benchmarks. Repeat test commands run up to 30x faster than pnpm and up to 5x faster than Bun.
 <!-- BENCH_RATIOS:END -->
 
 **[Existing lockfiles](https://aube.jdx.dev/package-manager/lockfiles).** Reads and writes `pnpm-lock.yaml`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, and `bun.lock` in place.
@@ -72,8 +72,8 @@ mise use aube
 aube is also published on npm:
 
 ```sh
-npm install -g --ignore-scripts=false @jdx/aube
-npx --ignore-scripts=false @jdx/aube --version
+npm install -g --ignore-scripts=false @endevco/aube
+npx --ignore-scripts=false @endevco/aube --version
 ```
 
 The npm package uses an install script to fetch native binaries for

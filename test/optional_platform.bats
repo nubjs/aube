@@ -54,6 +54,10 @@ teardown() {
 	# resolving from this file picks it up.
 	run grep -F 'aube-test-optional-win32@1.0.0' aube-lock.yaml
 	assert_success
+	# A package reachable only through an optional edge must carry
+	# `optional: true` in the snapshots block, exactly as pnpm marks it.
+	run grep -A1 -F 'aube-test-optional-win32@1.0.0:' aube-lock.yaml
+	assert_output --partial 'optional: true'
 }
 
 @test "required platform-mismatched dep still gets fetched and linked" {
@@ -110,6 +114,60 @@ teardown() {
 	# …but it MUST land in the lockfile's `packages:` block so a Windows
 	# CI run resolving from this file picks it up.
 	run grep -F 'aube-test-optional-win32@1.0.0:' pnpm-lock.yaml
+	assert_success
+	# pnpm flags optional-only packages with `optional: true` in the
+	# snapshots block; aube matches so a parse-then-write round-trip and a
+	# fresh resolve produce byte-identical snapshots.
+	run grep -A1 -F 'aube-test-optional-win32@1.0.0:' pnpm-lock.yaml
+	assert_output --partial 'optional: true'
+}
+
+@test "pnpm-lock.yaml records optional natives for exotic arches (full pnpm parity)" {
+	# pnpm records EVERY optional-dep variant a package declares — even
+	# rare triples like linux-ppc64. This fixture declares `cpu: ["ppc64"]`
+	# and must survive into pnpm-lock.yaml under the full accept-all set —
+	# the actual fix for the rollup optionalDependencies parity report.
+	: >pnpm-lock.yaml
+	cat >package.json <<-'JSON'
+		{
+		  "name": "pnpm-lock-exotic-arch",
+		  "version": "0.0.0",
+		  "optionalDependencies": {
+		    "aube-test-optional-ppc64": "1.0.0"
+		  }
+		}
+	JSON
+	run aube install --no-frozen-lockfile
+	assert_success
+	assert_exists pnpm-lock.yaml
+	# Never installed on the x64/arm64 CI host…
+	assert_not_exists node_modules/aube-test-optional-ppc64
+	# …but recorded in the lockfile's `packages:` block, matching pnpm.
+	run grep -F 'aube-test-optional-ppc64@1.0.0:' pnpm-lock.yaml
+	assert_success
+}
+
+@test "aube-lock.yaml records optional natives for exotic arches (full pnpm parity)" {
+	# aube-lock.yaml records EVERY optional-dep variant a package declares,
+	# matching pnpm and bun — both write all natives (linux-ppc64, freebsd,
+	# s390x, …) into their committed lockfiles. A teammate on a rare
+	# platform installing from this file must find their native binding, so
+	# nothing platform-specific is withheld. Install-time filtering still
+	# keeps the host's node_modules trimmed: the dep is recorded, not linked.
+	cat >package.json <<-'JSON'
+		{
+		  "name": "aube-lock-exotic-arch",
+		  "version": "0.0.0",
+		  "optionalDependencies": {
+		    "aube-test-optional-ppc64": "1.0.0"
+		  }
+		}
+	JSON
+	run aube install --no-frozen-lockfile
+	assert_success
+	assert_exists aube-lock.yaml
+	assert_not_exists node_modules/aube-test-optional-ppc64
+	run grep -F 'aube-test-optional-ppc64@1.0.0' aube-lock.yaml
 	assert_success
 }
 

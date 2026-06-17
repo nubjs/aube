@@ -150,24 +150,30 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
     true
 }
 
+/// The platform's `node` executable file name: `node.exe` on Windows,
+/// `node` everywhere else. Single source of truth for the spots that
+/// build or look up the node binary by name.
+pub(crate) const fn node_exe_name() -> &'static str {
+    if cfg!(windows) { "node.exe" } else { "node" }
+}
+
 /// Per-OS layout of a native Node install: unix puts `node` under
 /// `bin/`, Windows puts `node.exe` at the root (mise mirrors both).
 pub(crate) fn node_paths_in(dir: &Path) -> (PathBuf, PathBuf) {
+    let exe_name = node_exe_name();
+    // Windows zips put node.exe at the archive root; mise (and some
+    // mirror layouts) use bin\node.exe instead. Prefer the root copy
+    // when it exists, otherwise fall through to the shared bin/ layout
+    // used on every OS.
     if cfg!(windows) {
-        // Windows zips have node.exe at the archive root, but mise
-        // (and some mirrors' layouts) use bin\node.exe — accept both.
-        let root_exe = dir.join("node.exe");
+        let root_exe = dir.join(exe_name);
         if root_exe.is_file() {
             return (dir.to_path_buf(), root_exe);
         }
-        let bin = dir.join("bin");
-        let exe = bin.join("node.exe");
-        (bin, exe)
-    } else {
-        let bin = dir.join("bin");
-        let exe = bin.join("node");
-        (bin, exe)
     }
+    let bin = dir.join("bin");
+    let exe = bin.join(exe_name);
+    (bin, exe)
 }
 
 /// Find `node` on PATH and probe its version (`node --version`).
@@ -180,7 +186,7 @@ pub fn probe_path_node() -> Option<(node_semver::Version, PathBuf)> {
 }
 
 fn probe_path_node_uncached() -> Option<(node_semver::Version, PathBuf)> {
-    let exe = find_on_path(if cfg!(windows) { "node.exe" } else { "node" })?;
+    let exe = find_on_path(node_exe_name())?;
     let output = std::process::Command::new(&exe)
         .arg("--version")
         .output()
@@ -191,6 +197,27 @@ fn probe_path_node_uncached() -> Option<(node_semver::Version, PathBuf)> {
     let raw = String::from_utf8(output.stdout).ok()?;
     let version = node_semver::Version::parse(raw.trim().trim_start_matches('v')).ok()?;
     Some((version, exe))
+}
+
+/// Locate a `node` executable on `PATH` without spawning it (unlike
+/// [`probe_path_node`], which runs `node --version`). Cheap enough to
+/// call on the hot install/run path to populate `npm_node_execpath` /
+/// `NODE` for lifecycle scripts when no runtime switch is active.
+/// Returns the first `node` (`node.exe` on Windows) on `PATH` as an
+/// absolute, executable path, or `None` if none qualifies.
+pub fn node_on_path() -> Option<PathBuf> {
+    let node = find_on_path(node_exe_name())?;
+    // `npm_node_execpath` / `NODE` are contracted to be an absolute,
+    // runnable node. `find_on_path` only guarantees an existing file,
+    // and a relative `PATH` segment yields a relative match, so make
+    // the path absolute and require the exec bit — better to leave the
+    // vars unset than hand tools a path they can't run.
+    let node = if node.is_absolute() {
+        node
+    } else {
+        std::env::current_dir().ok()?.join(node)
+    };
+    is_executable_file(&node).then_some(node)
 }
 
 /// Minimal PATH walk (std-only). Returns the first existing,
@@ -231,7 +258,7 @@ mod tests {
             dir.join("bin")
         };
         std::fs::create_dir_all(&bin).unwrap();
-        let exe = bin.join(if cfg!(windows) { "node.exe" } else { "node" });
+        let exe = bin.join(node_exe_name());
         std::fs::write(&exe, "#!/bin/sh\necho v0.0.0\n").unwrap();
         #[cfg(unix)]
         {

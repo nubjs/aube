@@ -10,6 +10,7 @@ use crate::CodeMeta;
 // ── pnpmfile / hooks ────────────────────────────────────────────────
 pub const WARN_AUBE_PNPMFILE_NOT_FOUND: &str = "WARN_AUBE_PNPMFILE_NOT_FOUND";
 pub const WARN_AUBE_PNPMFILE_STDERR_FORWARDER: &str = "WARN_AUBE_PNPMFILE_STDERR_FORWARDER";
+pub const WARN_AUBE_PNPMFILE_CHECKSUM_FAILED: &str = "WARN_AUBE_PNPMFILE_CHECKSUM_FAILED";
 pub const WARN_AUBE_HOOK_IMPORTER_MUTATED: &str = "WARN_AUBE_HOOK_IMPORTER_MUTATED";
 pub const WARN_AUBE_HOOK_IMPORTER_ADDED: &str = "WARN_AUBE_HOOK_IMPORTER_ADDED";
 pub const WARN_AUBE_HOOK_IDENTITY_REWRITTEN: &str = "WARN_AUBE_HOOK_IDENTITY_REWRITTEN";
@@ -88,6 +89,8 @@ pub const WARN_AUBE_LOCKFILE_MERGE_CONFLICT: &str = "WARN_AUBE_LOCKFILE_MERGE_CO
 pub const WARN_AUBE_LOCKFILE_MERGE_CLEANUP_FAILED: &str = "WARN_AUBE_LOCKFILE_MERGE_CLEANUP_FAILED";
 pub const WARN_AUBE_LOCKFILE_CONFLICT_MARKERS: &str = "WARN_AUBE_LOCKFILE_CONFLICT_MARKERS";
 pub const WARN_AUBE_YARN_BERRY_UNSUPPORTED: &str = "WARN_AUBE_YARN_BERRY_UNSUPPORTED";
+pub const WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX: &str =
+    "WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX";
 
 // ── progress UI ─────────────────────────────────────────────────────
 pub const WARN_AUBE_PROGRESS_OVERFLOW: &str = "WARN_AUBE_PROGRESS_OVERFLOW";
@@ -142,6 +145,12 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_PNPMFILE_STDERR_FORWARDER,
         category: category::PNPMFILE_HOOKS,
         description: "The background task forwarding pnpmfile stderr panicked.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_PNPMFILE_CHECKSUM_FAILED,
+        category: category::PNPMFILE_HOOKS,
+        description: "Reading the local pnpmfile for checksum computation failed; the lockfile's `pnpmfileChecksum` field is omitted so a later install will re-resolve instead of trusting a stale value.",
         exit_code: None,
     },
     CodeMeta {
@@ -488,6 +497,12 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_YARN_BERRY_UNSUPPORTED,
         category: category::LOCKFILE,
         description: "A Yarn Berry `patch:` / `portal:` / `exec:` protocol — or any unrecognized protocol — was found in `yarn.lock`. Entry was skipped.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX,
+        category: category::LOCKFILE,
+        description: "A pnpm dep_path peer suffix had unbalanced parentheses (a truncated or hand-corrupted lockfile entry). The key is preserved verbatim instead of silently dropping everything after the `(`, so a later install surfaces the bad entry rather than mis-resolving it.",
         exit_code: None,
     },
     // Progress UI

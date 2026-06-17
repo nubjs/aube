@@ -60,7 +60,7 @@ impl RegistryClient {
         let url = format!("{packument_url}/{version}");
         let resp = self
             .send_metadata_with_retry(&format!("version {name}@{version}"), || {
-                self.authed_get(&url, registry_url)
+                self.authed_get_for_package(&url, registry_url, name)
                     .header("Accept", "application/json")
             })
             .await?;
@@ -85,7 +85,7 @@ impl RegistryClient {
         let (url, registry_url) = self.packument_url(name);
         let resp = self
             .send_metadata_with_retry(&format!("packument {name}"), || {
-                self.authed_get(&url, registry_url)
+                self.authed_get_for_package(&url, registry_url, name)
                     .header("Accept", PACKUMENT_FULL_ACCEPT)
             })
             .await?;
@@ -113,12 +113,13 @@ impl RegistryClient {
     ) -> Result<serde_json::Value, Error> {
         let (url, registry_url) = self.packument_url(name);
 
-        let mut req = self.authed(
-            self.http_for(registry_url)
+        let mut req = self.authed_for_package(
+            self.http_for_package(registry_url, name)
                 .put(&url)
                 .header("Content-Type", "application/json")
                 .json(body),
             registry_url,
+            name,
         );
         if let Some(code) = otp {
             req = req.header("npm-otp", code);
@@ -163,7 +164,7 @@ impl RegistryClient {
         let url = dist_tag_root_url(registry_url, name);
         let resp = self
             .send_metadata_with_retry(&format!("dist-tags {name}"), || {
-                self.authed_get(&url, registry_url)
+                self.authed_get_for_package(&url, registry_url, name)
             })
             .await?;
         let resp = check_dist_tag_status(resp, name).await?;
@@ -192,7 +193,7 @@ impl RegistryClient {
         let body = serde_json::to_string(version).map_err(std::io::Error::other)?;
 
         let mut req = self
-            .http_for(registry_url)
+            .http_for_package(registry_url, name)
             .put(&url)
             .header("Content-Type", "application/json")
             .body(body);
@@ -204,7 +205,10 @@ impl RegistryClient {
         } else {
             req
         };
-        let resp = self.authed(req, registry_url).send().await?;
+        let resp = self
+            .authed_for_package(req, registry_url, name)
+            .send()
+            .await?;
         let resp = check_dist_tag_status(resp, name).await?;
         resp.error_for_status()?;
         Ok(())
@@ -220,7 +224,7 @@ impl RegistryClient {
     ) -> Result<(), Error> {
         let registry_url = self.registry_url_for(name);
         let url = dist_tag_url(registry_url, name, tag);
-        let mut req = self.http_for(registry_url).delete(&url);
+        let mut req = self.http_for_package(registry_url, name).delete(&url);
         if self.config.is_public_npmjs(name) {
             req = req.header("npm-auth-type", "web");
         }
@@ -229,7 +233,10 @@ impl RegistryClient {
         } else {
             req
         };
-        let resp = self.authed(req, registry_url).send().await?;
+        let resp = self
+            .authed_for_package(req, registry_url, name)
+            .send()
+            .await?;
         // 404 here is ambiguous: package doesn't exist vs tag doesn't
         // exist on this package. Surface the `name@tag` form so the
         // caller can render it either way.
