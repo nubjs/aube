@@ -21,19 +21,21 @@ use std::path::{Path, PathBuf};
 /// and the `--allow-build=<pkg>` / `--deny-build=<pkg>` CLI flags —
 /// entries are forcibly set, overwriting any prior value.
 ///
-/// Manifest-root embedder caveat (the approve-builds heal gap): an
-/// embedder whose `manifest_namespace` is `""` writes the setting at
-/// the *top level* of `package.json` via [`edit_setting_map`], but the
-/// read side only honors that top-level key when
-/// `read_manifest_root_config` is set (the embedder's own identity
-/// surface). Under the embedder's pnpm-compat surface
-/// (`read_branded_pnpm_config` on, `read_manifest_root_config` off —
-/// the common pnpm-lock/fresh case) the reader looks at the `pnpm.*`
-/// namespace and the workspace yaml, *not* the top-level key, so a
-/// top-level write would be invisible and the approval a no-op.
+/// Manifest-root embedder routing: an embedder whose `manifest_namespace`
+/// is `""` writes the setting at the *top level* of `package.json` via
+/// [`edit_setting_map`]. The read side honors that top-level (neutral,
+/// un-branded) key on *every* surface, so under nub identity AND under an
+/// npm/bun/yarn incumbent (`read_branded_pnpm_config` off) the approval takes
+/// effect — `approve-builds` heals on those surfaces.
 ///
-/// When the read posture has gated off the top-level key but still
-/// reads the (pnpm) namespace, the write lands in `package.json` under
+/// The one surface where a bare top-level write is NOT the right target is the
+/// embedder's *pnpm-compat* surface (`read_branded_pnpm_config` on): there the
+/// reader also consults the `pnpm.*` namespace and the workspace yaml, and to
+/// match real pnpm 10.x — and to keep the approval where a pnpm user expects it
+/// — the write lands under `pnpm.*` (see below). The top-level key would still
+/// be *read* there, but writing under `pnpm.*` is the more faithful placement.
+///
+/// On that pnpm-compat surface the write lands in `package.json` under
 /// `pnpm.*` — the surface the reader honors — *without* creating a
 /// `pnpm-workspace.yaml` where none exists (a fresh yaml file is noisy).
 /// Approvals (`allow=true`) go to `pnpm.onlyBuiltDependencies` (pnpm's

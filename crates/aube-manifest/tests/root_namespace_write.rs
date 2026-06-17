@@ -98,7 +98,7 @@ fn root_embedder_writes_map_settings_at_manifest_root() {
 }
 
 #[test]
-fn root_embedder_reads_root_allow_builds_only_when_root_surface_is_active() {
+fn root_embedder_reads_neutral_top_level_allow_builds_on_every_surface() {
     aube_util::set_embedder(&ROOT_TOOL);
 
     let manifest = PackageJson::parse(
@@ -119,17 +119,32 @@ fn root_embedder_reads_root_allow_builds_only_when_root_surface_is_active() {
     )
     .unwrap();
 
-    // A non-pnpm incumbent under a manifest-root embedder gates both pnpm and
-    // root-native config off. This preserves compat projects where root
-    // `allowBuilds` is not the active package manager's surface.
+    // A non-pnpm incumbent under a manifest-root embedder: the pnpm namespace
+    // is gated off, but the top-level `allowBuilds` is the embedder's own
+    // un-branded key and is read on EVERY surface — so `approve-builds` heals
+    // here (the npm/bun/yarn incumbent case). The pnpm-branded `left-pad` entry
+    // is NOT read on this surface.
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = false;
         ctx.read_manifest_root_config = false;
     });
-    assert!(manifest.pnpm_allow_builds().is_empty());
+    let compat = manifest.pnpm_allow_builds();
+    assert!(matches!(
+        compat.get("esbuild"),
+        Some(AllowBuildRaw::Bool(true))
+    ));
+    assert!(matches!(
+        compat.get("sharp"),
+        Some(AllowBuildRaw::Bool(false))
+    ));
+    assert!(
+        !compat.contains_key("left-pad"),
+        "the pnpm-branded entry must not be read on a non-pnpm surface"
+    );
 
-    // Pnpm/fresh mode reads only pnpm-branded config, not the manifest-root
-    // setting that belongs to the root embedder identity.
+    // Pnpm/fresh mode reads the pnpm-branded config; the neutral top-level key
+    // is also read (it's the embedder's own un-branded key), merged with
+    // later-wins so a top-level entry can override a pnpm one on key conflict.
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = true;
         ctx.read_manifest_root_config = false;
@@ -139,7 +154,10 @@ fn root_embedder_reads_root_allow_builds_only_when_root_surface_is_active() {
         pnpm.get("left-pad"),
         Some(AllowBuildRaw::Bool(true))
     ));
-    assert!(!pnpm.contains_key("esbuild"));
+    assert!(matches!(
+        pnpm.get("esbuild"),
+        Some(AllowBuildRaw::Bool(true))
+    ));
 
     // NubIdentity-style mode gates pnpm off and reads root `allowBuilds` as the
     // native config surface produced by `pm use nub`.
@@ -297,17 +315,16 @@ fn set_allow_builds_writes_pnpm_allow_builds_map_for_denial_no_yaml() {
     );
 }
 
-/// Documents the CURRENT NonPnpmCompat (npm/bun/yarn incumbent) behavior:
-/// both gates are off, so `set_allow_builds` writes the top-level
-/// `package.json#allowBuilds` key that the read side does NOT consult on this
-/// surface — i.e. `approve-builds` is still a no-op for these incumbents. This
-/// is a known gap pending a separate routing decision; the test pins the
-/// reality so any future fix is a deliberate, visible change.
+/// `approve-builds` HEALS on the NonPnpmCompat (npm/bun/yarn incumbent)
+/// surface: with both gates off, `set_allow_builds` writes the top-level
+/// `package.json#allowBuilds` key, and the read side now consults that neutral,
+/// un-branded key on every surface — so the approval takes effect and the next
+/// install runs the script. (Previously a documented no-op; the gap is closed.)
 #[test]
-fn set_allow_builds_is_a_no_op_on_non_pnpm_compat_surface() {
+fn set_allow_builds_heals_on_non_pnpm_compat_surface() {
     aube_util::set_embedder(&ROOT_TOOL);
-    // npm/bun/yarn incumbent: neither the pnpm namespace nor the manifest-root
-    // key is read.
+    // npm/bun/yarn incumbent: the pnpm namespace is gated off and this is not
+    // nub identity, but the neutral top-level key is still read.
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = false;
         ctx.read_manifest_root_config = false;
@@ -319,7 +336,12 @@ fn set_allow_builds_is_a_no_op_on_non_pnpm_compat_surface() {
     let written = set_allow_builds(tmp.path(), &["core-js".to_string()], true).unwrap();
     assert_eq!(
         written.file_name().and_then(|n| n.to_str()),
-        Some("package.json")
+        Some("package.json"),
+        "approval lands in package.json, not a fresh pnpm-workspace.yaml, got: {written:?}"
+    );
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "must not create a pnpm-workspace.yaml on a non-pnpm surface"
     );
 
     // The approval is written at the top level…
@@ -328,19 +350,20 @@ fn set_allow_builds_is_a_no_op_on_non_pnpm_compat_surface() {
         manifest["allowBuilds"]["core-js"],
         serde_json::Value::Bool(true)
     );
-    // …but the read side on this surface ignores it: the approval does not
-    // take effect (the documented gap).
+    // …and the read side on this surface now honors it: the approval takes
+    // effect, so the next install runs the dep's lifecycle script.
     let parsed = PackageJson::parse(
         &tmp.path().join("package.json"),
         std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
     )
     .unwrap();
     assert!(
-        parsed.pnpm_allow_builds().is_empty(),
-        "KNOWN GAP: approve-builds is a no-op on a non-pnpm-compat surface — \
-         the top-level write is unread here. If this assertion fails, the gap \
-         was fixed and this documenting test should become the real assertion. \
-         got: {:#?}",
+        matches!(
+            parsed.pnpm_allow_builds().get("core-js"),
+            Some(AllowBuildRaw::Bool(true))
+        ),
+        "approve-builds must heal on a non-pnpm-compat surface — the top-level \
+         write is read back here. got: {:#?}",
         parsed.pnpm_allow_builds()
     );
 }

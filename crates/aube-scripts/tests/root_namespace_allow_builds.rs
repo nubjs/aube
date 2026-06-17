@@ -1,6 +1,8 @@
 //! Manifest-root embedders such as nub write `allowBuilds` at package.json
-//! root after migration. The lifecycle build policy must consume that root map
-//! only when the embedder marks its root-native config surface active.
+//! root after migration and on the npm/bun/yarn-compat `approve-builds` heal
+//! path. The top-level `allowBuilds` is the embedder's own un-branded key, so
+//! the lifecycle build policy consumes it on every surface — while the
+//! pnpm-branded `pnpm.allowBuilds` is read only when the pnpm surface is active.
 
 use aube_manifest::PackageJson;
 use aube_scripts::{AllowDecision, BuildPolicy};
@@ -42,7 +44,7 @@ fn build_decision(manifest: &PackageJson, name: &str, version: &str) -> AllowDec
 }
 
 #[test]
-fn root_allow_builds_feeds_build_policy_only_when_root_surface_is_active() {
+fn root_allow_builds_feeds_build_policy_on_every_surface() {
     aube_util::set_embedder(&ROOT_TOOL);
     let manifest = PackageJson::parse(
         std::path::Path::new("package.json"),
@@ -62,15 +64,27 @@ fn root_allow_builds_feeds_build_policy_only_when_root_surface_is_active() {
     )
     .unwrap();
 
+    // NonPnpmCompat (npm/bun/yarn incumbent): the neutral top-level key is read
+    // — the approve-builds heal — while the pnpm-branded entry is not.
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = false;
         ctx.read_manifest_root_config = false;
     });
     assert_eq!(
         build_decision(&manifest, "esbuild", "0.19.0"),
+        AllowDecision::Allow
+    );
+    assert_eq!(
+        build_decision(&manifest, "sharp", "0.33.0"),
+        AllowDecision::Deny
+    );
+    assert_eq!(
+        build_decision(&manifest, "left-pad", "1.3.0"),
         AllowDecision::Unspecified
     );
 
+    // PnpmOrFresh: the pnpm-branded entry is read, and the neutral top-level key
+    // is also honored (later-wins merge), so both decide.
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = true;
         ctx.read_manifest_root_config = false;
@@ -81,7 +95,7 @@ fn root_allow_builds_feeds_build_policy_only_when_root_surface_is_active() {
     );
     assert_eq!(
         build_decision(&manifest, "esbuild", "0.19.0"),
-        AllowDecision::Unspecified
+        AllowDecision::Allow
     );
 
     aube_util::update_engine_context(|ctx| {

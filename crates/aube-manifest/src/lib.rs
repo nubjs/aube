@@ -423,8 +423,14 @@ impl PackageJson {
     /// Extract the `pnpm.allowBuilds` / `aube.allowBuilds` object from
     /// the raw `package.json` payload, if present. For embedders whose native
     /// manifest config lives at root (`manifest_namespace == ""`), the
-    /// top-level `allowBuilds` map is also read when the runtime context says
-    /// that root-native surface is active. Returns a map keyed by the raw
+    /// top-level `allowBuilds` map is *always* read — it is the embedder's own
+    /// un-branded key (not a foreign brand's surface), so it is honored on
+    /// every config surface (nub identity, npm/bun/yarn compat, pnpm/fresh),
+    /// not only the root-native one. This is what makes `approve-builds`
+    /// effective under an npm/bun/yarn incumbent: the approval it writes at the
+    /// top level is read back here regardless of incumbent. Standalone aube
+    /// keeps a non-empty `manifest_namespace`, so this branch never fires for
+    /// it — its behavior is unchanged. Returns a map keyed by the raw
     /// pattern string (e.g. `"esbuild"`, `"@swc/core@1.3.0"`) with `bool`
     /// values preserved as `bool` and any other shape captured verbatim so the
     /// caller can warn about it. The tool's own namespace/root surface wins
@@ -441,9 +447,7 @@ impl PackageJson {
                 }
             }
         }
-        let ctx = aube_util::engine_context();
-        if ctx.read_manifest_root_config
-            && aube_util::embedder().manifest_namespace.is_empty()
+        if aube_util::embedder().manifest_namespace.is_empty()
             && let Some(map) = self.extra.get("allowBuilds").and_then(|v| v.as_object())
         {
             for (k, v) in map {
