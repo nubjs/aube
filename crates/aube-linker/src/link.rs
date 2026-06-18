@@ -17,6 +17,32 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 impl Linker {
+    fn without_global_virtual_store(&self) -> Self {
+        Self {
+            virtual_store: self.virtual_store.clone(),
+            store: self.store.clone(),
+            use_global_virtual_store: false,
+            strategy: self.strategy,
+            patches: self.patches.clone(),
+            hashes: self.hashes.clone(),
+            virtual_store_dir_max_length: self.virtual_store_dir_max_length,
+            shamefully_hoist: self.shamefully_hoist,
+            public_hoist_patterns: self.public_hoist_patterns.clone(),
+            public_hoist_negations: self.public_hoist_negations.clone(),
+            hoist: self.hoist,
+            hoist_patterns: self.hoist_patterns.clone(),
+            hoist_negations: self.hoist_negations.clone(),
+            hoist_workspace_packages: self.hoist_workspace_packages,
+            hoisting_limits: self.hoisting_limits,
+            dedupe_direct_deps: self.dedupe_direct_deps,
+            node_linker: self.node_linker,
+            modules_dir_name: self.modules_dir_name.clone(),
+            aube_dir_override: self.aube_dir_override.clone(),
+            link_concurrency: self.link_concurrency,
+            virtual_store_only: self.virtual_store_only,
+        }
+    }
+
     /// Link all packages into node_modules for the given project.
     pub fn link_all(
         &self,
@@ -52,6 +78,15 @@ impl Linker {
             );
             stats.hoisted_placements = Some(placements);
             return Ok(stats);
+        }
+
+        if self.use_global_virtual_store && self.hoist {
+            remove_hidden_hoist_tree(&self.virtual_store.join("node_modules"));
+            return self.without_global_virtual_store().link_all(
+                project_dir,
+                graph,
+                package_indices,
+            );
         }
 
         let nm = project_dir.join(&self.modules_dir_name);
@@ -658,6 +693,15 @@ impl Linker {
         if matches!(self.node_linker, NodeLinker::Hoisted) {
             return self.link_workspace_hoisted(root_dir, graph, package_indices, workspace_dirs);
         }
+        if self.use_global_virtual_store && self.hoist {
+            remove_hidden_hoist_tree(&self.virtual_store.join("node_modules"));
+            return self.without_global_virtual_store().link_workspace(
+                root_dir,
+                graph,
+                package_indices,
+                workspace_dirs,
+            );
+        }
 
         let root_nm = root_dir.join(&self.modules_dir_name);
         let aube_dir = self.aube_dir_for(root_dir);
@@ -1230,12 +1274,11 @@ impl Linker {
         Ok(stats)
     }
 
-    /// Populate (or sweep) the hidden modules directories at
-    /// `aube_dir/node_modules/<name>` and, in global-virtual-store mode,
-    /// `virtual_store/node_modules/<name>`. When `self.hoist` is
-    /// enabled, walks every non-local package in the graph and creates
-    /// a symlink for names that match `hoist_patterns` into each
-    /// corresponding virtual-store package entry.
+    /// Populate (or sweep) the project-local hidden modules directory at
+    /// `aube_dir/node_modules/<name>`. When `self.hoist` is enabled,
+    /// walks every non-local package in the graph and creates a symlink
+    /// for names that match `hoist_patterns` into each corresponding
+    /// virtual-store package entry.
     /// When disabled, wipes the directory so previously-hoisted
     /// symlinks don't keep resolving through Node's parent walk.
     ///
@@ -1245,20 +1288,15 @@ impl Linker {
     /// `.aube/react@18/node_modules/react/`) walk up through
     /// `.aube/node_modules/` during require resolution, which is the
     /// only consumer of these links — nothing inside the user's own
-    /// `node_modules/<name>` view is affected. In GVS mode, many
-    /// toolchains canonicalize the package path into
-    /// `~/.cache/aube/virtual-store/<hash>/node_modules/<name>`, so we
-    /// mirror the hidden hoist under the shared virtual-store root too.
+    /// `node_modules/<name>` view is affected. In GVS mode, the shared
+    /// virtual store must not expose unversioned hidden-hoist aliases:
+    /// those aliases are project-specific and would otherwise be mutable
+    /// cross-project state. Remove any stale shared mirror left by older
+    /// linkers and keep the only hidden-hoist tree project-local.
     fn link_hidden_hoist(&self, aube_dir: &Path, graph: &LockfileGraph) -> Result<(), Error> {
         self.link_hidden_hoist_at(aube_dir, aube_dir, graph, false, true)?;
         if self.use_global_virtual_store {
-            self.link_hidden_hoist_at(
-                &self.virtual_store,
-                &self.virtual_store,
-                graph,
-                true,
-                false,
-            )?;
+            remove_hidden_hoist_tree(&self.virtual_store.join("node_modules"));
         }
         Ok(())
     }
@@ -1276,23 +1314,33 @@ impl Linker {
         // lifetime) drops the SipHash overhead and the per-insert
         // `String` clone the `HashSet<String>` version forced.
         let mut claimed: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
-        let packages: Vec<_> = if self.hoist {
-            graph
-                .packages
-                .iter()
-                .filter_map(|(dep_path, pkg)| {
-                    if pkg.local_source.is_some() || !self.hoist_matches(&pkg.name) {
-                        return None;
-                    }
-                    // First-writer-wins on name clashes across versions.
-                    // BTree iteration over `graph.packages` gives a
-                    // deterministic tiebreaker across runs.
-                    claimed.insert(pkg.name.as_str()).then_some((dep_path, pkg))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut packages = Vec::new();
+        if self.hoist {
+            for direct in graph.root_deps() {
+                let Some(pkg) = graph.packages.get(&direct.dep_path) else {
+                    continue;
+                };
+                if pkg.local_source.is_some() || !self.hoist_matches(&pkg.name) {
+                    continue;
+                }
+                if claimed.insert(pkg.name.as_str()) {
+                    packages.push((direct.dep_path.as_str(), pkg));
+                }
+            }
+            for (dep_path, pkg) in &graph.packages {
+                if pkg.local_source.is_some() || !self.hoist_matches(&pkg.name) {
+                    continue;
+                }
+                // Root direct dependencies reserve their package names
+                // before the deterministic transitive sweep. That matches
+                // pnpm's undeclared-import fallback when the app and a
+                // transitive dependency bring different versions of the
+                // same package into the graph.
+                if claimed.insert(pkg.name.as_str()) {
+                    packages.push((dep_path.as_str(), pkg));
+                }
+            }
+        }
 
         if !self.hoist {
             // Previous install may have populated this tree with

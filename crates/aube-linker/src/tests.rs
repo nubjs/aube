@@ -32,6 +32,15 @@ fn setup_store_with_files(dir: &Path) -> (Store, BTreeMap<String, aube_store::Pa
     (store, indices)
 }
 
+fn package_index(store: &Store, package_json: &str, index_js: &str) -> PackageIndex {
+    let mut index = PackageIndex::default();
+    let package_json = store.import_bytes(package_json.as_bytes(), false).unwrap();
+    index.insert("package.json".to_string(), package_json);
+    let index_js = store.import_bytes(index_js.as_bytes(), false).unwrap();
+    index.insert("index.js".to_string(), index_js);
+    index
+}
+
 fn make_graph() -> LockfileGraph {
     let mut packages = BTreeMap::new();
 
@@ -175,7 +184,7 @@ fn test_link_all_creates_pnpm_virtual_store() {
     std::fs::create_dir_all(&project_dir).unwrap();
 
     let (store, indices) = setup_store_with_files(dir.path());
-    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true).with_hoist(false);
     let graph = make_graph();
 
     let stats = linker.link_all(&project_dir, &graph, &indices).unwrap();
@@ -183,7 +192,7 @@ fn test_link_all_creates_pnpm_virtual_store() {
     // .aube virtual store should exist
     assert!(project_dir.join("node_modules/.aube").exists());
 
-    // .aube/foo@1.0.0 should be a symlink to the global virtual store
+    // With hidden hoist disabled, .aube/foo@1.0.0 is a symlink to the global virtual store.
     let aube_foo = project_dir.join("node_modules/.aube/foo@1.0.0");
     assert!(aube_foo.symlink_metadata().unwrap().is_symlink());
 
@@ -378,7 +387,7 @@ fn test_global_virtual_store_is_populated() {
 
     let (store, indices) = setup_store_with_files(dir.path());
     let virtual_store = store.virtual_store_dir();
-    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true).with_hoist(false);
     let graph = make_graph();
 
     linker.link_all(&project_dir, &graph, &indices).unwrap();
@@ -396,44 +405,144 @@ fn test_global_virtual_store_is_populated() {
 }
 
 #[test]
-fn test_global_virtual_store_gets_hidden_hoist() {
+fn test_hidden_hoist_prefers_root_direct_dep_over_transitive_version() {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
 
-    let (store, indices) = setup_store_with_files(dir.path());
-    let virtual_store = store.virtual_store_dir();
-    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
-    let mut graph = make_graph();
-    graph
-        .packages
-        .get_mut("foo@1.0.0")
-        .unwrap()
-        .dependencies
-        .clear();
+    let store = Store::at(dir.path().join("store/files"));
+    let mut indices = BTreeMap::new();
+    indices.insert(
+        "@hookform/resolvers@5.2.2".to_string(),
+        package_index(
+            &store,
+            r#"{"name":"@hookform/resolvers","version":"5.2.2"}"#,
+            "module.exports = 'resolver';",
+        ),
+    );
+    indices.insert(
+        "transitive@1.0.0".to_string(),
+        package_index(
+            &store,
+            r#"{"name":"transitive","version":"1.0.0"}"#,
+            "module.exports = 'transitive';",
+        ),
+    );
+    indices.insert(
+        "zod@4.1.11".to_string(),
+        package_index(
+            &store,
+            r#"{"name":"zod","version":"4.1.11"}"#,
+            "module.exports = 'zod-4.1.11';",
+        ),
+    );
+    indices.insert(
+        "zod@4.3.5".to_string(),
+        package_index(
+            &store,
+            r#"{"name":"zod","version":"4.3.5"}"#,
+            "module.exports = 'zod-4.3.5';",
+        ),
+    );
 
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "@hookform/resolvers@5.2.2".to_string(),
+        LockedPackage {
+            name: "@hookform/resolvers".to_string(),
+            version: "5.2.2".to_string(),
+            dep_path: "@hookform/resolvers@5.2.2".to_string(),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "transitive@1.0.0".to_string(),
+        LockedPackage {
+            name: "transitive".to_string(),
+            version: "1.0.0".to_string(),
+            dependencies: BTreeMap::from([("zod".to_string(), "4.1.11".to_string())]),
+            dep_path: "transitive@1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "zod@4.1.11".to_string(),
+        LockedPackage {
+            name: "zod".to_string(),
+            version: "4.1.11".to_string(),
+            dep_path: "zod@4.1.11".to_string(),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "zod@4.3.5".to_string(),
+        LockedPackage {
+            name: "zod".to_string(),
+            version: "4.3.5".to_string(),
+            dep_path: "zod@4.3.5".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![
+            DirectDep {
+                name: "@hookform/resolvers".to_string(),
+                dep_path: "@hookform/resolvers@5.2.2".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            },
+            DirectDep {
+                name: "zod".to_string(),
+                dep_path: "zod@4.3.5".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            },
+            DirectDep {
+                name: "transitive".to_string(),
+                dep_path: "transitive@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            },
+        ],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
     linker.link_all(&project_dir, &graph, &indices).unwrap();
 
-    let project_hidden = project_dir.join("node_modules/.aube/node_modules/bar");
-    assert!(project_hidden.symlink_metadata().unwrap().is_symlink());
-
-    let global_hidden = virtual_store.join("node_modules/bar");
-    assert!(global_hidden.symlink_metadata().unwrap().is_symlink());
-
-    let from_real_store = virtual_store.join("foo@1.0.0/node_modules/bar/index.js");
+    let resolver_real =
+        std::fs::canonicalize(project_dir.join("node_modules/@hookform/resolvers/index.js"))
+            .unwrap();
     assert!(
-        !from_real_store.exists(),
-        "bar is not a declared sibling of foo in this fixture"
+        resolver_real.starts_with(std::fs::canonicalize(&project_dir).unwrap()),
+        "hidden-hoist fallback must keep package realpaths project-local"
     );
-    let fallback = virtual_store.join("node_modules/bar/index.js");
+
+    let project_hidden = project_dir.join("node_modules/.aube/node_modules/zod");
+    assert!(project_hidden.symlink_metadata().unwrap().is_symlink());
     assert_eq!(
-        std::fs::read_to_string(fallback).unwrap(),
-        "module.exports = 'bar';"
+        std::fs::read_to_string(project_hidden.join("index.js")).unwrap(),
+        "module.exports = 'zod-4.3.5';"
+    );
+    assert!(
+        store
+            .virtual_store_dir()
+            .join("node_modules/zod")
+            .symlink_metadata()
+            .is_err(),
+        "global virtual store must not expose an unversioned zod alias"
     );
 }
 
 #[test]
-fn test_global_virtual_store_hidden_hoist_prunes_only_dead_entries() {
+fn test_global_virtual_store_removes_stale_hidden_hoist_tree() {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -442,24 +551,12 @@ fn test_global_virtual_store_hidden_hoist_prunes_only_dead_entries() {
     let virtual_store = store.virtual_store_dir();
     let hidden = virtual_store.join("node_modules");
     std::fs::create_dir_all(&hidden).unwrap();
-    let dotfile = hidden.join(".sentinel");
-    std::fs::write(&dotfile, "shared").unwrap();
-    let stale = hidden.join("stale");
-    std::fs::write(&stale, "old").unwrap();
-    let stale_scope = hidden.join("@stale-scope");
-    std::fs::write(&stale_scope, "old").unwrap();
-    let external_target = virtual_store.join("external@1.0.0/node_modules/external");
-    std::fs::create_dir_all(&external_target).unwrap();
-    let external_link = hidden.join("external");
+    std::fs::write(hidden.join(".sentinel"), "old").unwrap();
+    let stale_target = virtual_store.join("zod@4.1.11/node_modules/zod");
+    std::fs::create_dir_all(&stale_target).unwrap();
     sys::create_dir_link(
-        &pathdiff::diff_paths(&external_target, &hidden).unwrap(),
-        &external_link,
-    )
-    .unwrap();
-    let dead_link = hidden.join("dead");
-    sys::create_dir_link(
-        Path::new("../missing@1.0.0/node_modules/missing"),
-        &dead_link,
+        &pathdiff::diff_paths(&stale_target, &hidden).unwrap(),
+        &hidden.join("zod"),
     )
     .unwrap();
 
@@ -468,36 +565,18 @@ fn test_global_virtual_store_hidden_hoist_prunes_only_dead_entries() {
         .link_all(&project_dir, &make_graph(), &indices)
         .unwrap();
 
-    assert_eq!(std::fs::read_to_string(dotfile).unwrap(), "shared");
-    assert!(!stale.exists());
-    assert!(stale_scope.symlink_metadata().is_err());
-    assert!(external_link.symlink_metadata().unwrap().is_symlink());
-    assert!(dead_link.symlink_metadata().is_err());
-    assert!(hidden.join("bar").symlink_metadata().unwrap().is_symlink());
-}
-
-#[test]
-fn test_global_virtual_store_hidden_hoist_disabled_keeps_live_shared_links() {
-    let dir = tempfile::tempdir().unwrap();
-    let project_dir = dir.path().join("project");
-    std::fs::create_dir_all(&project_dir).unwrap();
-
-    let (store, indices) = setup_store_with_files(dir.path());
-    let virtual_store = store.virtual_store_dir();
-    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
-    linker
-        .link_all(&project_dir, &make_graph(), &indices)
-        .unwrap();
-
-    let global_hidden = virtual_store.join("node_modules/bar");
-    assert!(global_hidden.symlink_metadata().unwrap().is_symlink());
-
-    Linker::new_with_gvs(&store, LinkStrategy::Copy, true)
-        .with_hoist(false)
-        .link_all(&project_dir, &make_graph(), &indices)
-        .unwrap();
-
-    assert!(global_hidden.symlink_metadata().unwrap().is_symlink());
+    assert!(
+        hidden.symlink_metadata().is_err(),
+        "shared hidden-hoist aliases must be removed, not pruned in place"
+    );
+    assert!(
+        project_dir
+            .join("node_modules/.aube/node_modules/bar")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink(),
+        "project-local hidden hoist remains populated"
+    );
 }
 
 #[test]
@@ -505,7 +584,7 @@ fn test_second_install_reuses_global_store() {
     let dir = tempfile::tempdir().unwrap();
 
     let (store, indices) = setup_store_with_files(dir.path());
-    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true).with_hoist(false);
     let graph = make_graph();
 
     // First install
@@ -595,7 +674,7 @@ fn gvs_shareable_source_dep_without_index_errors_loudly() {
 
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
-    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true).with_hoist(false);
     let err = linker
         .link_all(&project_dir, &graph, &indices)
         .expect_err("a shareable source dep with no index must error, not dangle");
