@@ -1869,6 +1869,53 @@ fn patched_dependency_writes_pnpm10_hash_and_suffix_shape() {
 }
 
 #[test]
+fn parses_pnpm11_workspace_patch_scalar_as_hash() {
+    const HASH: &str = "9a5e7ff81a171ea8f960603e932f919b35317e7259f8ff2c78678cbd09c9c009";
+    let yaml = format!(
+        r#"lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+patchedDependencies:
+  ms@2.1.3: {HASH}
+
+importers:
+
+  .:
+    dependencies:
+      ms:
+        specifier: 2.1.3
+        version: 2.1.3(patch_hash={HASH})
+
+packages:
+
+  ms@2.1.3:
+    resolution: {{integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}}
+
+snapshots:
+
+  ms@2.1.3(patch_hash={HASH}): {{}}
+"#
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, yaml).unwrap();
+
+    let graph = parse(&path).unwrap();
+
+    assert!(
+        graph.patched_dependencies.is_empty(),
+        "pnpm 11 scalar entry is a hash; the patch path lives in pnpm-workspace.yaml"
+    );
+    assert_eq!(
+        graph.patched_dependency_hashes.get("ms@2.1.3").unwrap(),
+        HASH
+    );
+}
+
+#[test]
 fn empty_overrides_block_omitted_from_yaml() {
     // Default-empty overrides should not introduce an `overrides:` key
     // in the lockfile — important for byte-identical parity with pnpm

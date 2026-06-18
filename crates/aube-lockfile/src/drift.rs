@@ -287,7 +287,13 @@ impl LockfileGraph {
         // whose selector the project no longer declares is as stale as
         // a declared patch the lockfile doesn't record (`patch-remove`
         // relies on this firing to drop the entry on the next write).
-        for selector in self.patched_dependencies.keys() {
+        let recorded_selectors: BTreeSet<&str> = self
+            .patched_dependencies
+            .keys()
+            .chain(self.patched_dependency_hashes.keys())
+            .map(String::as_str)
+            .collect();
+        for selector in recorded_selectors {
             if !effective_paths.contains_key(selector) {
                 return DriftStatus::Stale {
                     reason: format!(
@@ -299,11 +305,15 @@ impl LockfileGraph {
         for (selector, path) in effective_paths {
             match self.patched_dependencies.get(selector) {
                 None => {
-                    return DriftStatus::Stale {
-                        reason: format!(
-                            "patchedDependencies.{selector}: declared in the project but missing from the lockfile"
-                        ),
-                    };
+                    let pnpm_hash_only_entry = matches!(kind, LockfileKind::Pnpm)
+                        && self.patched_dependency_hashes.contains_key(selector);
+                    if !pnpm_hash_only_entry {
+                        return DriftStatus::Stale {
+                            reason: format!(
+                                "patchedDependencies.{selector}: declared in the project but missing from the lockfile"
+                            ),
+                        };
+                    }
                 }
                 Some(locked_path) if locked_path != path => {
                     return DriftStatus::Stale {
@@ -926,6 +936,27 @@ mod drift_tests {
         let graph = make_graph(&[("lodash", "^4.17.0", "lodash@4.17.21")]);
         assert_eq!(
             graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()),
+            DriftStatus::Fresh
+        );
+    }
+
+    #[test]
+    fn fresh_when_pnpm_patch_path_lives_in_workspace_yaml() {
+        let mut graph = make_graph(&[("ms", "2.1.3", "ms@2.1.3")]);
+        graph.patched_dependency_hashes.insert(
+            "ms@2.1.3".into(),
+            "9a5e7ff81a171ea8f960603e932f919b35317e7259f8ff2c78678cbd09c9c009".into(),
+        );
+        let effective_paths =
+            BTreeMap::from([("ms@2.1.3".into(), "patches/ms@2.1.3.patch".into())]);
+        let effective_hashes = graph.patched_dependency_hashes.clone();
+
+        assert_eq!(
+            graph.check_patched_dependencies_drift(
+                LockfileKind::Pnpm,
+                &effective_paths,
+                &effective_hashes,
+            ),
             DriftStatus::Fresh
         );
     }

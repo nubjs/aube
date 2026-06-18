@@ -117,10 +117,9 @@ pub(super) struct RawPnpmLockfile {
     #[serde(default)]
     pub(super) catalogs: Option<BTreeMap<String, BTreeMap<String, RawCatalogEntry>>>,
     /// pnpm v9+ top-level `patchedDependencies:` block. Map of
-    /// `pkg@version` selector → patch entry (pnpm uses a nested
-    /// `{ path, hash }` object, but we only model the path string
-    /// on the shared graph). Round-tripped verbatim so a parse/
-    /// write cycle doesn't drop user patches.
+    /// `pkg@version` selector → patch entry. pnpm writes either a
+    /// scalar or `{ path, hash }`; scalar values can be old path entries
+    /// or pnpm 11's workspace-yaml hash-only entries.
     #[serde(default)]
     pub(super) patched_dependencies: Option<BTreeMap<String, RawPatchedDependency>>,
     #[serde(default)]
@@ -135,14 +134,14 @@ pub(super) struct RawPnpmLockfile {
     pub(super) time: Option<BTreeMap<String, String>>,
 }
 
-/// pnpm writes `patchedDependencies` as either a bare path string
-/// (v8 style) or a nested `{ path, hash }` object (v9+). We accept
-/// both via an untagged enum; the path and the hash land in the
-/// graph's `patched_dependencies` / `patched_dependency_hashes` maps.
+/// pnpm writes `patchedDependencies` as either a scalar or a nested
+/// `{ path, hash }` object. Scalars are interpreted by the reader:
+/// older lockfiles use a path, while pnpm 11 can use a hash when
+/// `pnpm-workspace.yaml` carries the path.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(super) enum RawPatchedDependency {
-    Path(String),
+    Scalar(String),
     Object {
         path: String,
         #[serde(default)]
@@ -151,10 +150,21 @@ pub(super) enum RawPatchedDependency {
 }
 
 impl RawPatchedDependency {
-    pub(super) fn into_path_and_hash(self) -> (String, Option<String>) {
+    pub(super) fn scalar_value(&self) -> Option<&str> {
         match self {
-            RawPatchedDependency::Path(p) => (p, None),
-            RawPatchedDependency::Object { path, hash } => (path, hash),
+            RawPatchedDependency::Scalar(value) => Some(value),
+            RawPatchedDependency::Object { .. } => None,
+        }
+    }
+
+    pub(super) fn into_path_and_hash(
+        self,
+        scalar_is_hash: bool,
+    ) -> (Option<String>, Option<String>) {
+        match self {
+            RawPatchedDependency::Scalar(value) if scalar_is_hash => (None, Some(value)),
+            RawPatchedDependency::Scalar(path) => (Some(path), None),
+            RawPatchedDependency::Object { path, hash } => (Some(path), hash),
         }
     }
 }

@@ -1,7 +1,6 @@
 use super::dep_path::{
     dep_path_tail, parse_dep_path, peerless_alias_target, rewrite_peer_suffix,
-    rewrite_snapshot_alias_deps,
-    version_to_dep_path,
+    rewrite_snapshot_alias_deps, version_to_dep_path,
 };
 use super::raw::{
     RawBinSpec, RawDepSpec, RawRuntimeVariant, local_source_from_resolution, parse_raw_lockfile,
@@ -903,6 +902,8 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         }
     }
 
+    let scalar_patch_hashes = scalar_patch_hashes(&raw);
+
     let settings = raw
         .settings
         .map(|s| crate::LockfileSettings {
@@ -938,11 +939,18 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let mut patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
     let mut patched_dependency_hashes: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in raw.patched_dependencies.unwrap_or_default() {
-        let (path, hash) = v.into_path_and_hash();
+        let scalar_is_hash = v.scalar_value().is_some_and(|value| {
+            scalar_patch_hashes
+                .get(&k)
+                .is_some_and(|hash| hash == value)
+        });
+        let (path, hash) = v.into_path_and_hash(scalar_is_hash);
         if let Some(hash) = hash {
             patched_dependency_hashes.insert(k.clone(), hash);
         }
-        patched_dependencies.insert(k, path);
+        if let Some(path) = path {
+            patched_dependencies.insert(k, path);
+        }
     }
 
     // Lift the synthetic runtime importer deps recorded above into
@@ -999,6 +1007,33 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         extra_fields: BTreeMap::new(),
         workspace_extra_fields: BTreeMap::new(),
     })
+}
+
+fn scalar_patch_hashes(raw: &super::raw::RawPnpmLockfile) -> BTreeMap<String, String> {
+    let mut hashes = BTreeMap::new();
+    let Some(patched_dependencies) = raw.patched_dependencies.as_ref() else {
+        return hashes;
+    };
+    for (selector, entry) in patched_dependencies {
+        let Some(value) = entry.scalar_value() else {
+            continue;
+        };
+        if !is_sha256_hex(value) {
+            continue;
+        }
+        let marker = format!("(patch_hash={value})");
+        if raw.snapshots.keys().any(|key| {
+            key.strip_prefix(selector)
+                .is_some_and(|tail| tail.starts_with(&marker))
+        }) {
+            hashes.insert(selector.clone(), value.to_string());
+        }
+    }
+    hashes
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Convert a raw `variations` variant into the typed graph shape.
