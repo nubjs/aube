@@ -238,6 +238,19 @@ pub fn upsert_patched_dependency(cwd: &Path, key: &str, rel_patch_path: &str) ->
     // ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) or silently link unpatched
     // content (bun). aube-native projects keep the configured
     // namespace rule below.
+    //
+    // Brand-boundary exception (the embedder symmetric boundary): when the
+    // engine does NOT consume pnpm-branded config (`read_branded_pnpm_config
+    // == false` — an embedder running as the project's own identity, e.g.
+    // `nub` under a nub-identity project), writing the entry under the
+    // `pnpm` namespace would record it where the engine then *ignores* it:
+    // `pnpm_patched_dependencies()` skips the `pnpm` namespace under that
+    // posture, so the patch never reaches `effective_patch_config` →
+    // never lands in the lockfile → the next `--frozen-lockfile` install
+    // fails with ERR_*_OUTDATED_LOCKFILE (the patch is "declared but
+    // missing"). Land it in the un-branded top-level `patchedDependencies`
+    // instead — the location the engine reads under its own identity.
+    let reads_branded_pnpm = aube_util::engine_context().read_branded_pnpm_config;
     match aube_lockfile::detect_existing_lockfile_kind(cwd) {
         Some(aube_lockfile::LockfileKind::Bun) => {
             upsert_manifest_patched_dependency(cwd, key, rel_patch_path, None)
@@ -247,7 +260,11 @@ pub fn upsert_patched_dependency(cwd: &Path, key: &str, rel_patch_path: &str) ->
         Some(aube_lockfile::LockfileKind::Pnpm)
             if aube_manifest::workspace::workspace_yaml_existing(cwd).is_none() =>
         {
-            upsert_manifest_patched_dependency(cwd, key, rel_patch_path, Some("pnpm"))
+            // Standalone aube (reads pnpm config): nest under `pnpm` so real
+            // pnpm accepts the lockfile. An embedder that ignores pnpm config:
+            // write the un-branded top-level field it actually reads.
+            let namespace = if reads_branded_pnpm { Some("pnpm") } else { None };
+            upsert_manifest_patched_dependency(cwd, key, rel_patch_path, namespace)
                 .wrap_err("failed to write package.json")?;
             return Ok(cwd.join("package.json"));
         }
