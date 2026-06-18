@@ -208,12 +208,16 @@ impl PlacementPlan {
         floor: usize,
         name: &str,
         dep_path: &str,
+        reuse_visible_above_floor: bool,
     ) -> Result<PlaceOutcome, Error> {
         crate::validate_package_link_name(name)?;
         debug_assert!(is_ancestor_or_self(&self.nodes, floor, requester));
         // Reuse a matching package anywhere already visible through
         // Node's ancestor lookup, even if the hoist limit would
-        // prevent placing a new package that high.
+        // prevent placing a new package that high. `link:` deps opt
+        // out: they are live links owned by the requester that
+        // declared them, so a matching ancestor entry must not steal
+        // the requester's own symlink slot.
         let mut cursor = requester;
         loop {
             if let Some(&existing) = self.nodes[cursor].children.get(name) {
@@ -225,6 +229,9 @@ impl PlacementPlan {
                 }
                 // A nearer same-name package blocks Node from
                 // resolving to any matching package above it.
+                break;
+            }
+            if !reuse_visible_above_floor && cursor == floor {
                 break;
             }
             match self.nodes[cursor].parent {
@@ -319,12 +326,9 @@ fn process_queue(
         // own node_modules owns transitive resolution. Keep each link
         // at the requester that declared it instead of hoisting a
         // workspace member's relative link to the shared root.
-        let placement_floor = if matches!(pkg.local_source.as_ref(), Some(LocalSource::Link(_))) {
-            requester
-        } else {
-            floor
-        };
-        let outcome = plan.place(requester, placement_floor, &name, &dep_path)?;
+        let is_link = matches!(pkg.local_source.as_ref(), Some(LocalSource::Link(_)));
+        let placement_floor = if is_link { requester } else { floor };
+        let outcome = plan.place(requester, placement_floor, &name, &dep_path, !is_link)?;
         if !outcome.created {
             continue;
         }
@@ -380,6 +384,11 @@ pub(crate) struct HoistedWorkspaceImporter {
     pub(crate) root_deps: Vec<DirectDep>,
 }
 
+pub(crate) struct HoistedWorkspaceInputs<'a> {
+    pub(crate) importers: &'a [HoistedWorkspaceImporter],
+    pub(crate) extra_preserve: &'a BTreeMap<PathBuf, BTreeSet<String>>,
+}
+
 fn workspace_importer_floor(
     plan: &PlacementPlan,
     importer_idx: usize,
@@ -418,7 +427,15 @@ fn plan_workspace(
     }
 
     process_queue(&mut plan, queue, graph, hoisting_limits)?;
-    if has_root_importer || !plan.nodes[plan.root_idx].children.is_empty() {
+    // When no current importer/root placement claims the workspace
+    // root, sweep it only if a prior aube install left the state
+    // marker there. That reclaims stale aube-managed entries without
+    // creating or pruning an unrelated root node_modules tree.
+    let root_looks_aube_managed = root_nm.join(".aube-state").exists();
+    if has_root_importer
+        || !plan.nodes[plan.root_idx].children.is_empty()
+        || root_looks_aube_managed
+    {
         importer_roots.insert(0, plan.root_idx);
     }
     Ok((plan, importer_roots))
@@ -430,6 +447,7 @@ struct HoistedPlanMaterializer<'a> {
     plan: &'a PlacementPlan,
     graph: &'a LockfileGraph,
     package_indices: &'a BTreeMap<String, PackageIndex>,
+    extra_preserve: &'a BTreeMap<PathBuf, BTreeSet<String>>,
 }
 
 fn link_hoisted_plan(
@@ -444,6 +462,7 @@ fn link_hoisted_plan(
         plan,
         graph,
         package_indices,
+        extra_preserve,
     } = ctx;
 
     for root_idx in plan_roots {
@@ -454,7 +473,10 @@ fn link_hoisted_plan(
         // particular may hold a previous isolated tree that the user
         // hasn't switched off; we leave it alone rather than wiping
         // bytes the other layout owns.
-        let keep_root: std::collections::HashSet<&str> = plan.child_names(*root_idx).collect();
+        let mut keep_root: std::collections::HashSet<&str> = plan.child_names(*root_idx).collect();
+        if let Some(extra) = extra_preserve.get(nm) {
+            keep_root.extend(extra.iter().map(String::as_str));
+        }
         crate::sweep_stale_top_level_entries(nm, &keep_root, None);
     }
 
@@ -608,6 +630,7 @@ pub(crate) fn link_hoisted_importer(
     crate::mkdirp(&nm)?;
 
     let plan = plan_importer(&nm, root_deps, graph, linker.hoisting_limits)?;
+    let extra_preserve = BTreeMap::new();
     link_hoisted_plan(
         HoistedPlanMaterializer {
             linker,
@@ -615,6 +638,7 @@ pub(crate) fn link_hoisted_importer(
             plan: &plan,
             graph,
             package_indices,
+            extra_preserve: &extra_preserve,
         },
         &[plan.root_idx],
         stats,
@@ -625,7 +649,7 @@ pub(crate) fn link_hoisted_importer(
 pub(crate) fn link_hoisted_workspace(
     linker: &Linker,
     root_dir: &Path,
-    importers: &[HoistedWorkspaceImporter],
+    workspace: HoistedWorkspaceInputs<'_>,
     graph: &LockfileGraph,
     package_indices: &BTreeMap<String, PackageIndex>,
     stats: &mut LinkStats,
@@ -635,7 +659,7 @@ pub(crate) fn link_hoisted_workspace(
     let (plan, importer_roots) = plan_workspace(
         &root_nm,
         linker.modules_dir_name(),
-        importers,
+        workspace.importers,
         graph,
         linker.hoisting_limits,
     )?;
@@ -646,6 +670,7 @@ pub(crate) fn link_hoisted_workspace(
             plan: &plan,
             graph,
             package_indices,
+            extra_preserve: workspace.extra_preserve,
         },
         &importer_roots,
         stats,

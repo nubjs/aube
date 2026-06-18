@@ -177,6 +177,126 @@ fn hoisted_workspace_keeps_link_deps_under_declaring_importer() {
 }
 
 #[test]
+fn hoisted_workspace_keeps_link_deps_under_importer_when_root_also_declares_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let app_dir = project_dir.join("packages/app");
+    let lib_dir = project_dir.join("packages/lib");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
+
+    let store = Store::at(dir.path().join("store/files"));
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    let dep_path = "pkg-b@link+packages/lib";
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        dep_path.to_string(),
+        LockedPackage {
+            name: "pkg-b".to_string(),
+            version: "0.0.0".to_string(),
+            dep_path: dep_path.to_string(),
+            local_source: Some(LocalSource::Link(PathBuf::from("packages/lib"))),
+            ..Default::default()
+        },
+    );
+    let direct = DirectDep {
+        name: "pkg-b".to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: None,
+    };
+    let mut importers = BTreeMap::new();
+    importers.insert(".".to_string(), vec![direct.clone()]);
+    importers.insert("packages/app".to_string(), vec![direct]);
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+
+    linker
+        .link_workspace(&project_dir, &graph, &BTreeMap::new(), &BTreeMap::new())
+        .expect("hoisted workspace link must succeed");
+
+    assert!(
+        project_dir.join("node_modules/pkg-b").exists(),
+        "root's own link: dep should be linked at the root"
+    );
+    assert!(
+        app_dir.join("node_modules/pkg-b").exists(),
+        "a workspace package declaring the same link: dep should get its own link slot"
+    );
+}
+
+#[test]
+fn hoisted_workspace_failed_materialize_preserves_existing_workspace_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let app_dir = project_dir.join("packages/app");
+    let lib_dir = project_dir.join("packages/lib");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
+
+    let app_nm = app_dir.join("node_modules");
+    std::fs::create_dir_all(&app_nm).unwrap();
+    let link_path = app_nm.join("lib");
+    let rel_target = pathdiff::diff_paths(&lib_dir, &app_nm).unwrap();
+    sys::create_dir_link(&rel_target, &link_path).unwrap();
+
+    let store = Store::at(dir.path().join("store/files"));
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "foo@1.0.0".to_string(),
+        LockedPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: "foo@1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    let mut importers = BTreeMap::new();
+    importers.insert(".".to_string(), Vec::new());
+    importers.insert(
+        "packages/app".to_string(),
+        vec![
+            DirectDep {
+                name: "lib".to_string(),
+                dep_path: "lib@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            },
+            DirectDep {
+                name: "foo".to_string(),
+                dep_path: "foo@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            },
+        ],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let workspace_dirs = BTreeMap::from([("lib".to_string(), lib_dir)]);
+
+    let err = linker
+        .link_workspace(&project_dir, &graph, &BTreeMap::new(), &workspace_dirs)
+        .expect_err("missing package index should fail after the sweep phase");
+    assert!(
+        matches!(err, Error::MissingPackageIndex(ref dep_path) if dep_path == "foo@1.0.0"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        link_path.exists(),
+        "sweeping before the failing materialize step must preserve existing workspace links"
+    );
+}
+
+#[test]
 fn hoisted_workspace_without_root_importer_does_not_create_empty_root_node_modules() {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
@@ -218,6 +338,89 @@ fn hoisted_workspace_without_root_importer_does_not_create_empty_root_node_modul
         "a workspace with no root importer and no root placements should not create an empty root node_modules"
     );
     assert_eq!(stats.top_level_linked, 1);
+}
+
+#[test]
+fn hoisted_workspace_without_root_importer_leaves_unmanaged_root_node_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let app_dir = project_dir.join("packages/app");
+    let lib_dir = project_dir.join("packages/lib");
+    let unmanaged_dir = project_dir.join("node_modules/foreign");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    std::fs::create_dir_all(&unmanaged_dir).unwrap();
+
+    let store = Store::at(dir.path().join("store/files"));
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "lib".to_string(),
+            dep_path: "lib@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages: BTreeMap::new(),
+        ..Default::default()
+    };
+    let workspace_dirs = BTreeMap::from([("lib".to_string(), lib_dir)]);
+
+    linker
+        .link_workspace(&project_dir, &graph, &BTreeMap::new(), &workspace_dirs)
+        .expect("hoisted workspace link must succeed");
+
+    assert!(
+        unmanaged_dir.exists(),
+        "without a root importer, root placement, or aube state marker, the linker should not sweep a pre-existing root node_modules"
+    );
+}
+
+#[test]
+fn hoisted_workspace_without_root_importer_sweeps_existing_stale_root_node_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let app_dir = project_dir.join("packages/app");
+    let lib_dir = project_dir.join("packages/lib");
+    let stale_dir = project_dir.join("node_modules/stale");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    std::fs::create_dir_all(project_dir.join("node_modules/.aube-state")).unwrap();
+
+    let store = Store::at(dir.path().join("store/files"));
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "lib".to_string(),
+            dep_path: "lib@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages: BTreeMap::new(),
+        ..Default::default()
+    };
+    let workspace_dirs = BTreeMap::from([("lib".to_string(), lib_dir)]);
+
+    linker
+        .link_workspace(&project_dir, &graph, &BTreeMap::new(), &workspace_dirs)
+        .expect("hoisted workspace link must succeed");
+
+    assert!(
+        !stale_dir.exists(),
+        "an aube-managed root node_modules should still be swept even when the current workspace has no root importer"
+    );
 }
 
 #[test]

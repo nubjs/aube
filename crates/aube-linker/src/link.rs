@@ -12,7 +12,7 @@ use crate::sweep::{
 use crate::{Error, HoistedPlacements, LinkStats, Linker, NodeLinker, hoisted, sys};
 use aube_lockfile::{LocalSource, LockfileGraph};
 use aube_store::PackageIndex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 impl Linker {
@@ -513,6 +513,7 @@ impl Linker {
         let mut placements = HoistedPlacements::default();
         let mut hoisted_importers = Vec::new();
         let mut workspace_link_pass = Vec::new();
+        let mut workspace_preserve: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
         for (importer_path, deps) in &graph.importers {
             if !is_physical_importer(importer_path) {
                 continue;
@@ -553,13 +554,29 @@ impl Linker {
                 importer_dir: importer_dir.clone(),
                 root_deps: planner_deps,
             });
+            if self.hoist_workspace_packages {
+                let nm = importer_dir.join(&self.modules_dir_name);
+                for dep in deps {
+                    if workspace_dirs.contains_key(&dep.name)
+                        && !graph.packages.contains_key(&dep.dep_path)
+                    {
+                        workspace_preserve
+                            .entry(nm.clone())
+                            .or_default()
+                            .insert(dep.name.clone());
+                    }
+                }
+            }
             workspace_link_pass.push((importer_dir, deps.clone()));
         }
 
         hoisted::link_hoisted_workspace(
             self,
             root_dir,
-            &hoisted_importers,
+            hoisted::HoistedWorkspaceInputs {
+                importers: &hoisted_importers,
+                extra_preserve: &workspace_preserve,
+            },
             graph,
             package_indices,
             &mut stats,
@@ -583,12 +600,14 @@ impl Linker {
                     continue;
                 }
                 let link_path = nm.join(&dep.name);
+                let link_parent = link_path.parent().unwrap_or(&nm);
+                let target = pathdiff::diff_paths(ws_dir, link_parent).unwrap_or(ws_dir.clone());
+                if reconcile_top_level_link(&link_path, &target)? {
+                    continue;
+                }
                 if let Some(parent) = link_path.parent() {
                     mkdirp(parent)?;
                 }
-                try_remove_entry(&link_path);
-                let link_parent = link_path.parent().unwrap_or(&nm);
-                let target = pathdiff::diff_paths(ws_dir, link_parent).unwrap_or(ws_dir.clone());
                 sys::create_dir_link(&target, &link_path)
                     .map_err(|e| Error::Io(link_path.clone(), e))?;
                 stats.top_level_linked += 1;
