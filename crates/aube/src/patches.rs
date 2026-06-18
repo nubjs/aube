@@ -33,12 +33,18 @@ pub struct ResolvedPatch {
 }
 
 impl ResolvedPatch {
-    /// Short hex digest of the patch content. Folded into the graph
-    /// hash so a patched node lives at a different virtual-store path
-    /// than the unpatched one.
+    /// sha256 hex digest of the patch content, computed exactly the way
+    /// pnpm computes the `patchedDependencies` lockfile value
+    /// (`createHexHashFromFile`): the file is decoded as UTF-8 (lossy —
+    /// done at read time) and CRLF is normalized to LF before hashing,
+    /// so a patch authored on Windows hashes the same as on POSIX.
+    /// Folded into the graph hash (so a patched node lives at a distinct
+    /// virtual-store path) and written as the lockfile patch value, so
+    /// it must agree with pnpm byte-for-byte for `--frozen-lockfile`.
     pub fn content_hash(&self) -> String {
+        let normalized = self.content.replace("\r\n", "\n");
         let mut h = Sha256::new();
-        h.update(self.content.as_bytes());
+        h.update(normalized.as_bytes());
         hex::encode(h.finalize())
     }
 }
@@ -193,14 +199,18 @@ fn load_patches_with_lockfile_entries(
             ));
         }
         let path = cwd.join(&rel);
-        let content = std::fs::read_to_string(&path)
-            .into_diagnostic()
-            .map_err(|e| {
-                miette!(
-                    "failed to read patch file {} for {key}: {e}",
-                    path.display()
-                )
-            })?;
+        // Read raw bytes and decode lossily, matching pnpm/Node's
+        // `fs.readFile(path, 'utf8')`: a patch file with stray non-UTF-8
+        // bytes works under pnpm (replaced with U+FFFD) rather than
+        // erroring, and the patch *hash* must agree with pnpm's
+        // `createHexHashFromFile` for `--frozen-lockfile` parity.
+        let raw = std::fs::read(&path).into_diagnostic().map_err(|e| {
+            miette!(
+                "failed to read patch file {} for {key}: {e}",
+                path.display()
+            )
+        })?;
+        let content = String::from_utf8_lossy(&raw).into_owned();
         out.insert(
             key.clone(),
             ResolvedPatch {
@@ -540,6 +550,39 @@ mod tests {
     fn split_missing_version_errors() {
         assert!(split_patch_key("is-positive").is_err());
         assert!(split_patch_key("@babel/core").is_err());
+    }
+
+    fn patch_with_content(content: &str) -> ResolvedPatch {
+        ResolvedPatch {
+            key: "ms@2.1.3".into(),
+            name: "ms".into(),
+            version: "2.1.3".into(),
+            path: PathBuf::from("patches/ms@2.1.3.patch"),
+            rel: "patches/ms@2.1.3.patch".into(),
+            content: content.into(),
+        }
+    }
+
+    /// `content_hash` must equal pnpm's `createHexHashFromFile`: sha256
+    /// hex of the UTF-8 text. sha256 of `"hello\n"` is the known vector
+    /// from pnpm's own crypto.hash tests.
+    #[test]
+    fn content_hash_matches_pnpm_sha256_hex() {
+        assert_eq!(
+            patch_with_content("hello\n").content_hash(),
+            "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+        );
+    }
+
+    /// CRLF normalizes to LF before hashing, so a patch authored on
+    /// Windows hashes identically to the same patch on POSIX (matches
+    /// pnpm's `readNormalizedFile`).
+    #[test]
+    fn content_hash_normalizes_crlf_to_lf() {
+        assert_eq!(
+            patch_with_content("hello\r\n").content_hash(),
+            patch_with_content("hello\n").content_hash(),
+        );
     }
 
     #[test]

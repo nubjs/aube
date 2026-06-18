@@ -935,14 +935,23 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         })
         .collect();
 
-    let mut patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
+    // pnpm models the `patchedDependencies` value as a per-file *hash*,
+    // not a path (the current CLI writes a bare hash; older 9.x wrote a
+    // `{ hash, path }` object that pnpm migrates to the bare hash on
+    // read). So the hash lands in `patched_dependency_hashes`, and the
+    // path map stays empty — the install path derives the patch *path*
+    // from the manifest/workspace `patchedDependencies` declaration, and
+    // drift compares hash-against-hash. (Bun keeps storing a real path
+    // in `patched_dependencies`; that reader is unchanged.)
+    // The path map stays empty for pnpm regardless of which on-disk
+    // form we read — pnpm itself discards the legacy object's `path` on
+    // migration (`migratePatchedDependencies` keeps only `.hash`), and
+    // the install path derives the patch path from the manifest.
+    let patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
     let mut patched_dependency_hashes: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in raw.patched_dependencies.unwrap_or_default() {
-        let (path, hash) = v.into_path_and_hash();
-        if let Some(hash) = hash {
-            patched_dependency_hashes.insert(k.clone(), hash);
-        }
-        patched_dependencies.insert(k, path);
+        let (_path, hash) = v.into_path_and_hash();
+        patched_dependency_hashes.insert(k, hash);
     }
 
     // Lift the synthetic runtime importer deps recorded above into

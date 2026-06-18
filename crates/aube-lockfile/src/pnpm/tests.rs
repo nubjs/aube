@@ -1777,11 +1777,11 @@ fn catalogs_overrides_patched_dependencies_match_pnpm_order() {
     );
 }
 
-/// A patched dependency must serialize the way real pnpm 10 writes it
-/// (ground-truthed against pnpm 10.15.1 `patch` + `patch-commit` on
-/// `ms@2.1.3`): the top-level `patchedDependencies:` entry is a
-/// `{ hash, path }` mapping where `hash` is the sha256 hex of the
-/// patch file, the importer's resolved version and the `snapshots:`
+/// A patched dependency must serialize the way the current pnpm CLI
+/// writes it (ground-truthed against a pnpm v9 lockfile: the value is a
+/// bare per-file sha256-hex *hash* string, e.g.
+/// `graceful-fs@4.2.11: 68ebc232…`, not a `{ hash, path }` object and
+/// not a path). The importer's resolved version and the `snapshots:`
 /// key carry a `(patch_hash=<hash>)` suffix, and the `packages:` key
 /// stays the clean `name@version`. pnpm rejects a lockfile that names
 /// the patch without the hash plumbing with
@@ -1836,11 +1836,15 @@ fn patched_dependency_writes_pnpm10_hash_and_suffix_shape() {
     write(&lockfile_path, &graph, &manifest).unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
 
+    // The current pnpm CLI writes the bare per-file-hash string as the
+    // `patchedDependencies` value (no `{ hash, path }` object, no path).
     assert!(
-        yaml.contains(&format!(
-            "patchedDependencies:\n  ms@2.1.3:\n    hash: {HASH}\n    path: patches/ms@2.1.3.patch"
-        )),
-        "expected pnpm 10 {{hash, path}} patchedDependencies entry in:\n{yaml}"
+        yaml.contains(&format!("patchedDependencies:\n  ms@2.1.3: {HASH}")),
+        "expected bare-hash patchedDependencies entry in:\n{yaml}"
+    );
+    assert!(
+        !yaml.contains("    path: patches/ms@2.1.3.patch"),
+        "did not expect a path field in the patchedDependencies entry:\n{yaml}"
     );
     assert!(
         yaml.contains(&format!("version: 2.1.3(patch_hash={HASH})")),
@@ -1855,16 +1859,111 @@ fn patched_dependency_writes_pnpm10_hash_and_suffix_shape() {
         "expected the packages key to stay the clean name@version in:\n{yaml}"
     );
 
-    // Round-trip: both the path and the hash must survive a re-parse,
-    // otherwise the next write degrades to the rejected shape.
+    // Round-trip: the hash survives a re-parse. The path map is empty
+    // for pnpm — the value on disk is a hash, not a path.
     let reparsed = parse(&lockfile_path).unwrap();
-    assert_eq!(
-        reparsed.patched_dependencies.get("ms@2.1.3").unwrap(),
-        "patches/ms@2.1.3.patch"
+    assert!(
+        reparsed.patched_dependencies.is_empty(),
+        "pnpm reparse should leave the path map empty (the value is a hash): {:?}",
+        reparsed.patched_dependencies
     );
     assert_eq!(
         reparsed.patched_dependency_hashes.get("ms@2.1.3").unwrap(),
         HASH
+    );
+}
+
+/// Cross-tool (issue #15): a pnpm-authored v9 lockfile records the
+/// `patchedDependencies` value as a *bare per-file hash string* (the
+/// shape the current pnpm CLI writes, e.g.
+/// `graceful-fs@4.2.11: 68ebc232…`). aube must read it as a hash —
+/// landing in `patched_dependency_hashes`, leaving the path map empty
+/// — so a `--frozen-lockfile` install does not false-drift. Modeled on
+/// a real pnpm-lock.yaml block.
+#[test]
+fn pnpm_authored_bare_hash_patched_dependency_reads_as_hash() {
+    const HASH: &str = "68ebc232025360cb3dcd3081f4067f4e9fc022ab6b6f71a3230e86c7a5b337d1";
+    let yaml = format!(
+        "lockfileVersion: '9.0'\n\
+         \n\
+         patchedDependencies:\n  \
+         graceful-fs@4.2.11: {HASH}\n\
+         \n\
+         importers:\n\n  .:\n    dependencies:\n      \
+         graceful-fs:\n        specifier: 4.2.11\n        version: 4.2.11\n\
+         \n\
+         packages:\n\n  \
+         graceful-fs@4.2.11:\n    resolution: {{integrity: sha512-AA==}}\n\
+         \n\
+         snapshots:\n\n  graceful-fs@4.2.11: {{}}\n"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, &yaml).unwrap();
+
+    let graph = parse(&path).unwrap();
+    assert!(
+        graph.patched_dependencies.is_empty(),
+        "pnpm's value is a hash, not a path — path map must stay empty: {:?}",
+        graph.patched_dependencies
+    );
+    assert_eq!(
+        graph
+            .patched_dependency_hashes
+            .get("graceful-fs@4.2.11")
+            .unwrap(),
+        HASH
+    );
+
+    // The hash round-trips through a write back to the bare-string form
+    // (so re-emitting the lockfile stays parseable by pnpm).
+    let manifest = PackageJson {
+        name: Some("t".into()),
+        dependencies: [("graceful-fs".to_string(), "4.2.11".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = dir.path().join("out.yaml");
+    write(&out, &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        written.contains(&format!("patchedDependencies:\n  graceful-fs@4.2.11: {HASH}")),
+        "expected bare-hash re-emit:\n{written}"
+    );
+}
+
+/// Cross-tool: the legacy pnpm 9.x `{ hash, path }` object form is read
+/// for its hash (the authoritative field — pnpm's `migratePatchedDependencies`
+/// keeps only `.hash`). The path is discarded; the path map stays empty.
+#[test]
+fn pnpm_legacy_object_patched_dependency_reads_hash_only() {
+    let yaml = "lockfileVersion: '9.0'\n\
+         \n\
+         patchedDependencies:\n  \
+         is-positive@3.1.0:\n    \
+         hash: b27bbf2d83e68cac4491a38dd8b846aadd55d9c7bf8a4971139465c4de3566ce\n    \
+         path: patches/is-positive@3.1.0.patch\n\
+         \n\
+         importers:\n\n  .:\n    dependencies:\n      \
+         is-positive:\n        specifier: 3.1.0\n        version: 3.1.0\n\
+         \n\
+         packages:\n\n  \
+         is-positive@3.1.0:\n    resolution: {integrity: sha512-AA==}\n\
+         \n\
+         snapshots:\n\n  is-positive@3.1.0: {}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, yaml).unwrap();
+
+    let graph = parse(&path).unwrap();
+    assert!(graph.patched_dependencies.is_empty());
+    assert_eq!(
+        graph
+            .patched_dependency_hashes
+            .get("is-positive@3.1.0")
+            .unwrap(),
+        "b27bbf2d83e68cac4491a38dd8b846aadd55d9c7bf8a4971139465c4de3566ce"
     );
 }
 
@@ -2934,9 +3033,15 @@ snapshots:
     assert!(!graph.settings.auto_install_peers);
     assert!(graph.settings.lockfile_include_tarball_url);
     assert_eq!(graph.overrides.get("react").unwrap(), "catalog:");
+    // pnpm's patch value is a hash; the legacy `{ path, hash }` object
+    // is read for its hash only, and the path map stays empty.
+    assert!(graph.patched_dependencies.is_empty());
     assert_eq!(
-        graph.patched_dependencies.get("is-odd@3.0.1").unwrap(),
-        "patches/is-odd@3.0.1.patch"
+        graph
+            .patched_dependency_hashes
+            .get("is-odd@3.0.1")
+            .unwrap(),
+        "sha256-deadbeef"
     );
     assert_eq!(
         graph.catalogs["evens"]["is-even"].specifier, "^1.0.0",
@@ -3050,10 +3155,10 @@ snapshots:
     let reparsed = parse(&out).unwrap();
     assert_eq!(
         reparsed
-            .patched_dependencies
+            .patched_dependency_hashes
             .get("is-odd@3.0.1")
-            .unwrap_or_else(|| panic!("patched deps lost after reparse:\n{written}")),
-        "patches/is-odd@3.0.1.patch"
+            .unwrap_or_else(|| panic!("patched dep hash lost after reparse:\n{written}")),
+        "sha256-deadbeef"
     );
     assert_eq!(reparsed.catalogs["default"]["react"].version, "18.2.0");
     assert_eq!(

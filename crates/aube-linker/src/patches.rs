@@ -22,8 +22,14 @@ pub(crate) fn current_patch_hashes(patches: &Patches) -> BTreeMap<String, String
     patches
         .iter()
         .map(|(k, v)| {
+            // CRLF-normalize before hashing, matching pnpm's
+            // `createHexHashFromFile` and `ResolvedPatch::content_hash`,
+            // so the patch fingerprint is identical across the
+            // applied-patch sidecar, the graph hash, and the lockfile
+            // `patchedDependencies` value.
+            let normalized = v.replace("\r\n", "\n");
             let mut h = Sha256::new();
-            h.update(v.as_bytes());
+            h.update(normalized.as_bytes());
             (k.clone(), hex::encode(h.finalize()))
         })
         .collect()

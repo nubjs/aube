@@ -8,14 +8,17 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Serialized form of one `patchedDependencies:` entry. pnpm 10
-/// writes the `{ hash, path }` object (hash first — that's pnpm's
-/// own key order); the bare-path string is pnpm v8's form, kept for
-/// entries whose hash we never learned (bun.lock conversions).
+/// Serialized form of one `patchedDependencies:` entry. The current
+/// pnpm CLI writes a bare per-file-hash string
+/// (`graceful-fs@4.2.11: 68ebc232…`); that is the form we emit. The
+/// bare-path string is a fallback for entries whose hash we never
+/// learned (e.g. a bun.lock conversion) — pnpm still parses a string,
+/// though it would treat it as a hash, so this path should not arise
+/// for a real pnpm install.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum WritablePatchedDependency {
-    WithHash { hash: String, path: String },
+    Hash(String),
     PathOnly(String),
 }
 
@@ -782,32 +785,39 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     .collect(),
             )
         },
-        // pnpm 10 emits patched deps as `{ hash, path }` and rejects a
-        // hash-less entry's install with a config-mismatch error, so
-        // emit the object form whenever the graph carries the hash.
-        // Selectors without a recorded hash (bun.lock conversions,
-        // pnpm v8 lockfiles) keep the bare-path form, which pnpm
-        // still parses. Skipped when empty to keep parity with
-        // no-patch installs.
-        patched_dependencies: if graph.patched_dependencies.is_empty() {
-            None
-        } else {
-            Some(
-                graph
-                    .patched_dependencies
-                    .iter()
-                    .map(|(selector, path)| {
-                        let entry = match graph.patched_dependency_hashes.get(selector) {
-                            Some(hash) => WritablePatchedDependency::WithHash {
-                                hash: hash.clone(),
-                                path: path.clone(),
-                            },
-                            None => WritablePatchedDependency::PathOnly(path.clone()),
-                        };
-                        (selector.clone(), entry)
-                    })
-                    .collect(),
-            )
+        // pnpm records the patch's per-file *hash* as the
+        // `patchedDependencies` value (the current CLI writes a bare
+        // hash string; the path lives only in the manifest/workspace
+        // declaration). A hash-less selector (bun.lock conversion) falls
+        // back to the path string. The selector set is the union of the
+        // path map and the hash map so a hash-only graph (parsed from a
+        // pnpm lockfile, which carries no path) still re-emits its
+        // entries. Skipped when empty to keep parity with no-patch
+        // installs.
+        patched_dependencies: {
+            let selectors: std::collections::BTreeSet<&String> = graph
+                .patched_dependencies
+                .keys()
+                .chain(graph.patched_dependency_hashes.keys())
+                .collect();
+            if selectors.is_empty() {
+                None
+            } else {
+                Some(
+                    selectors
+                        .into_iter()
+                        .map(|selector| {
+                            let entry = match graph.patched_dependency_hashes.get(selector) {
+                                Some(hash) => WritablePatchedDependency::Hash(hash.clone()),
+                                None => WritablePatchedDependency::PathOnly(
+                                    graph.patched_dependencies[selector].clone(),
+                                ),
+                            };
+                            (selector.clone(), entry)
+                        })
+                        .collect(),
+                )
+            }
         },
         time,
         importers,

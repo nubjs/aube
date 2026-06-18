@@ -129,10 +129,11 @@ impl LockfileGraph {
         workspace_catalogs: &BTreeMap<String, BTreeMap<String, String>>,
         check_resolution_metadata: bool,
     ) -> DriftStatus {
-        let effective = resolve_catalog_refs_in_overrides(
+        let mut effective = resolve_catalog_refs_in_overrides(
             &merge_manifest_and_workspace_overrides(manifest, workspace_overrides),
             workspace_catalogs,
         );
+        manifest.resolve_override_refs(&mut effective);
         if check_resolution_metadata
             && let Some(reason) = self.resolution_metadata_drift_reason(
                 manifest,
@@ -161,10 +162,11 @@ impl LockfileGraph {
         // so we mirror that here.
         let effective_overrides = match manifests.iter().find(|(p, _)| p == ".") {
             Some((_, root_manifest)) => {
-                let effective = resolve_catalog_refs_in_overrides(
+                let mut effective = resolve_catalog_refs_in_overrides(
                     &merge_manifest_and_workspace_overrides(root_manifest, workspace_overrides),
                     workspace_catalogs,
                 );
+                root_manifest.resolve_override_refs(&mut effective);
                 if check_resolution_metadata
                     && let Some(reason) = self.resolution_metadata_drift_reason(
                         root_manifest,
@@ -236,10 +238,16 @@ impl LockfileGraph {
         workspace_ignored_optional: &[String],
         workspace_catalogs: &BTreeMap<String, BTreeMap<String, String>>,
     ) -> Option<String> {
-        let effective = resolve_catalog_refs_in_overrides(
+        let mut effective = resolve_catalog_refs_in_overrides(
             &merge_manifest_and_workspace_overrides(manifest, workspace_overrides),
             workspace_catalogs,
         );
+        // Resolve `$pkg` sibling references the same way the install
+        // path does (`settings.rs` calls `resolve_override_refs` before
+        // storing the override into the lockfile). Without this the
+        // drift check compares the manifest literal `$pkg` against the
+        // lockfile's resolved range and reports false drift.
+        manifest.resolve_override_refs(&mut effective);
         let locked = resolve_catalog_refs_in_overrides(&self.overrides, workspace_catalogs);
         overrides_drift_reason(&locked, &effective)
             .or_else(|| {
@@ -283,6 +291,16 @@ impl LockfileGraph {
         ) {
             return DriftStatus::Fresh;
         }
+        // pnpm records the patch's per-file *hash* as the lockfile value
+        // (no path), so drift is a pure hash-against-hash comparison —
+        // exactly pnpm's own `getOutdatedLockfileSetting` rule, which
+        // diffs `lockfile.patchedDependencies` (selector → hash) against
+        // the freshly computed `calcPatchHashes`. The path-against-path
+        // comparison below is only meaningful for formats that store a
+        // real path (bun, aube).
+        if kind == LockfileKind::Pnpm {
+            return self.check_patched_dependency_hashes_drift(effective_hashes);
+        }
         // Both directions matter, exactly like pnpm: a lockfile entry
         // whose selector the project no longer declares is as stale as
         // a declared patch the lockfile doesn't record (`patch-remove`
@@ -324,6 +342,47 @@ impl LockfileGraph {
                         "patchedDependencies.{selector}: patch file contents changed (hash mismatch)"
                     ),
                 };
+            }
+        }
+        DriftStatus::Fresh
+    }
+
+    /// Hash-only patched-dependency drift, for pnpm lockfiles whose
+    /// `patchedDependencies` value is the patch's per-file hash. Fires in
+    /// both directions: a selector the lockfile records but the project
+    /// no longer declares, a declared selector the lockfile is missing,
+    /// or a hash mismatch (the patch file's contents changed). Mirrors
+    /// pnpm's `getOutdatedLockfileSetting` `patchedDependencies` check.
+    fn check_patched_dependency_hashes_drift(
+        &self,
+        effective_hashes: &BTreeMap<String, String>,
+    ) -> DriftStatus {
+        for selector in self.patched_dependency_hashes.keys() {
+            if !effective_hashes.contains_key(selector) {
+                return DriftStatus::Stale {
+                    reason: format!(
+                        "patchedDependencies.{selector}: recorded in the lockfile but no longer declared in the project"
+                    ),
+                };
+            }
+        }
+        for (selector, effective_hash) in effective_hashes {
+            match self.patched_dependency_hashes.get(selector) {
+                None => {
+                    return DriftStatus::Stale {
+                        reason: format!(
+                            "patchedDependencies.{selector}: declared in the project but missing from the lockfile"
+                        ),
+                    };
+                }
+                Some(locked_hash) if locked_hash != effective_hash => {
+                    return DriftStatus::Stale {
+                        reason: format!(
+                            "patchedDependencies.{selector}: patch file contents changed (hash mismatch)"
+                        ),
+                    };
+                }
+                Some(_) => {}
             }
         }
         DriftStatus::Fresh
@@ -1514,6 +1573,45 @@ mod drift_tests {
     }
 
     #[test]
+    fn fresh_when_override_dollar_ref_matches_lockfile_resolved() {
+        // pnpm's `$pkg` sibling-reference syntax: `overrides: { foo: "$zod" }`
+        // resolves to the root's declared `zod` range and pnpm writes the
+        // *resolved* value into the lockfile. A frozen install comparing the
+        // raw `$zod` literal against the resolved `^4.3.5` would read stale
+        // (issue #16). Drift must resolve the `$`-ref the same way the
+        // install path does.
+        let mut manifest = make_manifest(&[("zod", "^4.3.5")]);
+        manifest.extra.insert(
+            "overrides".into(),
+            serde_json::json!({ "some-dep": "$zod" }),
+        );
+        let mut graph = make_graph(&[("zod", "^4.3.5", "zod@4.3.5")]);
+        graph.overrides.insert("some-dep".into(), "^4.3.5".into());
+        assert_eq!(
+            graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()),
+            DriftStatus::Fresh,
+        );
+    }
+
+    #[test]
+    fn stale_when_override_dollar_ref_target_version_changes() {
+        // The `$`-ref target moved (`zod` bumped to `^4.4.0`) but the
+        // lockfile still records the old resolved override (`^4.3.5`).
+        // Resolving the ref surfaces the divergence as drift.
+        let mut manifest = make_manifest(&[("zod", "^4.4.0")]);
+        manifest.extra.insert(
+            "overrides".into(),
+            serde_json::json!({ "some-dep": "$zod" }),
+        );
+        let mut graph = make_graph(&[("zod", "^4.4.0", "zod@4.4.0")]);
+        graph.overrides.insert("some-dep".into(), "^4.3.5".into());
+        match graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()) {
+            DriftStatus::Stale { reason } => assert!(reason.contains("some-dep"), "reason: {reason}"),
+            other => panic!("expected stale, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn fresh_when_pnpm_wrote_override_rewritten_importer_spec() {
         // pnpm rewrites the importer `specifier:` to the post-override
         // value when a bare-name override applies, so a pnpm-generated
@@ -2272,5 +2370,101 @@ mod drift_tests {
             graph.check_catalogs_drift(&ws),
             DriftStatus::Stale { .. }
         ));
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    // --- patched-dependency drift (issue #15) ---
+    //
+    // A pnpm lockfile records the patch's per-file *hash* as the
+    // `patchedDependencies` value (no path), so drift for pnpm is a pure
+    // hash-against-hash comparison. The path map is empty for a pnpm
+    // lockfile; comparing it against the manifest-derived paths used to
+    // report every declared patch as "missing from the lockfile".
+
+    #[test]
+    fn pnpm_patched_dep_fresh_when_hash_matches() {
+        let graph = LockfileGraph {
+            patched_dependency_hashes: map(&[("ms@2.1.3", "abc123")]),
+            ..Default::default()
+        };
+        // The project declares the patch (path + freshly computed hash).
+        let effective_paths = map(&[("ms@2.1.3", "patches/ms@2.1.3.patch")]);
+        let effective_hashes = map(&[("ms@2.1.3", "abc123")]);
+        assert_eq!(
+            graph.check_patched_dependencies_drift(
+                LockfileKind::Pnpm,
+                &effective_paths,
+                &effective_hashes
+            ),
+            DriftStatus::Fresh,
+        );
+    }
+
+    #[test]
+    fn pnpm_patched_dep_stale_when_hash_differs() {
+        let graph = LockfileGraph {
+            patched_dependency_hashes: map(&[("ms@2.1.3", "abc123")]),
+            ..Default::default()
+        };
+        let effective_paths = map(&[("ms@2.1.3", "patches/ms@2.1.3.patch")]);
+        let effective_hashes = map(&[("ms@2.1.3", "def456")]);
+        match graph.check_patched_dependencies_drift(
+            LockfileKind::Pnpm,
+            &effective_paths,
+            &effective_hashes,
+        ) {
+            DriftStatus::Stale { reason } => assert!(reason.contains("ms@2.1.3"), "{reason}"),
+            other => panic!("expected stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pnpm_patched_dep_stale_when_declared_but_lockfile_missing() {
+        let graph = LockfileGraph::default();
+        let effective_paths = map(&[("ms@2.1.3", "patches/ms@2.1.3.patch")]);
+        let effective_hashes = map(&[("ms@2.1.3", "abc123")]);
+        assert!(matches!(
+            graph.check_patched_dependencies_drift(
+                LockfileKind::Pnpm,
+                &effective_paths,
+                &effective_hashes
+            ),
+            DriftStatus::Stale { .. }
+        ));
+    }
+
+    #[test]
+    fn bun_patched_dep_compares_path_not_hash() {
+        // The kind-branch keeps bun on the PATH interpretation: bun's
+        // lockfile carries a real patch path in `patched_dependencies`,
+        // so a matching path is Fresh and a moved path is Stale —
+        // independent of any recorded hash.
+        let graph = LockfileGraph {
+            patched_dependencies: map(&[("ms@2.1.3", "patches/ms@2.1.3.patch")]),
+            ..Default::default()
+        };
+        let effective_hashes = map(&[("ms@2.1.3", "abc123")]);
+        assert_eq!(
+            graph.check_patched_dependencies_drift(
+                LockfileKind::Bun,
+                &map(&[("ms@2.1.3", "patches/ms@2.1.3.patch")]),
+                &effective_hashes
+            ),
+            DriftStatus::Fresh,
+        );
+        match graph.check_patched_dependencies_drift(
+            LockfileKind::Bun,
+            &map(&[("ms@2.1.3", "patches/moved.patch")]),
+            &effective_hashes,
+        ) {
+            DriftStatus::Stale { reason } => assert!(reason.contains("ms@2.1.3"), "{reason}"),
+            other => panic!("expected stale on moved path, got {other:?}"),
+        }
     }
 }

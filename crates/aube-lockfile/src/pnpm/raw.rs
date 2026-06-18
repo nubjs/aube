@@ -135,25 +135,39 @@ pub(super) struct RawPnpmLockfile {
     pub(super) time: Option<BTreeMap<String, String>>,
 }
 
-/// pnpm writes `patchedDependencies` as either a bare path string
-/// (v8 style) or a nested `{ path, hash }` object (v9+). We accept
-/// both via an untagged enum; the path and the hash land in the
-/// graph's `patched_dependencies` / `patched_dependency_hashes` maps.
+/// pnpm's `patchedDependencies` lockfile value. Two on-disk shapes
+/// both exist across the v9 range and the reader accepts either:
+///
+/// - **Bare hash string** — what the current pnpm CLI writes
+///   (`graceful-fs@4.2.11: 68ebc232…`). The value is the per-file
+///   sha256 hex of the patch, *not* a path.
+/// - **`{ hash, path }` object** — written by earlier pnpm 9.x. pnpm
+///   migrates it to the bare `.hash` string on read
+///   (`migratePatchedDependencies`), so the hash is the authoritative
+///   field; the path is informational and not carried into drift.
+///
+/// Both forms decode to a hash (and, for the object form, a path).
+/// The hash lands in the graph's `patched_dependency_hashes` map; the
+/// path map stays empty for pnpm lockfiles, because pnpm records no
+/// path in the current form and drift/linking derive the path from the
+/// manifest/workspace declaration instead.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(super) enum RawPatchedDependency {
-    Path(String),
+    Hash(String),
     Object {
-        path: String,
         #[serde(default)]
-        hash: Option<String>,
+        path: Option<String>,
+        hash: String,
     },
 }
 
 impl RawPatchedDependency {
-    pub(super) fn into_path_and_hash(self) -> (String, Option<String>) {
+    /// `(optional path, hash)`. The bare-string form carries only a
+    /// hash; the legacy object form may also carry a path.
+    pub(super) fn into_path_and_hash(self) -> (Option<String>, String) {
         match self {
-            RawPatchedDependency::Path(p) => (p, None),
+            RawPatchedDependency::Hash(h) => (None, h),
             RawPatchedDependency::Object { path, hash } => (path, hash),
         }
     }
