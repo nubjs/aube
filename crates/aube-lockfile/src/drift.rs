@@ -295,10 +295,12 @@ impl LockfileGraph {
         // (no path), so drift is a pure hash-against-hash comparison —
         // exactly pnpm's own `getOutdatedLockfileSetting` rule, which
         // diffs `lockfile.patchedDependencies` (selector → hash) against
-        // the freshly computed `calcPatchHashes`. The path-against-path
-        // comparison below is only meaningful for formats that store a
-        // real path (bun, aube).
-        if kind == LockfileKind::Pnpm {
+        // the freshly computed `calcPatchHashes`. aube's own lock.yaml
+        // shares pnpm's `{ hash, path }` block and the same reader (which
+        // keeps only the hash, leaving the path map empty), so its drift
+        // is hash-against-hash too. The path-against-path comparison below
+        // is only meaningful for bun, whose reader stores a real path.
+        if matches!(kind, LockfileKind::Pnpm | LockfileKind::Aube) {
             return self.check_patched_dependency_hashes_drift(effective_hashes);
         }
         // Both directions matter, exactly like pnpm: a lockfile entry
@@ -2437,6 +2439,44 @@ mod drift_tests {
             ),
             DriftStatus::Stale { .. }
         ));
+    }
+
+    #[test]
+    fn aube_patched_dep_fresh_when_hash_matches_with_empty_path_map() {
+        // aube's own lock.yaml shares pnpm's `{ hash, path }` block and is
+        // read by the same parser, which keeps only the hash and leaves
+        // `patched_dependencies` (the path map) empty. A frozen install
+        // declaring the patch with a matching hash must read as Fresh, not
+        // a false "declared in the project but missing from the lockfile"
+        // (which is what the old path-against-empty-map comparison produced
+        // for the Aube kind after a `nub pm use nub` conversion).
+        let graph = LockfileGraph {
+            patched_dependency_hashes: map(&[("ms@2.1.3", "abc123")]),
+            ..Default::default()
+        };
+        let effective_paths = map(&[("ms@2.1.3", "patches/ms@2.1.3.patch")]);
+        let effective_hashes = map(&[("ms@2.1.3", "abc123")]);
+        assert_eq!(
+            graph.check_patched_dependencies_drift(
+                LockfileKind::Aube,
+                &effective_paths,
+                &effective_hashes
+            ),
+            DriftStatus::Fresh,
+        );
+        // And a changed hash is still Stale under the Aube kind.
+        let stale = LockfileGraph {
+            patched_dependency_hashes: map(&[("ms@2.1.3", "abc123")]),
+            ..Default::default()
+        };
+        match stale.check_patched_dependencies_drift(
+            LockfileKind::Aube,
+            &effective_paths,
+            &map(&[("ms@2.1.3", "def456")]),
+        ) {
+            DriftStatus::Stale { reason } => assert!(reason.contains("ms@2.1.3"), "{reason}"),
+            other => panic!("expected stale on changed hash, got {other:?}"),
+        }
     }
 
     #[test]
