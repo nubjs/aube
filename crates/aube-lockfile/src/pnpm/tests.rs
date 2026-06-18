@@ -1777,15 +1777,16 @@ fn catalogs_overrides_patched_dependencies_match_pnpm_order() {
     );
 }
 
-/// A patched dependency must serialize the way the current pnpm CLI
-/// writes it (ground-truthed against a pnpm v9 lockfile: the value is a
-/// bare per-file sha256-hex *hash* string, e.g.
-/// `graceful-fs@4.2.11: 68ebc232…`, not a `{ hash, path }` object and
-/// not a path). The importer's resolved version and the `snapshots:`
-/// key carry a `(patch_hash=<hash>)` suffix, and the `packages:` key
-/// stays the clean `name@version`. pnpm rejects a lockfile that names
-/// the patch without the hash plumbing with
-/// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`.
+/// A patched dependency must serialize the way pnpm 9+ writes it
+/// (ground-truthed against a pnpm@10.15.1 lockfile: a `{ hash, path }`
+/// object, e.g. `is-odd@3.0.1:\n    hash: dcac…\n    path:
+/// patches/is-odd@3.0.1.patch`). The importer's resolved version and
+/// the `snapshots:` key carry a `(patch_hash=<hash>)` suffix, and the
+/// `packages:` key stays the clean `name@version`. pnpm rejects a
+/// lockfile that records the patch as a bare hash scalar or a hash-only
+/// object with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` (see
+/// `patched_dependency_roundtrips_through_real_pnpm` for the captured
+/// real-pnpm byte-for-byte form).
 #[test]
 fn patched_dependency_writes_pnpm10_hash_and_suffix_shape() {
     const HASH: &str = "82ff0b4d1c20272cdb11684045f28947472d5b8a10a04c0d972102d14815e536";
@@ -1836,15 +1837,15 @@ fn patched_dependency_writes_pnpm10_hash_and_suffix_shape() {
     write(&lockfile_path, &graph, &manifest).unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
 
-    // The current pnpm CLI writes the bare per-file-hash string as the
-    // `patchedDependencies` value (no `{ hash, path }` object, no path).
+    // pnpm 9+ writes a `{ hash, path }` object as the
+    // `patchedDependencies` value; a frozen install rejects anything
+    // else (a bare hash scalar or a hash-only object) with
+    // `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`.
     assert!(
-        yaml.contains(&format!("patchedDependencies:\n  ms@2.1.3: {HASH}")),
-        "expected bare-hash patchedDependencies entry in:\n{yaml}"
-    );
-    assert!(
-        !yaml.contains("    path: patches/ms@2.1.3.patch"),
-        "did not expect a path field in the patchedDependencies entry:\n{yaml}"
+        yaml.contains(&format!(
+            "patchedDependencies:\n  ms@2.1.3:\n    hash: {HASH}\n    path: patches/ms@2.1.3.patch"
+        )),
+        "expected a {{ hash, path }} patchedDependencies entry in:\n{yaml}"
     );
     assert!(
         yaml.contains(&format!("version: 2.1.3(patch_hash={HASH})")),
@@ -1870,6 +1871,80 @@ fn patched_dependency_writes_pnpm10_hash_and_suffix_shape() {
     assert_eq!(
         reparsed.patched_dependency_hashes.get("ms@2.1.3").unwrap(),
         HASH
+    );
+}
+
+/// Byte-for-byte parity with real pnpm@10.15.1's `patchedDependencies:`
+/// block. The expected text was captured by running
+/// `corepack pnpm@10.15.1 install` on the `patched-deps` conformance
+/// fixture (`is-odd@3.0.1` patched via `patches/is-odd@3.0.1.patch`,
+/// declared in `pnpm-workspace.yaml`) and reading the resulting
+/// `pnpm-lock.yaml`. A bare-hash scalar (the form aube emitted before
+/// this fix) made `pnpm install --frozen-lockfile` reject the lockfile
+/// with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`; the `{ hash, path }` object
+/// below is the only shape pnpm accepts. This closes the gap the prior
+/// nub→nub unit test missed (it asserted the bare-hash form).
+#[test]
+fn patched_dependency_roundtrips_through_real_pnpm() {
+    // Captured from `corepack pnpm@10.15.1 install` on the patched-deps
+    // fixture — the exact bytes real pnpm wrote.
+    const HASH: &str = "dcac38e61b21e4c1fbc036fbd04c2c57fc5aca4d595709258e1654cf8529c5c1";
+    const EXPECTED_BLOCK: &str =
+        "patchedDependencies:\n  is-odd@3.0.1:\n    hash: dcac38e61b21e4c1fbc036fbd04c2c57fc5aca4d595709258e1654cf8529c5c1\n    path: patches/is-odd@3.0.1.patch";
+
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "is-odd@3.0.1".to_string(),
+        LockedPackage {
+            name: "is-odd".to_string(),
+            version: "3.0.1".to_string(),
+            integrity: Some("sha512-CQpnWPrDwmP1+SMHXZhtLtJv90yiyVfluGsX5iNCVkrhQtU3TQHsUWPG9wkdk9Lgd5yNpAg9jQEo90CBaXgWMA==".to_string()),
+            dep_path: "is-odd@3.0.1".to_string(),
+            ..Default::default()
+        },
+    );
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "is-odd".to_string(),
+            dep_path: "is-odd@3.0.1".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("3.0.1".to_string()),
+        }],
+    );
+    let mut patched_dependencies = BTreeMap::new();
+    patched_dependencies.insert(
+        "is-odd@3.0.1".to_string(),
+        "patches/is-odd@3.0.1.patch".to_string(),
+    );
+    let mut patched_dependency_hashes = BTreeMap::new();
+    patched_dependency_hashes.insert("is-odd@3.0.1".to_string(), HASH.to_string());
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        patched_dependencies,
+        patched_dependency_hashes,
+        ..Default::default()
+    };
+    let mut deps = BTreeMap::new();
+    deps.insert("is-odd".to_string(), "3.0.1".to_string());
+    let manifest = PackageJson {
+        name: Some("conform-patched-deps".to_string()),
+        dependencies: deps,
+        ..Default::default()
+    };
+
+    write(&lockfile_path, &graph, &manifest).unwrap();
+    let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
+
+    assert!(
+        yaml.contains(EXPECTED_BLOCK),
+        "emitted patchedDependencies block diverges from real pnpm@10.15.1; expected to find:\n{EXPECTED_BLOCK}\nin:\n{yaml}"
     );
 }
 
@@ -1915,8 +1990,13 @@ fn pnpm_authored_bare_hash_patched_dependency_reads_as_hash() {
         HASH
     );
 
-    // The hash round-trips through a write back to the bare-string form
-    // (so re-emitting the lockfile stays parseable by pnpm).
+    // Re-emitting a graph parsed straight from a lockfile (no install,
+    // so the patch path was never resolved from disk) writes a
+    // hash-only object — the honest output when the path is unknown. A
+    // real install resolves the path first via `record_patches_on_graph`
+    // and writes the full `{ hash, path }` object pnpm's frozen check
+    // requires (see `patched_dependency_roundtrips_through_real_pnpm`);
+    // this path-less re-emit is not the frozen-round-trip flow.
     let manifest = PackageJson {
         name: Some("t".into()),
         dependencies: [("graceful-fs".to_string(), "4.2.11".to_string())]
@@ -1928,8 +2008,10 @@ fn pnpm_authored_bare_hash_patched_dependency_reads_as_hash() {
     write(&out, &graph, &manifest).unwrap();
     let written = std::fs::read_to_string(&out).unwrap();
     assert!(
-        written.contains(&format!("patchedDependencies:\n  graceful-fs@4.2.11: {HASH}")),
-        "expected bare-hash re-emit:\n{written}"
+        written.contains(&format!(
+            "patchedDependencies:\n  graceful-fs@4.2.11:\n    hash: {HASH}"
+        )),
+        "expected hash-only object re-emit:\n{written}"
     );
 }
 

@@ -8,17 +8,23 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Serialized form of one `patchedDependencies:` entry. The current
-/// pnpm CLI writes a bare per-file-hash string
-/// (`graceful-fs@4.2.11: 68ebc232…`); that is the form we emit. The
-/// bare-path string is a fallback for entries whose hash we never
-/// learned (e.g. a bun.lock conversion) — pnpm still parses a string,
-/// though it would treat it as a hash, so this path should not arise
-/// for a real pnpm install.
+/// Serialized form of one `patchedDependencies:` entry. pnpm 9+ writes
+/// a `{ hash, path }` mapping (`is-odd@3.0.1:\n  hash: dcac…\n  path:
+/// patches/is-odd@3.0.1.patch`) and a frozen install compares the whole
+/// object against the resolved manifest/workspace declaration — a bare
+/// hash scalar or a hash-only object is rejected with
+/// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`. So we emit the full object
+/// whenever we know the path. `HashOnly` is the degenerate fallback for
+/// a graph parsed from a pnpm lockfile (which discards the path) and
+/// re-emitted without re-resolving the patch from disk; a real install
+/// always resolves the path first via `record_patches_on_graph`, so the
+/// `{ hash, path }` form is what ships. `PathOnly` covers a hash-less
+/// selector (a bun.lock conversion that never computed the sha256).
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum WritablePatchedDependency {
-    Hash(String),
+    HashAndPath { hash: String, path: String },
+    HashOnly { hash: String },
     PathOnly(String),
 }
 
@@ -785,15 +791,18 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     .collect(),
             )
         },
-        // pnpm records the patch's per-file *hash* as the
-        // `patchedDependencies` value (the current CLI writes a bare
-        // hash string; the path lives only in the manifest/workspace
-        // declaration). A hash-less selector (bun.lock conversion) falls
-        // back to the path string. The selector set is the union of the
-        // path map and the hash map so a hash-only graph (parsed from a
-        // pnpm lockfile, which carries no path) still re-emits its
-        // entries. Skipped when empty to keep parity with no-patch
-        // installs.
+        // pnpm 9+ records each patch as a `{ hash, path }` object, and a
+        // frozen install rejects any other shape (a bare hash scalar or a
+        // hash-only object) with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`. We
+        // emit the full object whenever both are known — a real install
+        // resolves the path via `record_patches_on_graph` before writing,
+        // so this is the form that ships. A hash-only entry (a graph
+        // parsed from a pnpm lockfile and re-emitted without re-resolving
+        // the patch) keeps just the hash, and a hash-less selector
+        // (bun.lock conversion) falls back to the path string. The
+        // selector set is the union of the path and hash maps so neither
+        // a path-only nor a hash-only graph drops its entries. Skipped
+        // when empty to keep parity with no-patch installs.
         patched_dependencies: {
             let selectors: std::collections::BTreeSet<&String> = graph
                 .patched_dependencies
@@ -807,10 +816,25 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     selectors
                         .into_iter()
                         .map(|selector| {
-                            let entry = match graph.patched_dependency_hashes.get(selector) {
-                                Some(hash) => WritablePatchedDependency::Hash(hash.clone()),
-                                None => WritablePatchedDependency::PathOnly(
-                                    graph.patched_dependencies[selector].clone(),
+                            let hash = graph.patched_dependency_hashes.get(selector);
+                            let path = graph.patched_dependencies.get(selector);
+                            let entry = match (hash, path) {
+                                (Some(hash), Some(path)) => {
+                                    WritablePatchedDependency::HashAndPath {
+                                        hash: hash.clone(),
+                                        path: path.clone(),
+                                    }
+                                }
+                                (Some(hash), None) => WritablePatchedDependency::HashOnly {
+                                    hash: hash.clone(),
+                                },
+                                (None, Some(path)) => {
+                                    WritablePatchedDependency::PathOnly(path.clone())
+                                }
+                                // Selector came from the union of both maps;
+                                // it must appear in at least one.
+                                (None, None) => unreachable!(
+                                    "patched-dependency selector {selector:?} in neither map"
                                 ),
                             };
                             (selector.clone(), entry)
