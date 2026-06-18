@@ -312,13 +312,22 @@ fn process_queue(
     hoisting_limits: HoistingLimits,
 ) -> Result<(), Error> {
     while let Some((requester, floor, name, dep_path)) = queue.pop_front() {
-        let outcome = plan.place(requester, floor, &name, &dep_path)?;
-        if !outcome.created {
-            continue;
-        }
         let Some(pkg) = graph.packages.get(&dep_path) else {
             continue;
         };
+        // `link:` entries are live symlinks into a source tree whose
+        // own node_modules owns transitive resolution. Keep each link
+        // at the requester that declared it instead of hoisting a
+        // workspace member's relative link to the shared root.
+        let placement_floor = if matches!(pkg.local_source.as_ref(), Some(LocalSource::Link(_))) {
+            requester
+        } else {
+            floor
+        };
+        let outcome = plan.place(requester, placement_floor, &name, &dep_path)?;
+        if !outcome.created {
+            continue;
+        }
         // Skip transitives for `link:` deps — their target directory
         // holds its own node_modules and Node resolves through it
         // naturally. Materializing a copy would fight with a live
@@ -390,12 +399,14 @@ fn plan_workspace(
     hoisting_limits: HoistingLimits,
 ) -> Result<(PlacementPlan, Vec<usize>), Error> {
     let mut plan = PlacementPlan::new(root_nm.to_path_buf());
-    let mut importer_roots = vec![plan.root_idx];
+    let mut importer_roots = Vec::new();
+    let mut has_root_importer = false;
     let mut queue: VecDeque<(usize, usize, String, String)> = VecDeque::new();
 
     for importer in importers {
         let importer_nm = importer.importer_dir.join(modules_dir_name);
         let importer_idx = if importer_nm == root_nm {
+            has_root_importer = true;
             plan.root_idx
         } else {
             let idx = plan.add_importer_root(importer_nm);
@@ -407,19 +418,34 @@ fn plan_workspace(
     }
 
     process_queue(&mut plan, queue, graph, hoisting_limits)?;
+    if has_root_importer || !plan.nodes[plan.root_idx].children.is_empty() {
+        importer_roots.insert(0, plan.root_idx);
+    }
     Ok((plan, importer_roots))
 }
 
+struct HoistedPlanMaterializer<'a> {
+    linker: &'a Linker,
+    root_dir: &'a Path,
+    plan: &'a PlacementPlan,
+    graph: &'a LockfileGraph,
+    package_indices: &'a BTreeMap<String, PackageIndex>,
+}
+
 fn link_hoisted_plan(
-    linker: &Linker,
-    root_dir: &Path,
-    plan: &PlacementPlan,
+    ctx: HoistedPlanMaterializer<'_>,
     plan_roots: &[usize],
-    graph: &LockfileGraph,
-    package_indices: &BTreeMap<String, PackageIndex>,
     stats: &mut LinkStats,
     placements: &mut HoistedPlacements,
 ) -> Result<(), Error> {
+    let HoistedPlanMaterializer {
+        linker,
+        root_dir,
+        plan,
+        graph,
+        package_indices,
+    } = ctx;
+
     for root_idx in plan_roots {
         let nm = &plan.nodes[*root_idx].nm_dir;
         crate::mkdirp(nm)?;
@@ -583,12 +609,14 @@ pub(crate) fn link_hoisted_importer(
 
     let plan = plan_importer(&nm, root_deps, graph, linker.hoisting_limits)?;
     link_hoisted_plan(
-        linker,
-        root_dir,
-        &plan,
+        HoistedPlanMaterializer {
+            linker,
+            root_dir,
+            plan: &plan,
+            graph,
+            package_indices,
+        },
         &[plan.root_idx],
-        graph,
-        package_indices,
         stats,
         placements,
     )
@@ -612,12 +640,14 @@ pub(crate) fn link_hoisted_workspace(
         linker.hoisting_limits,
     )?;
     link_hoisted_plan(
-        linker,
-        root_dir,
-        &plan,
+        HoistedPlanMaterializer {
+            linker,
+            root_dir,
+            plan: &plan,
+            graph,
+            package_indices,
+        },
         &importer_roots,
-        graph,
-        package_indices,
         stats,
         placements,
     )

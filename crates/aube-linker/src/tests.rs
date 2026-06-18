@@ -1,5 +1,5 @@
 use super::*;
-use aube_lockfile::{DepType, DirectDep, LockedPackage, LockfileGraph};
+use aube_lockfile::{DepType, DirectDep, LocalSource, LockedPackage, LockfileGraph};
 use aube_store::Store;
 
 fn setup_store_with_files(dir: &Path) -> (Store, BTreeMap<String, aube_store::PackageIndex>) {
@@ -119,6 +119,105 @@ fn hoisted_workspace_hoists_non_conflicting_member_direct_deps_to_root() {
         "member-local copy should not be the only placement for a non-conflicting hoisted dep"
     );
     assert_eq!(stats.top_level_linked, 2);
+}
+
+#[test]
+fn hoisted_workspace_keeps_link_deps_under_declaring_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let app_dir = project_dir.join("packages/app");
+    let lib_dir = project_dir.join("packages/lib");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
+
+    let store = Store::at(dir.path().join("store/files"));
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    let dep_path = "pkg-b@link+packages/lib";
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        dep_path.to_string(),
+        LockedPackage {
+            name: "pkg-b".to_string(),
+            version: "0.0.0".to_string(),
+            dep_path: dep_path.to_string(),
+            local_source: Some(LocalSource::Link(PathBuf::from("packages/lib"))),
+            ..Default::default()
+        },
+    );
+    let mut importers = BTreeMap::new();
+    importers.insert(".".to_string(), Vec::new());
+    importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "pkg-b".to_string(),
+            dep_path: dep_path.to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+
+    linker
+        .link_workspace(&project_dir, &graph, &BTreeMap::new(), &BTreeMap::new())
+        .expect("hoisted workspace link must succeed");
+
+    assert!(
+        app_dir.join("node_modules/pkg-b").exists(),
+        "link: deps should be available from the workspace package that declares them"
+    );
+    assert!(
+        !project_dir.join("node_modules/pkg-b").exists(),
+        "link: deps should not be hoisted to the shared workspace root"
+    );
+}
+
+#[test]
+fn hoisted_workspace_without_root_importer_does_not_create_empty_root_node_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let app_dir = project_dir.join("packages/app");
+    let lib_dir = project_dir.join("packages/lib");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&lib_dir).unwrap();
+
+    let store = Store::at(dir.path().join("store/files"));
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "lib".to_string(),
+            dep_path: "lib@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages: BTreeMap::new(),
+        ..Default::default()
+    };
+    let workspace_dirs = BTreeMap::from([("lib".to_string(), lib_dir)]);
+
+    let stats = linker
+        .link_workspace(&project_dir, &graph, &BTreeMap::new(), &workspace_dirs)
+        .expect("hoisted workspace link must succeed");
+
+    assert!(
+        app_dir.join("node_modules/lib").exists(),
+        "workspace dep should still be linked in the importing workspace package"
+    );
+    assert!(
+        !project_dir.join("node_modules").exists(),
+        "a workspace with no root importer and no root placements should not create an empty root node_modules"
+    );
+    assert_eq!(stats.top_level_linked, 1);
 }
 
 #[test]
