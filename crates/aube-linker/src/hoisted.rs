@@ -8,10 +8,12 @@
 //! matches npm / yarn-classic's flat tree and is what certain legacy
 //! toolchains (React Native's Metro, some Jest plugins) require.
 //!
-//! Placement algorithm (npm-style, per importer):
+//! Placement algorithm (npm-style):
 //!
-//! 1. Start with a `TreeNode` for the importer — its `node_modules`
-//!    directory and an empty child map.
+//! 1. Start with a `TreeNode` for the root `node_modules` directory
+//!    and an empty child map. Workspace installs add synthetic
+//!    importer roots under it so Node's walk-up from a member package
+//!    can still see the workspace root.
 //! 2. BFS from the importer's direct deps. For each `(requester, name,
 //!    dep_path)` pair, walk up from the requester looking for the
 //!    shallowest ancestor whose `children[name]` is either absent or
@@ -71,6 +73,7 @@ impl HoistedPlacements {
         hoisting_limits: HoistingLimits,
     ) -> Result<Self, Error> {
         let mut placements = Self::default();
+        let mut importers = Vec::new();
         for (importer_path, deps) in &graph.importers {
             if !crate::is_physical_importer(importer_path) {
                 continue;
@@ -78,17 +81,27 @@ impl HoistedPlacements {
             let importer_dir = if importer_path == "." {
                 root_dir.to_path_buf()
             } else {
-                root_dir.join(importer_path)
+                aube_util::path::normalize_lexical(&root_dir.join(importer_path))
             };
-            let nm = importer_dir.join(modules_dir_name);
-            let plan = plan_importer(&nm, deps, graph, hoisting_limits)?;
-            for node in &plan.nodes {
-                let (Some(dep_path), Some(pkg_dir)) = (&node.dep_path, &node.pkg_dir) else {
-                    continue;
-                };
-                if pkg_dir.exists() {
-                    placements.record(dep_path, pkg_dir.clone());
-                }
+            importers.push(HoistedWorkspaceImporter {
+                importer_dir,
+                root_deps: deps.clone(),
+            });
+        }
+        let root_nm = root_dir.join(modules_dir_name);
+        let (plan, _) = plan_workspace(
+            &root_nm,
+            modules_dir_name,
+            &importers,
+            graph,
+            hoisting_limits,
+        )?;
+        for node in &plan.nodes {
+            let (Some(dep_path), Some(pkg_dir)) = (&node.dep_path, &node.pkg_dir) else {
+                continue;
+            };
+            if pkg_dir.exists() {
+                placements.record(dep_path, pkg_dir.clone());
             }
         }
         Ok(placements)
@@ -134,11 +147,11 @@ impl HoistedPlacements {
     }
 }
 
-/// One node in the placement tree. A node is either the importer
-/// root (`pkg_dir == None`) or a placed package. `nm_dir` is the
-/// `node_modules/` directory underneath this node where its children
-/// live — for the importer that's `<importer>/node_modules`, for a
-/// placed package it's `<parent.nm_dir>/<name>/node_modules`.
+/// One node in the placement tree. A node is either the workspace
+/// root/importer root (`pkg_dir == None`) or a placed package. `nm_dir`
+/// is the `node_modules/` directory underneath this node where its
+/// children live — for an importer that's `<importer>/node_modules`,
+/// for a placed package it's `<parent.nm_dir>/<name>/node_modules`.
 struct TreeNode {
     pkg_dir: Option<PathBuf>,
     nm_dir: PathBuf,
@@ -171,6 +184,18 @@ impl PlacementPlan {
             nodes: vec![root],
             root_idx: 0,
         }
+    }
+
+    fn add_importer_root(&mut self, importer_nm: PathBuf) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(TreeNode {
+            pkg_dir: None,
+            nm_dir: importer_nm,
+            parent: Some(self.root_idx),
+            children: BTreeMap::new(),
+            dep_path: None,
+        });
+        idx
     }
 
     /// Place `(name, dep_path)` under the ancestor chain rooted at
@@ -248,13 +273,8 @@ impl PlacementPlan {
         })
     }
 
-    /// Names placed directly in the importer root's `node_modules/`.
-    /// Drives the stale-entry sweep in `link_hoisted_importer`.
-    pub(crate) fn root_names(&self) -> impl Iterator<Item = &str> {
-        self.nodes[self.root_idx]
-            .children
-            .keys()
-            .map(|s| s.as_str())
+    fn child_names(&self, node_idx: usize) -> impl Iterator<Item = &str> {
+        self.nodes[node_idx].children.keys().map(|s| s.as_str())
     }
 }
 
@@ -270,31 +290,27 @@ fn is_ancestor_or_self(nodes: &[TreeNode], ancestor: usize, mut node: usize) -> 
     }
 }
 
-/// Build a placement plan for a single importer.
-pub(crate) fn plan_importer(
-    importer_nm: &Path,
+fn seed_root_deps(
+    queue: &mut VecDeque<(usize, usize, String, String)>,
+    requester: usize,
+    floor: usize,
     root_deps: &[DirectDep],
     graph: &LockfileGraph,
-    hoisting_limits: HoistingLimits,
-) -> Result<PlacementPlan, Error> {
-    let mut plan = PlacementPlan::new(importer_nm.to_path_buf());
-    let mut queue: VecDeque<(usize, usize, String, String)> = VecDeque::new();
-
-    // Seed the queue with the importer's direct deps in declaration
-    // order. BFS makes shallower deps win placement ties over
-    // deeper ones, which matches npm's first-writer-wins policy.
+) {
     for dep in root_deps {
         if !graph.packages.contains_key(&dep.dep_path) {
             continue;
         }
-        queue.push_back((
-            plan.root_idx,
-            plan.root_idx,
-            dep.name.clone(),
-            dep.dep_path.clone(),
-        ));
+        queue.push_back((requester, floor, dep.name.clone(), dep.dep_path.clone()));
     }
+}
 
+fn process_queue(
+    plan: &mut PlacementPlan,
+    mut queue: VecDeque<(usize, usize, String, String)>,
+    graph: &LockfileGraph,
+    hoisting_limits: HoistingLimits,
+) -> Result<(), Error> {
     while let Some((requester, floor, name, dep_path)) = queue.pop_front() {
         let outcome = plan.place(requester, floor, &name, &dep_path)?;
         if !outcome.created {
@@ -311,7 +327,8 @@ pub(crate) fn plan_importer(
             continue;
         }
         let child_floor = match hoisting_limits {
-            HoistingLimits::None | HoistingLimits::Workspaces => plan.root_idx,
+            HoistingLimits::None => plan.root_idx,
+            HoistingLimits::Workspaces => floor,
             HoistingLimits::Dependencies => outcome.node_idx,
         };
         for (dep_name, dep_tail) in &pkg.dependencies {
@@ -327,58 +344,100 @@ pub(crate) fn plan_importer(
             ));
         }
     }
+    Ok(())
+}
+
+/// Build a placement plan for a single importer.
+pub(crate) fn plan_importer(
+    importer_nm: &Path,
+    root_deps: &[DirectDep],
+    graph: &LockfileGraph,
+    hoisting_limits: HoistingLimits,
+) -> Result<PlacementPlan, Error> {
+    let mut plan = PlacementPlan::new(importer_nm.to_path_buf());
+    let mut queue: VecDeque<(usize, usize, String, String)> = VecDeque::new();
+
+    // Seed the queue with the importer's direct deps in declaration
+    // order. BFS makes shallower deps win placement ties over
+    // deeper ones, which matches npm's first-writer-wins policy.
+    seed_root_deps(&mut queue, plan.root_idx, plan.root_idx, root_deps, graph);
+    process_queue(&mut plan, queue, graph, hoisting_limits)?;
 
     Ok(plan)
 }
 
-/// Materialize a planned tree onto disk for a single importer.
-///
-/// Called by `Linker::link_all` and `Linker::link_workspace` when the
-/// linker is configured with `NodeLinker::Hoisted`. The importer's
-/// existing `node_modules/` is swept of any top-level entries the
-/// plan doesn't claim (direct deps from a previous install may have
-/// changed); placed packages are then materialized in two passes —
-/// local (`file:`/`link:`) first, then registry packages via the
-/// standard reflink/hardlink/copy file-linker.
-///
-/// Every placed package is recorded in `placements` so the install
-/// driver can later resolve `dep_path -> on-disk dir` for bin
-/// linking and lifecycle scripts without recomputing the plan.
-pub(crate) struct HoistedImporterDirs<'a> {
-    pub(crate) root: &'a Path,
-    pub(crate) importer: &'a Path,
+pub(crate) struct HoistedWorkspaceImporter {
+    pub(crate) importer_dir: PathBuf,
+    pub(crate) root_deps: Vec<DirectDep>,
 }
 
-pub(crate) fn link_hoisted_importer(
+fn workspace_importer_floor(
+    plan: &PlacementPlan,
+    importer_idx: usize,
+    hoisting_limits: HoistingLimits,
+) -> usize {
+    match hoisting_limits {
+        HoistingLimits::None => plan.root_idx,
+        HoistingLimits::Workspaces | HoistingLimits::Dependencies => importer_idx,
+    }
+}
+
+fn plan_workspace(
+    root_nm: &Path,
+    modules_dir_name: &str,
+    importers: &[HoistedWorkspaceImporter],
+    graph: &LockfileGraph,
+    hoisting_limits: HoistingLimits,
+) -> Result<(PlacementPlan, Vec<usize>), Error> {
+    let mut plan = PlacementPlan::new(root_nm.to_path_buf());
+    let mut importer_roots = vec![plan.root_idx];
+    let mut queue: VecDeque<(usize, usize, String, String)> = VecDeque::new();
+
+    for importer in importers {
+        let importer_nm = importer.importer_dir.join(modules_dir_name);
+        let importer_idx = if importer_nm == root_nm {
+            plan.root_idx
+        } else {
+            let idx = plan.add_importer_root(importer_nm);
+            importer_roots.push(idx);
+            idx
+        };
+        let floor = workspace_importer_floor(&plan, importer_idx, hoisting_limits);
+        seed_root_deps(&mut queue, importer_idx, floor, &importer.root_deps, graph);
+    }
+
+    process_queue(&mut plan, queue, graph, hoisting_limits)?;
+    Ok((plan, importer_roots))
+}
+
+fn link_hoisted_plan(
     linker: &Linker,
-    dirs: HoistedImporterDirs<'_>,
-    root_deps: &[DirectDep],
+    root_dir: &Path,
+    plan: &PlacementPlan,
+    plan_roots: &[usize],
     graph: &LockfileGraph,
     package_indices: &BTreeMap<String, PackageIndex>,
     stats: &mut LinkStats,
     placements: &mut HoistedPlacements,
 ) -> Result<(), Error> {
-    let root_dir = dirs.root;
-    let importer_dir = dirs.importer;
-    let nm = importer_dir.join(linker.modules_dir_name());
-    crate::mkdirp(&nm)?;
-
-    let plan = plan_importer(&nm, root_deps, graph, linker.hoisting_limits)?;
-
-    // Sweep any top-level entries that are no longer claimed by the
-    // plan. Dotfiles (`.aube`, `.bin`, …) are preserved — .aube in
-    // particular may hold a previous isolated tree that the user
-    // hasn't switched off; we leave it alone rather than wiping
-    // bytes the other layout owns.
-    let keep_root: std::collections::HashSet<&str> = plan.root_names().collect();
-    crate::sweep_stale_top_level_entries(&nm, &keep_root, None);
+    for root_idx in plan_roots {
+        let nm = &plan.nodes[*root_idx].nm_dir;
+        crate::mkdirp(nm)?;
+        // Sweep any top-level entries that are no longer claimed by the
+        // plan. Dotfiles (`.aube`, `.bin`, …) are preserved — .aube in
+        // particular may hold a previous isolated tree that the user
+        // hasn't switched off; we leave it alone rather than wiping
+        // bytes the other layout owns.
+        let keep_root: std::collections::HashSet<&str> = plan.child_names(*root_idx).collect();
+        crate::sweep_stale_top_level_entries(nm, &keep_root, None);
+    }
 
     // Materialize every non-root node. Order doesn't matter for
     // correctness (each package's files are written into its own
     // directory) but we iterate by index so the BFS order surfaces
     // in progress/debug logs.
     for idx in 0..plan.nodes.len() {
-        if idx == plan.root_idx {
+        if plan.nodes[idx].dep_path.is_none() {
             continue;
         }
         // Borrow scoping: take a clone of the fields we need out of
@@ -387,8 +446,8 @@ pub(crate) fn link_hoisted_importer(
         let (dep_path, pkg_dir) = {
             let node = &plan.nodes[idx];
             (
-                node.dep_path.clone().expect("non-root node has dep_path"),
-                node.pkg_dir.clone().expect("non-root node has pkg_dir"),
+                node.dep_path.clone().expect("placed node has dep_path"),
+                node.pkg_dir.clone().expect("placed node has pkg_dir"),
             )
         };
         let Some(pkg) = graph.packages.get(&dep_path) else {
@@ -408,15 +467,13 @@ pub(crate) fn link_hoisted_importer(
             }
             crate::try_remove_entry(&pkg_dir);
             let abs_target = root_dir.join(rel);
-            let link_parent = pkg_dir.parent().unwrap_or(&nm);
+            let link_parent = pkg_dir
+                .parent()
+                .unwrap_or_else(|| plan.nodes[plan.root_idx].nm_dir.as_path());
             let rel_target = pathdiff::diff_paths(&abs_target, link_parent).unwrap_or(abs_target);
             crate::sys::create_dir_link(&rel_target, &pkg_dir)
                 .map_err(|e| Error::Io(pkg_dir.clone(), e))?;
             placements.record(&dep_path, pkg_dir);
-            // Don't bump `top_level_linked` here: the post-loop
-            // `children.len()` add below already counts every root
-            // child including `link:` direct deps. Incrementing in
-            // both places would double-count.
             continue;
         }
 
@@ -492,8 +549,78 @@ pub(crate) fn link_hoisted_importer(
         placements.record(&dep_path, pkg_dir);
     }
 
-    stats.top_level_linked += plan.nodes[plan.root_idx].children.len();
+    stats.top_level_linked += plan_roots
+        .iter()
+        .map(|root_idx| plan.nodes[*root_idx].children.len())
+        .sum::<usize>();
     Ok(())
+}
+
+pub(crate) struct HoistedImporterDirs<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) importer: &'a Path,
+}
+
+/// Materialize a hoisted tree for a single importer.
+///
+/// Workspace installs use [`link_hoisted_workspace`] so member
+/// importers can share the workspace root placement tree. The
+/// single-importer path still serves non-workspace installs and
+/// preserves the original `link_all` behavior.
+pub(crate) fn link_hoisted_importer(
+    linker: &Linker,
+    dirs: HoistedImporterDirs<'_>,
+    root_deps: &[DirectDep],
+    graph: &LockfileGraph,
+    package_indices: &BTreeMap<String, PackageIndex>,
+    stats: &mut LinkStats,
+    placements: &mut HoistedPlacements,
+) -> Result<(), Error> {
+    let root_dir = dirs.root;
+    let importer_dir = dirs.importer;
+    let nm = importer_dir.join(linker.modules_dir_name());
+    crate::mkdirp(&nm)?;
+
+    let plan = plan_importer(&nm, root_deps, graph, linker.hoisting_limits)?;
+    link_hoisted_plan(
+        linker,
+        root_dir,
+        &plan,
+        &[plan.root_idx],
+        graph,
+        package_indices,
+        stats,
+        placements,
+    )
+}
+
+pub(crate) fn link_hoisted_workspace(
+    linker: &Linker,
+    root_dir: &Path,
+    importers: &[HoistedWorkspaceImporter],
+    graph: &LockfileGraph,
+    package_indices: &BTreeMap<String, PackageIndex>,
+    stats: &mut LinkStats,
+    placements: &mut HoistedPlacements,
+) -> Result<(), Error> {
+    let root_nm = root_dir.join(linker.modules_dir_name());
+    let (plan, importer_roots) = plan_workspace(
+        &root_nm,
+        linker.modules_dir_name(),
+        importers,
+        graph,
+        linker.hoisting_limits,
+    )?;
+    link_hoisted_plan(
+        linker,
+        root_dir,
+        &plan,
+        &importer_roots,
+        graph,
+        package_indices,
+        stats,
+        placements,
+    )
 }
 
 #[cfg(test)]

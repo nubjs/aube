@@ -80,6 +80,48 @@ fn make_graph() -> LockfileGraph {
 }
 
 #[test]
+fn hoisted_workspace_hoists_non_conflicting_member_direct_deps_to_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let app_dir = project_dir.join("packages/app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    let mut graph = make_graph();
+    graph.importers.insert(".".to_string(), Vec::new());
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "foo".to_string(),
+            dep_path: "foo@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+
+    let stats = linker
+        .link_workspace(&project_dir, &graph, &indices, &BTreeMap::new())
+        .expect("hoisted workspace link must succeed");
+
+    let root_foo = project_dir.join("node_modules/foo/index.js");
+    assert!(
+        root_foo.exists(),
+        "non-conflicting workspace member dependency must be hoisted to the workspace root"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_foo).unwrap(),
+        "module.exports = 'foo';"
+    );
+    assert!(
+        !app_dir.join("node_modules/foo").exists(),
+        "member-local copy should not be the only placement for a non-conflicting hoisted dep"
+    );
+    assert_eq!(stats.top_level_linked, 2);
+}
+
+#[test]
 fn test_detect_strategy() {
     let dir = tempfile::tempdir().unwrap();
     let strategy = Linker::detect_strategy(dir.path());

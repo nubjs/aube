@@ -497,13 +497,11 @@ impl Linker {
         Ok(stats)
     }
 
-    /// Hoisted-mode workspace linker. Runs the per-importer
-    /// hoisted planner once per importer in the graph, accumulating
-    /// stats + placements into a single `LinkStats`. Each importer
-    /// gets its own independent flat tree (no shared root
-    /// virtual-store like the isolated layout), matching npm
-    /// workspaces and what hoisted-mode toolchains expect: a
-    /// self-contained `node_modules/` under every importer.
+    /// Hoisted-mode workspace linker. Plans one shared workspace-root
+    /// tree with each non-root importer as an alternate lookup root.
+    /// Non-conflicting workspace deps can therefore land at the root
+    /// `node_modules`, while version/name conflicts still nest under
+    /// the importer that needs them.
     fn link_workspace_hoisted(
         &self,
         root_dir: &Path,
@@ -513,6 +511,8 @@ impl Linker {
     ) -> Result<LinkStats, Error> {
         let mut stats = LinkStats::default();
         let mut placements = HoistedPlacements::default();
+        let mut hoisted_importers = Vec::new();
+        let mut workspace_link_pass = Vec::new();
         for (importer_path, deps) in &graph.importers {
             if !is_physical_importer(importer_path) {
                 continue;
@@ -549,19 +549,24 @@ impl Linker {
                 })
                 .cloned()
                 .collect();
-            hoisted::link_hoisted_importer(
-                self,
-                hoisted::HoistedImporterDirs {
-                    root: root_dir,
-                    importer: &importer_dir,
-                },
-                &planner_deps,
-                graph,
-                package_indices,
-                &mut stats,
-                &mut placements,
-            )?;
+            hoisted_importers.push(hoisted::HoistedWorkspaceImporter {
+                importer_dir: importer_dir.clone(),
+                root_deps: planner_deps,
+            });
+            workspace_link_pass.push((importer_dir, deps.clone()));
+        }
 
+        hoisted::link_hoisted_workspace(
+            self,
+            root_dir,
+            &hoisted_importers,
+            graph,
+            package_indices,
+            &mut stats,
+            &mut placements,
+        )?;
+
+        for (importer_dir, deps) in workspace_link_pass {
             // Drop workspace deps in as symlinks, same as isolated mode.
             let nm = importer_dir.join(&self.modules_dir_name);
             if !self.hoist_workspace_packages {
