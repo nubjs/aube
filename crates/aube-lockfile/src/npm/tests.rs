@@ -1823,6 +1823,57 @@ fn test_parse_npm_workspace_importers() {
 }
 
 #[test]
+fn test_parse_npm_workspace_importer_keeps_nested_conflicting_direct_dep() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+            "name": "workspace-root",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "workspace-root",
+                    "version": "1.0.0",
+                    "workspaces": ["packages/*"],
+                    "dependencies": { "commander": "^5.0.0" }
+                },
+                "node_modules/commander": {
+                    "version": "5.1.0",
+                    "integrity": "sha512-commander5"
+                },
+                "node_modules/tempo": {
+                    "resolved": "packages/cli",
+                    "link": true
+                },
+                "packages/cli": {
+                    "name": "tempo",
+                    "version": "1.0.0",
+                    "dependencies": { "commander": "^12.1.0" }
+                },
+                "packages/cli/node_modules/commander": {
+                    "version": "12.1.0",
+                    "integrity": "sha512-commander12"
+                }
+            }
+        }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let root_commander = graph.importers["."]
+        .iter()
+        .find(|dep| dep.name == "commander")
+        .expect("root commander direct dep");
+    assert_eq!(root_commander.dep_path, "commander@5.1.0");
+    assert_eq!(root_commander.specifier.as_deref(), Some("^5.0.0"));
+
+    let cli_commander = graph.importers["packages/cli"]
+        .iter()
+        .find(|dep| dep.name == "commander")
+        .expect("workspace commander direct dep");
+    assert_eq!(cli_commander.dep_path, "commander@12.1.0");
+    assert_eq!(cli_commander.specifier.as_deref(), Some("^12.1.0"));
+}
+
+#[test]
 fn test_write_npm_workspace_importers() {
     let mut graph = LockfileGraph::default();
     let web_link = LocalSource::Link(PathBuf::from("web"));

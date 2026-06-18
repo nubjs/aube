@@ -458,7 +458,7 @@ impl LockfileGraph {
         // install. (Their *spec* is still verified separately by the
         // round-tripped `ignored_optional_dependencies` block below.)
         let ignored = &self.ignored_optional_dependencies;
-        let manifest_deps = manifest
+        let mut manifest_deps: Vec<(&String, &String, bool)> = manifest
             .dependencies
             .iter()
             .map(|(k, v)| (k, v, false))
@@ -469,7 +469,20 @@ impl LockfileGraph {
                     .iter()
                     .filter(|(name, _)| !ignored.contains(name.as_str()))
                     .map(|(k, v)| (k, v, true)),
+            )
+            .collect();
+        if self.settings.auto_install_peers {
+            manifest_deps.extend(
+                manifest
+                    .non_optional_peer_dependencies()
+                    .filter(|(name, _)| {
+                        !manifest.dependencies.contains_key(name.as_str())
+                            && !manifest.dev_dependencies.contains_key(name.as_str())
+                            && !manifest.optional_dependencies.contains_key(name.as_str())
+                    })
+                    .map(|(k, v)| (k, v, false)),
             );
+        }
 
         for (name, spec, is_optional) in manifest_deps {
             match lockfile_specs.get(name.as_str()) {
@@ -575,6 +588,19 @@ impl LockfileGraph {
                 .entry(name.as_str())
                 .or_insert(DepType::Optional);
         }
+        if self.settings.auto_install_peers {
+            for (name, _) in manifest.non_optional_peer_dependencies() {
+                if manifest.dependencies.contains_key(name)
+                    || manifest.dev_dependencies.contains_key(name)
+                    || manifest.optional_dependencies.contains_key(name)
+                {
+                    continue;
+                }
+                manifest_dep_types
+                    .entry(name.as_str())
+                    .or_insert(DepType::Production);
+            }
+        }
         for dep in importer_deps {
             let Some(expected) = manifest_dep_types.get(dep.name.as_str()) else {
                 continue;
@@ -611,7 +637,7 @@ impl LockfileGraph {
         // specifier string and then removed it, the (name, specifier)
         // pair no longer matches any peer range, and drift correctly
         // fires so the resolver re-runs and rewrites the lockfile.
-        let manifest_names: std::collections::HashSet<&str> = manifest
+        let mut manifest_names: std::collections::HashSet<&str> = manifest
             .dependencies
             .keys()
             .chain(manifest.dev_dependencies.keys())
@@ -623,6 +649,18 @@ impl LockfileGraph {
             )
             .map(|s| s.as_str())
             .collect();
+        if self.settings.auto_install_peers {
+            manifest_names.extend(
+                manifest
+                    .non_optional_peer_dependencies()
+                    .filter(|(name, _)| {
+                        !manifest.dependencies.contains_key(name.as_str())
+                            && !manifest.dev_dependencies.contains_key(name.as_str())
+                            && !manifest.optional_dependencies.contains_key(name.as_str())
+                    })
+                    .map(|(name, _)| name.as_str()),
+            );
+        }
         let auto_hoisted_peer_specs: std::collections::HashSet<(&str, &str)> = self
             .packages
             .values()
@@ -1022,6 +1060,53 @@ mod drift_tests {
             graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()),
             DriftStatus::Stale { .. }
         ));
+    }
+
+    #[test]
+    fn fresh_when_importer_peer_dependency_is_recorded_as_dependency() {
+        let mut manifest = make_manifest(&[]);
+        manifest
+            .peer_dependencies
+            .insert("zod".into(), "^3.22.0".into());
+        let graph = make_graph(&[("zod", "^3.22.0", "zod@3.22.0")]);
+
+        assert_eq!(
+            graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()),
+            DriftStatus::Fresh
+        );
+    }
+
+    #[test]
+    fn stale_when_importer_peer_dependency_row_exists_with_auto_install_peers_false() {
+        let mut manifest = make_manifest(&[]);
+        manifest
+            .peer_dependencies
+            .insert("zod".into(), "^3.22.0".into());
+        let mut graph = make_graph(&[("zod", "^3.22.0", "zod@3.22.0")]);
+        graph.settings.auto_install_peers = false;
+
+        match graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()) {
+            DriftStatus::Stale { reason } => assert!(reason.contains("zod")),
+            DriftStatus::Fresh => panic!("expected Stale"),
+        }
+    }
+
+    #[test]
+    fn stale_when_optional_importer_peer_dependency_is_recorded_as_dependency() {
+        let mut manifest = make_manifest(&[]);
+        manifest
+            .peer_dependencies
+            .insert("zod".into(), "^3.22.0".into());
+        manifest.extra.insert(
+            "peerDependenciesMeta".into(),
+            serde_json::json!({"zod": {"optional": true}}),
+        );
+        let graph = make_graph(&[("zod", "^3.22.0", "zod@3.22.0")]);
+
+        match graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()) {
+            DriftStatus::Stale { reason } => assert!(reason.contains("zod")),
+            DriftStatus::Fresh => panic!("expected Stale"),
+        }
     }
 
     // Regression guard for #42: the drift check must recognize

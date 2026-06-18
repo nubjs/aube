@@ -3410,6 +3410,172 @@ async fn auto_install_peers_installs_missing_required_peer() {
 }
 
 #[tokio::test]
+async fn importer_peer_dependencies_are_seeded_as_direct_deps() {
+    let zod = make_packument("zod", &["3.22.0"], "3.22.0");
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client);
+    resolver.cache.insert("zod".to_string(), zod);
+
+    let root = PackageJson::default();
+    let mut ui = PackageJson::default();
+    ui.peer_dependencies
+        .insert("zod".to_string(), "^3.22.0".to_string());
+
+    let graph = resolver
+        .resolve_workspace(
+            &[(".".to_string(), root), ("packages/ui".to_string(), ui)],
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("resolve failed");
+
+    let ui_deps = graph
+        .importers
+        .get("packages/ui")
+        .expect("packages/ui importer");
+    let zod_dep = ui_deps
+        .iter()
+        .find(|dep| dep.name == "zod")
+        .expect("peer dependency should be a direct dep");
+    assert_eq!(zod_dep.dep_type, DepType::Production);
+    assert_eq!(zod_dep.specifier.as_deref(), Some("^3.22.0"));
+    assert_eq!(zod_dep.dep_path, "zod@3.22.0");
+}
+
+#[tokio::test]
+async fn auto_install_peers_false_skips_importer_peer_dependencies() {
+    let zod = make_packument("zod", &["3.22.0"], "3.22.0");
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client).with_auto_install_peers(false);
+    resolver.cache.insert("zod".to_string(), zod);
+
+    let mut ui = PackageJson::default();
+    ui.peer_dependencies
+        .insert("zod".to_string(), "^3.22.0".to_string());
+
+    let graph = resolver
+        .resolve_workspace(
+            &[("packages/ui".to_string(), ui)],
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("resolve failed");
+
+    assert!(graph.importers["packages/ui"].is_empty());
+    assert!(
+        !graph_has_package(&graph, "zod", "3.22.0"),
+        "auto-install-peers=false should not install importer peers"
+    );
+}
+
+#[tokio::test]
+async fn importer_optional_peer_dependencies_are_not_seeded() {
+    let zod = make_packument("zod", &["3.22.0"], "3.22.0");
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client);
+    resolver.cache.insert("zod".to_string(), zod);
+
+    let mut ui = PackageJson::default();
+    ui.peer_dependencies
+        .insert("zod".to_string(), "^3.22.0".to_string());
+    ui.extra.insert(
+        "peerDependenciesMeta".to_string(),
+        serde_json::json!({"zod": {"optional": true}}),
+    );
+
+    let graph = resolver
+        .resolve_workspace(
+            &[("packages/ui".to_string(), ui)],
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("resolve failed");
+
+    assert!(graph.importers["packages/ui"].is_empty());
+    assert!(
+        !graph_has_package(&graph, "zod", "3.22.0"),
+        "optional importer peers should not be auto-installed"
+    );
+}
+
+#[tokio::test]
+async fn importer_peer_dependencies_do_not_duplicate_declared_deps() {
+    let zod = make_packument("zod", &["3.22.0", "3.23.0"], "3.23.0");
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client);
+    resolver.cache.insert("zod".to_string(), zod);
+
+    let mut ui = PackageJson::default();
+    ui.dependencies
+        .insert("zod".to_string(), "3.22.0".to_string());
+    ui.peer_dependencies
+        .insert("zod".to_string(), "^3.0.0".to_string());
+
+    let graph = resolver
+        .resolve_workspace(
+            &[("packages/ui".to_string(), ui)],
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("resolve failed");
+
+    let ui_deps = graph.importers.get("packages/ui").unwrap();
+    assert_eq!(ui_deps.len(), 1);
+    assert_eq!(ui_deps[0].name, "zod");
+    assert_eq!(ui_deps[0].specifier.as_deref(), Some("3.22.0"));
+    assert_eq!(ui_deps[0].dep_path, "zod@3.22.0");
+}
+
+#[tokio::test]
+async fn importer_peer_dependencies_resolve_per_importer_range() {
+    let host = make_packument("host", &["1.0.0", "2.0.0"], "2.0.0");
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client);
+    resolver.cache.insert("host".to_string(), host);
+
+    let mut one = PackageJson::default();
+    one.peer_dependencies
+        .insert("host".to_string(), "^1.0.0".to_string());
+    let mut two = PackageJson::default();
+    two.peer_dependencies
+        .insert("host".to_string(), "^2.0.0".to_string());
+
+    let graph = resolver
+        .resolve_workspace(
+            &[
+                ("packages/one".to_string(), one),
+                ("packages/two".to_string(), two),
+            ],
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("resolve failed");
+
+    assert_eq!(graph.importers["packages/one"][0].dep_path, "host@1.0.0");
+    assert_eq!(graph.importers["packages/two"][0].dep_path, "host@2.0.0");
+}
+
+#[tokio::test]
 async fn auto_install_peers_uses_importer_declared_peer_name_without_extra_version() {
     let mut plugin = make_packument("plugin", &["1.0.0"], "1.0.0");
     plugin

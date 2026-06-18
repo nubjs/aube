@@ -391,6 +391,29 @@ impl PackageJson {
         parse_json(path, content)
     }
 
+    /// True when `peerDependenciesMeta.<name>.optional` is set.
+    ///
+    /// `peerDependenciesMeta` stays in the flattened `extra` map because
+    /// most manifest consumers do not need it, but resolver and lockfile
+    /// drift checks must agree on optional peer handling.
+    pub fn peer_dependency_is_optional(&self, name: &str) -> bool {
+        self.extra
+            .get("peerDependenciesMeta")
+            .and_then(|v| v.as_object())
+            .and_then(|meta| meta.get(name))
+            .and_then(|entry| entry.as_object())
+            .and_then(|entry| entry.get("optional"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Iterate over non-optional `peerDependencies` entries.
+    pub fn non_optional_peer_dependencies(&self) -> impl Iterator<Item = (&String, &String)> + '_ {
+        self.peer_dependencies
+            .iter()
+            .filter(|(name, _)| !self.peer_dependency_is_optional(name))
+    }
+
     /// Iterate over the `pnpm` and `aube` config objects in
     /// `package.json`, yielding whichever are present in precedence
     /// order (pnpm first, aube last). Callers that merge into a map

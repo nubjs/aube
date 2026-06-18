@@ -51,10 +51,11 @@ pub(crate) struct ResolveDriver<'a> {
     /// wait-for-fetch loop calls `ensure_fetch` unconditionally.
     existing_names: FxHashSet<&'a str>,
     /// Per-importer set of declared dep names (`dependencies` ∪
-    /// `devDependencies` ∪ `optionalDependencies`). Consulted by the
-    /// peer-dep enqueue path to suppress `auto-install-peers` when the
-    /// importer (or root, under `resolve-peers-from-workspace-root`)
-    /// has already declared the peer.
+    /// `devDependencies` ∪ `optionalDependencies` ∪ synthesized
+    /// non-optional `peerDependencies`). Consulted by the peer-dep
+    /// enqueue path to suppress `auto-install-peers` when the importer
+    /// (or root, under `resolve-peers-from-workspace-root`) has already
+    /// declared the peer.
     importer_declared_dep_names: BTreeMap<String, BTreeSet<String>>,
 
     /// Locked packages keyed by dep_path. The output graph's packages
@@ -137,13 +138,20 @@ impl<'a> ResolveDriver<'a> {
         let importer_declared_dep_names: BTreeMap<String, BTreeSet<String>> = manifests
             .iter()
             .map(|(importer_path, manifest)| {
-                let names = manifest
+                let mut names: BTreeSet<String> = manifest
                     .dependencies
                     .keys()
                     .chain(manifest.dev_dependencies.keys())
                     .chain(manifest.optional_dependencies.keys())
                     .cloned()
                     .collect();
+                if resolver.auto_install_peers {
+                    names.extend(
+                        manifest
+                            .non_optional_peer_dependencies()
+                            .map(|(name, _)| name.clone()),
+                    );
+                }
                 (importer_path.clone(), names)
             })
             .collect();
@@ -162,6 +170,7 @@ impl<'a> ResolveDriver<'a> {
         seed_direct_deps(
             manifests,
             &resolver.ignored_optional_dependencies,
+            resolver.auto_install_peers,
             &mut queue,
             &mut importers,
         );

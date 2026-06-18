@@ -451,21 +451,27 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
 /// Canonical project-relative form of an npm `packages` install path
 /// (or a `link.resolved` target). `--prefix` installs prepend a climb
 /// out of npm's cwd back to the project dir
-/// (`../../../abs/proj/node_modules/foo`); the rest of the reader
-/// assumes the project-relative spelling (`node_modules/foo`). Returns
-/// the slice beginning at the first `node_modules/` segment when the
-/// path doesn't already start there; otherwise returns the path
-/// unchanged. The root key (`""`) and paths with no `node_modules/`
-/// segment (e.g. a workspace target like `packages/app`) pass through
-/// untouched.
+/// (`../../../abs/proj/node_modules/foo`) instead of the canonical
+/// project-relative spelling (`node_modules/foo`). Only those outside-root
+/// paths are stripped. Workspace-member install paths such as
+/// `packages/cli/node_modules/commander` are already project-relative and
+/// must be preserved so member-local dependencies do not collapse onto the
+/// root hoist slot.
 fn canonical_install_path(install_path: &str) -> &str {
-    if install_path.starts_with("node_modules/") {
+    if install_path.starts_with("node_modules/") || !looks_outside_project_prefix(install_path) {
         return install_path;
     }
     match install_path.find("node_modules/") {
         Some(idx) => &install_path[idx..],
         None => install_path,
     }
+}
+
+fn looks_outside_project_prefix(path: &str) -> bool {
+    path.starts_with("../")
+        || path.starts_with('/')
+        || path.starts_with("\\\\")
+        || path.as_bytes().get(1) == Some(&b':')
 }
 
 /// Rewrite every `packages` key and every `link.resolved` target to its
