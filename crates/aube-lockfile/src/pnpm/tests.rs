@@ -3120,6 +3120,78 @@ snapshots:
 }
 
 #[test]
+fn pnpm_hash_only_patched_dependency_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::fs::write(
+        &path,
+        format!(
+            r#"lockfileVersion: '9.0'
+
+patchedDependencies:
+  is-odd@3.0.1: {hash}
+
+importers:
+
+  .:
+    dependencies:
+      is-odd:
+        specifier: 3.0.1
+        version: 3.0.1(patch_hash={hash})
+
+packages:
+
+  is-odd@3.0.1:
+    resolution: {{integrity: sha512-odd}}
+
+snapshots:
+
+  is-odd@3.0.1(patch_hash={hash}): {{}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let graph = parse(&path).unwrap();
+    assert!(graph.patched_dependencies.is_empty());
+    assert_eq!(
+        graph.patched_dependency_hashes.get("is-odd@3.0.1"),
+        Some(&hash.to_string())
+    );
+
+    let manifest = PackageJson {
+        dependencies: [("is-odd".to_string(), "3.0.1".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = dir.path().join("out.yaml");
+    write(&out, &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(&out).unwrap();
+
+    assert!(
+        written.contains(&format!("  is-odd@3.0.1: {hash}")),
+        "hash-only patchedDependencies scalar must be preserved:\n{written}"
+    );
+    assert!(
+        written.contains(&format!("version: 3.0.1(patch_hash={hash})")),
+        "hash-only patches must still stamp importer versions:\n{written}"
+    );
+    assert!(
+        written.contains(&format!("is-odd@3.0.1(patch_hash={hash})")),
+        "hash-only patches must still stamp snapshot keys:\n{written}"
+    );
+
+    let reparsed = parse(&out).unwrap();
+    assert!(reparsed.patched_dependencies.is_empty());
+    assert_eq!(
+        reparsed.patched_dependency_hashes.get("is-odd@3.0.1"),
+        Some(&hash.to_string())
+    );
+}
+
+#[test]
 fn write_pnpm_lockfile_uses_native_alias_shape() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pnpm-lock.yaml");

@@ -16,6 +16,7 @@ use std::path::Path;
 #[serde(untagged)]
 enum WritablePatchedDependency {
     WithHash { hash: String, path: String },
+    HashOnly(String),
     PathOnly(String),
 }
 
@@ -84,7 +85,6 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             graph
                 .patched_dependency_hashes
                 .get(&selector)
-                .filter(|_| graph.patched_dependencies.contains_key(&selector))
                 .map(|hash| (dep_path.as_str(), hash.as_str()))
         })
         .collect();
@@ -782,32 +782,52 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     .collect(),
             )
         },
-        // pnpm 10 emits patched deps as `{ hash, path }` and rejects a
-        // hash-less entry's install with a config-mismatch error, so
-        // emit the object form whenever the graph carries the hash.
-        // Selectors without a recorded hash (bun.lock conversions,
-        // pnpm v8 lockfiles) keep the bare-path form, which pnpm
-        // still parses. Skipped when empty to keep parity with
+        // pnpm 10 emits manifest-backed patched deps as `{ hash, path }`
+        // and rejects a hash-less entry's install with a config-mismatch
+        // error, so emit the object form whenever the graph carries both
+        // values. pnpm 11 may write workspace-yaml-backed patches as a
+        // hash-only scalar in the lockfile because the path lives in
+        // `pnpm-workspace.yaml`; preserve that scalar instead of dropping
+        // the selector. Selectors without a recorded hash (bun.lock
+        // conversions, pnpm v8 lockfiles) keep the bare-path form, which
+        // pnpm still parses. Skipped when empty to keep parity with
         // no-patch installs.
-        patched_dependencies: if graph.patched_dependencies.is_empty() {
-            None
-        } else {
-            Some(
-                graph
-                    .patched_dependencies
-                    .iter()
-                    .map(|(selector, path)| {
-                        let entry = match graph.patched_dependency_hashes.get(selector) {
-                            Some(hash) => WritablePatchedDependency::WithHash {
-                                hash: hash.clone(),
-                                path: path.clone(),
-                            },
-                            None => WritablePatchedDependency::PathOnly(path.clone()),
-                        };
-                        (selector.clone(), entry)
-                    })
-                    .collect(),
-            )
+        patched_dependencies: {
+            let selectors = graph
+                .patched_dependencies
+                .keys()
+                .chain(graph.patched_dependency_hashes.keys())
+                .collect::<std::collections::BTreeSet<_>>();
+            if selectors.is_empty() {
+                None
+            } else {
+                Some(
+                    selectors
+                        .into_iter()
+                        .map(|selector| {
+                            let entry = match (
+                                graph.patched_dependencies.get(selector),
+                                graph.patched_dependency_hashes.get(selector),
+                            ) {
+                                (Some(path), Some(hash)) => WritablePatchedDependency::WithHash {
+                                    hash: hash.clone(),
+                                    path: path.clone(),
+                                },
+                                (None, Some(hash)) => {
+                                    WritablePatchedDependency::HashOnly(hash.clone())
+                                }
+                                (Some(path), None) => {
+                                    WritablePatchedDependency::PathOnly(path.clone())
+                                }
+                                (None, None) => unreachable!(
+                                    "selector came from patched dependency path/hash keys"
+                                ),
+                            };
+                            (selector.clone(), entry)
+                        })
+                        .collect(),
+                )
+            }
         },
         time,
         importers,

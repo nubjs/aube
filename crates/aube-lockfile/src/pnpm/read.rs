@@ -939,11 +939,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let mut patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
     let mut patched_dependency_hashes: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in raw.patched_dependencies.unwrap_or_default() {
-        let scalar_is_hash = v.scalar_value().is_some_and(|value| {
-            scalar_patch_hashes
-                .get(&k)
-                .is_some_and(|hash| hash == value)
-        });
+        let scalar_is_hash = is_hash_only_patch_scalar(&k, &v, &scalar_patch_hashes);
         let (path, hash) = v.into_path_and_hash(scalar_is_hash);
         if let Some(hash) = hash {
             patched_dependency_hashes.insert(k.clone(), hash);
@@ -1030,6 +1026,18 @@ fn scalar_patch_hashes(raw: &super::raw::RawPnpmLockfile) -> BTreeMap<String, St
         }
     }
     hashes
+}
+
+fn is_hash_only_patch_scalar(
+    selector: &str,
+    entry: &super::raw::RawPatchedDependency,
+    scalar_hashes: &BTreeMap<String, String>,
+) -> bool {
+    entry.scalar_value().is_some_and(|value| {
+        scalar_hashes
+            .get(selector)
+            .is_some_and(|hash| hash == value)
+    })
 }
 
 fn is_sha256_hex(value: &str) -> bool {
