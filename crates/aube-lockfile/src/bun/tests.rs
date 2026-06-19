@@ -1760,3 +1760,81 @@ fn bun_authored_git_entries_round_trip_with_their_integrity() {
         "bun-authored git entry must round-trip verbatim; got:\n{body}"
     );
 }
+
+// A hosted-git dependency the resolver fetched through a codeload archive
+// arrives as a `RemoteTarball { git_hosted: true }`, NOT a
+// `LocalSource::Git`. The writer must still emit bun's git tuple (git-spec
+// ident + `owner-repo-sha` repo-tag, no integrity), because a cold-cache
+// `bun install --frozen-lockfile` fetches the dep from GitHub and rejects
+// the registry-shaped collapse with `IntegrityCheckFailed`. This is the
+// shape both `aube install` (fresh resolve) and a pnpm-v9 lockfile feed the
+// writer, so it is the real-world git-dep path — not the synthetic
+// `LocalSource::Git` one the test above covers.
+#[test]
+fn git_hosted_remote_tarball_is_emitted_as_bun_git_tuple() {
+    let sha = "1c6264b795492e8fdecbc82cb8802fcfbfc08d26";
+    // The resolver's own codeload-tarball SRI — a different artifact than
+    // the one bun hashes, so it must NOT be written as bun's integrity.
+    let aube_sri = fake_sri('r');
+    let local = LocalSource::RemoteTarball(crate::RemoteTarballSource {
+        url: format!("https://codeload.github.com/vercel/ms/tar.gz/{sha}"),
+        integrity: aube_sri.clone(),
+        git_hosted: true,
+    });
+    let dep_path = local.dep_path("ms");
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        dep_path.clone(),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            integrity: Some(aube_sri.clone()),
+            dep_path: dep_path.clone(),
+            local_source: Some(local),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "ms".to_string(),
+            dep_path,
+            dep_type: DepType::Production,
+            specifier: Some("git+https://github.com/vercel/ms.git#1c6264b".to_string()),
+        }],
+    );
+    let manifest = aube_manifest::PackageJson {
+        name: Some("test".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [(
+            "ms".to_string(),
+            format!("git+https://github.com/vercel/ms.git#{sha}"),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let body = std::fs::read_to_string(out.path()).unwrap();
+
+    let short = &sha[..7];
+    assert!(
+        body.contains(&format!(
+            "\"ms\": [\"ms@github:vercel/ms#{short}\", {{}}, \"vercel-ms-{short}\"]"
+        )),
+        "a git_hosted tarball must serialize as bun's git tuple (git-spec \
+         ident + repo-tag, no integrity); got:\n{body}"
+    );
+    assert!(
+        !body.contains(&aube_sri),
+        "the resolver's codeload SRI must not leak in as bun's git \
+         integrity (bun verifies its own pack hash): {body}"
+    );
+    assert!(
+        !body.contains("\"ms@2.1.3\""),
+        "the git dep must NOT collapse into a registry-shaped `ms@2.1.3` \
+         entry (the bug that fails bun's cold-cache frozen install):\n{body}"
+    );
+}

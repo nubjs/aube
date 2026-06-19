@@ -419,16 +419,38 @@ fn note_git_range<'a>(name: &'a str, range: &'a str, map: &mut BTreeMap<&'a str,
 }
 
 /// The `resolved "<url>"` value yarn v1 writes for a git dependency.
-/// For a hosted provider (github/gitlab/bitbucket) with a 40-char commit
-/// SHA, that's the flat codeload-style HTTPS tarball
-/// (`https://codeload.github.com/<owner>/<repo>/tar.gz/<sha>`) — exactly
-/// what real yarn records. For a self-hosted / non-codeload git source we
-/// fall back to the `<url>#<commit>` clone form, which yarn also accepts.
-/// `None` only when there is no resolved commit to pin (the source never
-/// got an ls-remote pass) — the caller then omits the `resolved` line.
-fn yarn_git_resolved(git: &crate::GitSource) -> Option<String> {
+///
+/// yarn's `resolved` form depends on how the dependency was DECLARED, not
+/// just where it resolves. Empirically (yarn 1.22), a hosted *shorthand*
+/// (`github:owner/repo#ref`, `owner/repo#ref`) resolves to the flat codeload
+/// tarball (`https://codeload.github.com/<owner>/<repo>/tar.gz/<sha>`), while
+/// a *URL* git spec (`git+https://…#<sha>`, `git+ssh://…`, `git://…`) is
+/// echoed back VERBATIM as the `resolved` URL, fragment and all. Emitting a
+/// codeload tarball for a `git+https` declaration makes yarn's GitFetcher
+/// fail `Invariant Violation: Commit hash required` on a frozen install,
+/// because it expects the commit on the URL fragment.
+///
+/// `declared` is the original descriptor recovered from the manifest (the
+/// block-header range). `None` only when there is no resolved commit to pin
+/// (the source never got an ls-remote pass) — the caller omits `resolved`.
+fn yarn_git_resolved(git: &crate::GitSource, declared: &str) -> Option<String> {
     if git.resolved.is_empty() {
         return None;
+    }
+    // A URL-form git declaration is echoed verbatim. `parse_git_spec`
+    // returns a URL only for genuine URL specs (it expands bare/`github:`
+    // shorthands into a hosted URL but reports them here via the shorthand
+    // check below), so gate on the literal declared prefix instead.
+    let is_url_form = declared.starts_with("git+")
+        || declared.starts_with("git://")
+        || declared.starts_with("git@")
+        || declared.starts_with("ssh://")
+        || ((declared.starts_with("https://") || declared.starts_with("http://"))
+            && declared.contains(".git"));
+    if is_url_form {
+        // The declaration already carries the committish fragment yarn
+        // needs (`…#<sha>`); echo it unchanged.
+        return Some(declared.to_string());
     }
     if let Some(hosted) = crate::parse_hosted_git(&git.url)
         && let Some(tarball) = hosted.tarball_url(&git.resolved)
@@ -578,8 +600,25 @@ pub fn write_classic(
         // range can't be recovered, refuse rather than emit the broken
         // expanded form (the never-silently-write-a-yarn-rejected-lockfile
         // bar). `git_resolved` is the `resolved` URL when we can derive one.
+        // A hosted-git dependency fetched through a codeload archive (or
+        // recorded that way by pnpm v9+) arrives as a
+        // `RemoteTarball { git_hosted: true }` rather than a
+        // `LocalSource::Git`. yarn v1 keys such a dep by the declared git
+        // spec with a `resolved "<codeload tarball URL>"` line — keying it
+        // by the tarball URL with `version "0.0.0"` (the local-source
+        // fallback below) makes `yarn install --frozen-lockfile` reject the
+        // file. Normalize the stand-in tarball back to a git source so the
+        // git branch renders yarn's accepted form.
+        let hosted_git = match &pkg.local_source {
+            Some(LocalSource::RemoteTarball(rt)) => rt.as_hosted_git_source(),
+            _ => None,
+        };
+        let git_source = match &pkg.local_source {
+            Some(LocalSource::Git(git)) => Some(git.clone()),
+            _ => hosted_git,
+        };
         let mut git_resolved: Option<String> = None;
-        let header = if let Some(LocalSource::Git(git)) = &pkg.local_source {
+        let header = if let Some(git) = &git_source {
             let range = declared_git_range.get(pkg.name.as_str()).ok_or_else(|| {
                 Error::parse(
                     path,
@@ -593,7 +632,7 @@ pub fn write_classic(
                     ),
                 )
             })?;
-            git_resolved = yarn_git_resolved(git);
+            git_resolved = yarn_git_resolved(git, range);
             format!("{}@{}", pkg.name, range)
         } else if let Some(src) = &pkg.local_source {
             // `file:`/`link:`/`portal:` — keyed by the declared protocol

@@ -418,6 +418,20 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 }
                 _ => None,
             });
+            // pnpm records the real semver of a URL-keyed package (remote
+            // tarball, hosted-git codeload archive) on the `packages:`
+            // entry's `version:` field, since the dep-path key is a URL
+            // rather than a `name@semver` pin. The importer loop seeds these
+            // with a `0.0.0` placeholder; lift the recorded semver here so a
+            // conversion writer (yarn's `version "x.y.z"`, bun's `name@x.y.z`
+            // for non-git tarballs) emits the real version instead of
+            // `0.0.0` — which yarn frozen-rejects on a git dep.
+            if let Some(pkg_info) = pkg_info
+                && let Some(ver) = pkg_info.version.as_ref()
+                && local_pkg.version == "0.0.0"
+            {
+                local_pkg.version = ver.clone();
+            }
             if let Some(pkg_info) = pkg_info
                 && let Some(ref res) = pkg_info.resolution
                 && let Some(mut ls) = local_source_from_resolution(res)

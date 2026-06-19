@@ -52,6 +52,42 @@ pub struct RemoteTarballSource {
     pub git_hosted: bool,
 }
 
+impl RemoteTarballSource {
+    /// Reconstruct the [`GitSource`] a hosted-git tarball stands in for.
+    ///
+    /// Both the resolver (when it fetches a `github:`/`git+https://…`
+    /// dependency through a codeload archive instead of a full clone) and
+    /// pnpm v9+ record a hosted git dependency as a remote codeload tarball
+    /// with `git_hosted = true` rather than a `{repo, commit}` pair. The
+    /// bun and yarn lockfile writers must emit each PM's *git* form for
+    /// such a dependency — bun's cold-cache frozen install rejects the
+    /// registry-shaped collapse with `IntegrityCheckFailed`, and yarn keys
+    /// a git dep by the declared git spec, not the tarball URL — so they
+    /// call this to recover the git identity (host URL + resolved SHA +
+    /// the codeload tarball's integrity) from the stand-in tarball.
+    ///
+    /// Returns `None` for an ordinary (non-git) remote tarball — i.e. one
+    /// whose URL isn't a recognizable codeload archive form (a provider
+    /// codeload host + `/tar.gz/<40-char-sha>` path). Detection is by URL,
+    /// not the `git_hosted` flag: a codeload host serves *only* git
+    /// archives, and pnpm v9 doesn't reliably set `gitHosted:` on the
+    /// resolution it records for a git dep, so keying off the flag alone
+    /// would miss the pnpm-conversion path. The committish (the user's
+    /// original `#<ref>` tag/branch) is not encoded in the tarball URL, so
+    /// it stays `None`; the writers recover the declared git spec from the
+    /// manifest.
+    pub fn as_hosted_git_source(&self) -> Option<GitSource> {
+        let (hosted, sha) = parse_hosted_git_tarball(&self.url)?;
+        Some(GitSource {
+            url: hosted.https_url(),
+            committish: None,
+            resolved: sha,
+            integrity: (!self.integrity.is_empty()).then(|| self.integrity.clone()),
+            subpath: None,
+        })
+    }
+}
+
 /// A git dependency spec. See [`LocalSource::Git`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitSource {
@@ -618,6 +654,67 @@ pub fn parse_hosted_git(url: &str) -> Option<HostedGit> {
     })
 }
 
+/// Invert [`HostedGit::tarball_url`]: parse a codeload-style hosted-git
+/// archive URL back into its `(HostedGit, sha)` parts. pnpm v9+ records a
+/// git dependency as a flat HTTPS tarball
+/// (`resolution: {tarball: https://codeload.github.com/<owner>/<repo>/tar.gz/<sha>}`)
+/// rather than a `{repo, commit}` pair, which would otherwise classify as a
+/// plain remote tarball and lose the dependency's git identity — collapsing
+/// it into a registry-shaped entry that bun's cold-cache frozen install
+/// rejects (`IntegrityCheckFailed`) and that yarn keys by the tarball URL.
+/// Recovering `(owner, repo, sha)` here lets the reader rebuild a
+/// [`GitSource`] so the bun/yarn writers emit each PM's accepted git form.
+///
+/// Returns `None` for any non-codeload URL (a genuine remote tarball stays a
+/// remote tarball) or a SHA that isn't 40 hex chars.
+pub fn parse_hosted_git_tarball(url: &str) -> Option<(HostedGit, String)> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let before_query = rest.split_once('?').map_or(rest, |(b, _)| b);
+    let (host, path) = before_query.split_once('/')?;
+    let is_sha = |s: &str| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit());
+    let (host, owner, repo, sha) = match host.to_ascii_lowercase().as_str() {
+        // `codeload.github.com/<owner>/<repo>/tar.gz/<sha>`
+        "codeload.github.com" => {
+            let mut segs = path.splitn(4, '/');
+            let owner = segs.next()?;
+            let repo = segs.next()?;
+            if segs.next()? != "tar.gz" {
+                return None;
+            }
+            (HostedGitHost::GitHub, owner, repo, segs.next()?)
+        }
+        // `gitlab.com/<owner>/<repo>/-/archive/<sha>/<repo>-<sha>.tar.gz`
+        "gitlab.com" => {
+            let (head, _file) = path.rsplit_once('/')?;
+            let (repo_path, sha) = head.rsplit_once('/')?;
+            let owner_repo = repo_path.strip_suffix("/-/archive")?;
+            let (owner, repo) = owner_repo.rsplit_once('/')?;
+            (HostedGitHost::GitLab, owner, repo, sha)
+        }
+        // `bitbucket.org/<owner>/<repo>/get/<sha>.tar.gz`
+        "bitbucket.org" => {
+            let archive = path.strip_suffix(".tar.gz")?;
+            let (head, sha) = archive.rsplit_once("/get/")?;
+            let (owner, repo) = head.rsplit_once('/')?;
+            (HostedGitHost::Bitbucket, owner, repo, sha)
+        }
+        _ => return None,
+    };
+    if owner.is_empty() || repo.is_empty() || !is_sha(sha) {
+        return None;
+    }
+    Some((
+        HostedGit {
+            host,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        },
+        sha.to_ascii_lowercase(),
+    ))
+}
+
 fn parse_scp_url(body: &str) -> Option<String> {
     if body.contains("://") {
         return None;
@@ -1042,6 +1139,51 @@ mod tests {
             assert!(
                 parse_hosted_git(spec).is_none(),
                 "spec {spec} must not match a hosted provider",
+            );
+        }
+    }
+
+    // `parse_hosted_git_tarball` must invert `HostedGit::tarball_url` for
+    // each provider, recovering `(owner, repo, sha)` from a codeload-style
+    // archive URL. pnpm v9+ (and aube's own resolver) record a hosted git
+    // dependency as such a tarball; the inverse is what lets the bun/yarn
+    // writers re-derive the dependency's git identity instead of collapsing
+    // it into a registry/tarball entry the real PM rejects.
+    #[test]
+    fn parse_hosted_git_tarball_inverts_tarball_url() {
+        let sha = "1c6264b795492e8fdecbc82cb8802fcfbfc08d26";
+        for host in [
+            HostedGitHost::GitHub,
+            HostedGitHost::GitLab,
+            HostedGitHost::Bitbucket,
+        ] {
+            let hosted = HostedGit {
+                host,
+                owner: "vercel".to_string(),
+                repo: "ms".to_string(),
+            };
+            let url = hosted.tarball_url(sha).expect("40-char sha → tarball URL");
+            let (parsed, parsed_sha) = parse_hosted_git_tarball(&url)
+                .unwrap_or_else(|| panic!("{url} must parse back to its hosted git parts"));
+            assert_eq!(parsed, hosted, "round-trip host/owner/repo for {host:?}");
+            assert_eq!(parsed_sha, sha, "round-trip sha for {host:?}");
+        }
+    }
+
+    #[test]
+    fn parse_hosted_git_tarball_rejects_non_codeload() {
+        for url in [
+            // A genuine registry / arbitrary remote tarball stays a tarball.
+            "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+            "https://example.com/owner/repo/tar.gz/1c6264b795492e8fdecbc82cb8802fcfbfc08d26",
+            // codeload host but a non-40-char ref (a tag, not a pinned sha).
+            "https://codeload.github.com/vercel/ms/tar.gz/v2.1.3",
+            // codeload host, wrong archive segment.
+            "https://codeload.github.com/vercel/ms/zip/1c6264b795492e8fdecbc82cb8802fcfbfc08d26",
+        ] {
+            assert!(
+                parse_hosted_git_tarball(url).is_none(),
+                "{url} must not be treated as a hosted git tarball",
             );
         }
     }

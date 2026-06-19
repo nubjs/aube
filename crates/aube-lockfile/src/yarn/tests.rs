@@ -1525,3 +1525,168 @@ fn test_write_classic_git_dep_without_declared_descriptor_is_refused() {
         "the refusal must name the dep and explain the git-conversion limit, got: {msg}"
     );
 }
+
+// A hosted-git dependency the resolver fetched through a codeload archive
+// (or that pnpm v9+ recorded the same way) arrives as a
+// `RemoteTarball { git_hosted: true }`, NOT a `LocalSource::Git`. The yarn
+// classic writer must still key it by the declared git spec with a
+// `resolved "<codeload tarball URL>"` line and the real semver `version` —
+// keying it by the tarball URL with `version "0.0.0"` (the old local-source
+// fallback) makes `yarn install --frozen-lockfile` reject the file. This is
+// the shape the `nub pm use yarn` conversion actually feeds the writer (its
+// graph comes from the pnpm reader), so it is the real-world path.
+#[test]
+fn test_write_classic_git_hosted_tarball_echoes_declared_git_url_resolved() {
+    let sha = "1c6264b795492e8fdecbc82cb8802fcfbfc08d26";
+    let source = LocalSource::RemoteTarball(crate::RemoteTarballSource {
+        url: format!("https://codeload.github.com/vercel/ms/tar.gz/{sha}"),
+        // pnpm's codeload resolution carries no integrity; even when one is
+        // present, yarn v1 keys off `resolved`, not `integrity`.
+        integrity: String::new(),
+        git_hosted: true,
+    });
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        source.dep_path("ms"),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            dep_path: source.dep_path("ms"),
+            local_source: Some(source),
+            ..Default::default()
+        },
+    );
+    let graph = LockfileGraph {
+        importers: BTreeMap::from([(".".to_string(), vec![])]),
+        packages,
+        ..Default::default()
+    };
+    // The manifest declares the full git+https spec; the block header must
+    // reproduce it verbatim (what yarn matches against on a frozen install).
+    let declared = format!("git+https://github.com/vercel/ms.git#{sha}");
+    let manifest = make_manifest(&[("ms", &declared)], &[]);
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write_classic(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    assert!(
+        written.contains(&format!("\"ms@{declared}\":\n")),
+        "git block must be keyed by the declared git spec, not the tarball URL:\n{written}"
+    );
+    assert!(
+        written.contains("  version \"2.1.3\"\n"),
+        "git block must carry the real semver, not `0.0.0`:\n{written}"
+    );
+    // A `git+https://…#<sha>` URL declaration is echoed VERBATIM as
+    // `resolved` (yarn's GitFetcher needs the commit on the URL fragment);
+    // a codeload tarball would make yarn fail `Commit hash required`.
+    assert!(
+        written.contains(&format!("  resolved \"{declared}\"\n")),
+        "a git+https URL declaration must echo verbatim as resolved:\n{written}"
+    );
+}
+
+// End-to-end of the actual `nub pm use yarn` conversion path: parse a real
+// pnpm v9 lockfile (where a git dep is recorded as a codeload tarball with
+// the declared git spec on the importer `specifier`) and write it as a yarn
+// v1 lockfile. The two git deps in the fixture cover both spellings real
+// pnpm preserves: a `github:owner/repo#tag` shorthand and a
+// `git+https://…#<sha>` URL. The output must match what real yarn 1.x
+// writes — declared-spec keys, real versions, codeload `resolved` URLs.
+#[test]
+fn pnpm_v9_codeload_git_deps_convert_to_accepted_yarn_classic() {
+    let pnpm_lock = r#"lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      is-number:
+        specifier: github:jonschlinkert/is-number#7.0.0
+        version: https://codeload.github.com/jonschlinkert/is-number/tar.gz/98e8ff1da1a89f93d1397a24d7413ed15421c139
+      ms:
+        specifier: git+https://github.com/vercel/ms.git#1c6264b795492e8fdecbc82cb8802fcfbfc08d26
+        version: https://codeload.github.com/vercel/ms/tar.gz/1c6264b795492e8fdecbc82cb8802fcfbfc08d26
+
+packages:
+
+  is-number@https://codeload.github.com/jonschlinkert/is-number/tar.gz/98e8ff1da1a89f93d1397a24d7413ed15421c139:
+    resolution: {tarball: https://codeload.github.com/jonschlinkert/is-number/tar.gz/98e8ff1da1a89f93d1397a24d7413ed15421c139}
+    version: 7.0.0
+    engines: {node: '>=0.12.0'}
+
+  ms@https://codeload.github.com/vercel/ms/tar.gz/1c6264b795492e8fdecbc82cb8802fcfbfc08d26:
+    resolution: {tarball: https://codeload.github.com/vercel/ms/tar.gz/1c6264b795492e8fdecbc82cb8802fcfbfc08d26}
+    version: 2.1.3
+
+snapshots:
+
+  is-number@https://codeload.github.com/jonschlinkert/is-number/tar.gz/98e8ff1da1a89f93d1397a24d7413ed15421c139: {}
+
+  ms@https://codeload.github.com/vercel/ms/tar.gz/1c6264b795492e8fdecbc82cb8802fcfbfc08d26: {}
+"#;
+    let pnpm_path = tempfile::Builder::new()
+        .suffix("-pnpm-lock.yaml")
+        .tempfile()
+        .unwrap();
+    std::fs::write(pnpm_path.path(), pnpm_lock).unwrap();
+    let graph = crate::pnpm::parse(pnpm_path.path()).unwrap();
+
+    let manifest = make_manifest(
+        &[
+            ("is-number", "github:jonschlinkert/is-number#7.0.0"),
+            (
+                "ms",
+                "git+https://github.com/vercel/ms.git#1c6264b795492e8fdecbc82cb8802fcfbfc08d26",
+            ),
+        ],
+        &[],
+    );
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write_classic(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    // `github:` shorthand → declared-spec key, real version, codeload tarball.
+    assert!(
+        written.contains("\"is-number@github:jonschlinkert/is-number#7.0.0\":\n"),
+        "is-number must be keyed by its declared github: spec:\n{written}"
+    );
+    assert!(
+        written.contains(
+            "  resolved \"https://codeload.github.com/jonschlinkert/is-number/tar.gz/\
+             98e8ff1da1a89f93d1397a24d7413ed15421c139\"\n"
+        ),
+        "is-number must carry its codeload resolved URL:\n{written}"
+    );
+    // `git+https://…#<sha>` URL → declared-spec key, and `resolved` echoed
+    // verbatim (NOT a codeload tarball — yarn's GitFetcher needs the commit
+    // on the URL fragment, else `Invariant Violation: Commit hash required`).
+    assert!(
+        written.contains(
+            "\"ms@git+https://github.com/vercel/ms.git#\
+             1c6264b795492e8fdecbc82cb8802fcfbfc08d26\":\n"
+        ),
+        "ms must be keyed by its declared git+https spec:\n{written}"
+    );
+    assert!(
+        written.contains(
+            "  resolved \"git+https://github.com/vercel/ms.git#\
+             1c6264b795492e8fdecbc82cb8802fcfbfc08d26\"\n"
+        ),
+        "ms (git+https URL form) must echo its declared URL verbatim as resolved:\n{written}"
+    );
+    assert!(
+        written.contains("  version \"7.0.0\"\n") && written.contains("  version \"2.1.3\"\n"),
+        "both git deps must carry their real semver, not `0.0.0`:\n{written}"
+    );
+    assert!(
+        !written.contains("@https://codeload"),
+        "no git dep may be keyed by the codeload tarball URL:\n{written}"
+    );
+}

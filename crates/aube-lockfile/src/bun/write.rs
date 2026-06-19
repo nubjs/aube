@@ -358,7 +358,25 @@ pub fn write(
         // collapsed to the alias name and produced a gratuitous diff
         // against bun's own output.
         let ident_name = pkg.alias_of.as_deref().unwrap_or(&pkg.name);
-        let entry = if let Some(LocalSource::Git(git)) = pkg.local_source.as_ref() {
+        // A hosted-git dependency the resolver fetched through a codeload
+        // archive (or that pnpm recorded the same way) arrives as a
+        // `RemoteTarball { git_hosted: true }` rather than a
+        // `LocalSource::Git`. bun writes such a dep in its *git* form
+        // (`name@github:owner/repo#<sha>` key + `owner-repo-sha` repo-tag),
+        // and a cold-cache `bun install --frozen-lockfile` rejects the
+        // registry-shaped collapse with `IntegrityCheckFailed` (it fetches
+        // from GitHub and the registry tarball's integrity doesn't match).
+        // Normalize the stand-in tarball back to a git source so the git
+        // branch below renders bun's accepted form.
+        let hosted_git = match pkg.local_source.as_ref() {
+            Some(LocalSource::RemoteTarball(rt)) => rt.as_hosted_git_source(),
+            _ => None,
+        };
+        let git_source = match pkg.local_source.as_ref() {
+            Some(LocalSource::Git(git)) => Some(git.clone()),
+            _ => hosted_git,
+        };
+        let entry = if let Some(git) = git_source.as_ref() {
             // bun's git tuple: `[ident, {meta}, "<owner>-<repo>-<commit>",
             // integrity]` — no registry-URL slot, and the repo-tag string
             // (bun's cache key) is required: bun 1.3.14 rejects a frozen
