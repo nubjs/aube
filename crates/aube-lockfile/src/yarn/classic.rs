@@ -154,11 +154,96 @@ pub(super) fn parse_classic_str(
     let mut importers = BTreeMap::new();
     importers.insert(".".to_string(), direct);
 
+    // A yarn v1 yarn.lock is a flat resolution list with NO workspace /
+    // importer structure — workspace membership lives only in the root
+    // package.json `workspaces` globs plus the on-disk member
+    // package.json files. Without reconstructing the members here, a
+    // yarn-source workspace converts to a single lone `.` importer and
+    // the target PM frozen-rejects (pnpm ERR_PNPM_OUTDATED_LOCKFILE on a
+    // child package.json, npm "Missing" members, bun "lockfile had
+    // changes"). Discover each member from the globs + disk and build
+    // its importer, cross-referencing its declared ranges against the
+    // flat resolution list the same way the root importer is built.
+    if let Some(workspaces) = &manifest.workspaces {
+        let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        for member_dir in discover_workspace_members(project_dir, workspaces.patterns()) {
+            let member_pj_path = project_dir.join(&member_dir).join("package.json");
+            let Ok(member_pj) = aube_manifest::PackageJson::from_path(&member_pj_path) else {
+                continue;
+            };
+            let mut member_direct: Vec<DirectDep> = Vec::new();
+            let mut push_member = |name: &str, range: &str, dep_type: DepType| {
+                let spec = format!("{name}@{range}");
+                if let Some(dep_path) = spec_to_dep_path.get(&spec) {
+                    member_direct.push(DirectDep {
+                        name: name.to_string(),
+                        dep_path: dep_path.clone(),
+                        dep_type,
+                        specifier: Some(range.to_string()),
+                    });
+                }
+            };
+            for (name, range) in &member_pj.dependencies {
+                push_member(name, range, DepType::Production);
+            }
+            for (name, range) in &member_pj.dev_dependencies {
+                push_member(name, range, DepType::Dev);
+            }
+            for (name, range) in &member_pj.optional_dependencies {
+                push_member(name, range, DepType::Optional);
+            }
+            importers.insert(member_dir, member_direct);
+        }
+    }
+
     Ok(LockfileGraph {
         importers,
         packages,
         ..Default::default()
     })
+}
+
+/// Expand the root manifest's `workspaces` globs against the on-disk
+/// tree, returning each member's project-relative directory (POSIX
+/// `/`-separated, the importer-key form) that contains a `package.json`.
+/// Mirrors npm/yarn-classic workspace globbing: a `packages/*` pattern
+/// matches direct child directories; an explicit `packages/app` matches
+/// that one directory.
+fn discover_workspace_members(project_dir: &Path, patterns: &[String]) -> Vec<String> {
+    let mut members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for pattern in patterns {
+        // Negation patterns (`!packages/excluded`) and the root itself
+        // aren't member sources here.
+        if pattern.starts_with('!') || pattern == "." {
+            continue;
+        }
+        let glob_pat = project_dir.join(pattern);
+        let Some(glob_str) = glob_pat.to_str() else {
+            continue;
+        };
+        let Ok(paths) = glob::glob(glob_str) else {
+            continue;
+        };
+        for entry in paths.flatten() {
+            if !entry.is_dir() || !entry.join("package.json").is_file() {
+                continue;
+            }
+            let Ok(rel) = entry.strip_prefix(project_dir) else {
+                continue;
+            };
+            // Importer keys are POSIX-relative (`packages/app`), never
+            // the host's `\`-separated form.
+            let rel_posix = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if !rel_posix.is_empty() {
+                members.insert(rel_posix);
+            }
+        }
+    }
+    members.into_iter().collect()
 }
 
 #[derive(Debug)]

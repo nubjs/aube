@@ -4706,3 +4706,90 @@ fn runtime_pin_drift_detection() {
         DriftStatus::Fresh
     );
 }
+
+/// Converting an npm workspace to pnpm must NOT fabricate workspace-member
+/// `link:` deps on the empty root importer. npm symlinks every member into
+/// the root `node_modules/` and the npm reader surfaces those as root deps
+/// (so the linker recreates the symlinks), but pnpm writes `.: {}` for an
+/// empty root — members are importers, not deps of the root. Emitting the
+/// phantom links made the converted lockfile's root specifiers diverge from
+/// the root package.json, so pnpm frozen-rejects with
+/// ERR_PNPM_OUTDATED_LOCKFILE. Regression guard for the npm→pnpm leg of
+/// `tests/conversion/run.sh` (empty-root-importer).
+#[test]
+fn npm_to_pnpm_conversion_omits_phantom_member_links_on_empty_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // Member package.json files on disk — the pnpm writer reads them to
+    // map `name@version` back to the member directory.
+    std::fs::create_dir_all(root.join("packages/pkg-a")).unwrap();
+    std::fs::create_dir_all(root.join("packages/pkg-b")).unwrap();
+    std::fs::write(
+        root.join("packages/pkg-a/package.json"),
+        r#"{ "name": "@empty/pkg-a", "version": "1.0.0", "dependencies": { "ms": "^2.1.3" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/pkg-b/package.json"),
+        r#"{ "name": "@empty/pkg-b", "version": "1.0.0", "dependencies": { "kleur": "^4.1.5" } }"#,
+    )
+    .unwrap();
+
+    // The exact package-lock.json real npm writes for this workspace:
+    // the members appear as `node_modules/<name>: { link: true }` root
+    // symlinks plus their `packages/<dir>` importer entries.
+    let npm_lock = r#"{
+  "name": "wsroot",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "wsroot", "version": "1.0.0", "workspaces": ["packages/*"] },
+    "node_modules/@empty/pkg-a": { "resolved": "packages/pkg-a", "link": true },
+    "node_modules/@empty/pkg-b": { "resolved": "packages/pkg-b", "link": true },
+    "node_modules/kleur": {
+      "version": "4.1.5",
+      "resolved": "https://registry.npmjs.org/kleur/-/kleur-4.1.5.tgz",
+      "integrity": "sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ=="
+    },
+    "node_modules/ms": {
+      "version": "2.1.3",
+      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA=="
+    },
+    "packages/pkg-a": { "name": "@empty/pkg-a", "version": "1.0.0", "dependencies": { "ms": "^2.1.3" } },
+    "packages/pkg-b": { "name": "@empty/pkg-b", "version": "1.0.0", "dependencies": { "kleur": "^4.1.5" } }
+  }
+}"#;
+    let npm_path = root.join("package-lock.json");
+    std::fs::write(&npm_path, npm_lock).unwrap();
+
+    let graph = crate::npm::parse(&npm_path).unwrap();
+
+    // Root manifest declares NO deps (empty root importer).
+    let manifest = PackageJson {
+        name: Some("wsroot".to_string()),
+        version: Some("1.0.0".to_string()),
+        workspaces: Some(aube_manifest::Workspaces::Array(vec!["packages/*".to_string()])),
+        ..PackageJson::default()
+    };
+
+    let out_path = root.join("pnpm-lock.yaml");
+    write(&out_path, &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(&out_path).unwrap();
+
+    // The root importer must be empty — no phantom member `link:` deps.
+    assert!(
+        !written.contains("link:packages/pkg-a") && !written.contains("link:packages/pkg-b"),
+        "root importer must not carry phantom workspace-member link: deps:\n{written}"
+    );
+    assert!(
+        written.contains("  .: {}"),
+        "empty root importer must render as `.: {{}}`:\n{written}"
+    );
+    // The members are still their own importers with their child deps.
+    assert!(
+        written.contains("packages/pkg-a:") && written.contains("packages/pkg-b:"),
+        "member importers must still be emitted:\n{written}"
+    );
+}

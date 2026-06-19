@@ -138,6 +138,37 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             let workspace_link_dir = (!graph.packages.contains_key(&dep.dep_path))
                 .then(|| workspace_member_dirs.get(&dep.dep_path))
                 .flatten();
+            // npm symlinks every workspace member into the root
+            // `node_modules/` and the npm reader surfaces those links as
+            // direct deps of the `.` importer so the linker recreates the
+            // symlinks. But pnpm never records a workspace member as a
+            // `link:` dependency of the root unless the root manifest
+            // actually declares it — members are importers, not deps of
+            // the root. Emitting the phantom `link:` deps makes the root
+            // importer's specifiers diverge from the root package.json,
+            // so pnpm's frozen check rejects the converted lockfile with
+            // ERR_PNPM_OUTDATED_LOCKFILE. A member shows up two ways: as
+            // a `workspace_link_dir` match (no package entry) or, on the
+            // npm-reader path, as a `LocalSource::Link` package whose
+            // target directory is itself a sibling importer. Drop either
+            // form on the root unless the root manifest declares it.
+            let links_to_sibling_importer = graph
+                .packages
+                .get(&dep.dep_path)
+                .and_then(|p| p.local_source.as_ref())
+                .and_then(|src| match src {
+                    LocalSource::Link(target) => target.to_str(),
+                    _ => None,
+                })
+                .is_some_and(|target| graph.importers.contains_key(target));
+            if importer_path == "."
+                && (workspace_link_dir.is_some() || links_to_sibling_importer)
+                && !manifest.dependencies.contains_key(&dep.name)
+                && !manifest.dev_dependencies.contains_key(&dep.name)
+                && !manifest.optional_dependencies.contains_key(&dep.name)
+            {
+                continue;
+            }
             if exclude_links
                 && (workspace_link_dir.is_some()
                     || matches!(
