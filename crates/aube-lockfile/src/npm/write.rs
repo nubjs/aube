@@ -282,30 +282,78 @@ pub fn write(
     // `Missing: <name>@<version> from lock file`. Emit the pair here.
     emit_file_dep_links(graph, &roots, ".", &mut packages);
 
+    // Resolve each workspace member's identity (name/version/peers).
+    // A `LocalSource::Link` package exists only when the graph was
+    // *read* from an npm lockfile (the reader synthesizes it from the
+    // `node_modules/<name>: {link:true}` pair). On a fresh resolve from
+    // package.json there is no such package, so recover the member's
+    // name/version/peers from its own `package.json` on disk — the same
+    // best-effort disk read the pnpm and bun writers use. Without this
+    // fallback every member importer + its child deps were dropped and
+    // `npm ci` rejected the lockfile with `Missing: <member> from lock
+    // file`.
+    // Pre-read every member's `package.json` once, up front, so the
+    // borrowed name/version/peer strings live as long as `packages`
+    // (the `WriteNpmPackage` arena borrows them). Only read for importers
+    // without a `LocalSource::Link` package — i.e. a fresh resolve.
+    let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let member_manifests: BTreeMap<&str, aube_manifest::PackageJson> = graph
+        .importers
+        .keys()
+        .filter(|p| p.as_str() != ".")
+        .filter(|p| workspace_package_for_importer(graph, p).is_none())
+        .map(|p| {
+            let m = aube_manifest::PackageJson::from_path(
+                &project_dir.join(p).join("package.json"),
+            )
+            .unwrap_or_default();
+            (p.as_str(), m)
+        })
+        .collect();
     for (importer_path, importer_roots) in graph.importers.iter().filter(|(path, _)| *path != ".") {
-        let Some(workspace_pkg) = workspace_package_for_importer(graph, importer_path) else {
+        let linked = workspace_package_for_importer(graph, importer_path);
+        let disk_manifest = member_manifests.get(importer_path.as_str());
+        let member_name = linked
+            .map(|p| p.name.as_str())
+            .or(disk_manifest.and_then(|m| m.name.as_deref()));
+        let Some(member_name) = member_name else {
+            // No identity anywhere (no link package, no/anonymous
+            // manifest on disk) — can't emit a coherent member entry.
             continue;
         };
+        let member_version = linked
+            .map(|p| p.version.as_str())
+            .or(disk_manifest.and_then(|m| m.version.as_deref()));
+        let peer_dependencies: BTreeMap<&str, &str> = match (linked, disk_manifest) {
+            (Some(p), _) => p
+                .peer_dependencies
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect(),
+            (None, Some(m)) => m
+                .peer_dependencies
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect(),
+            (None, None) => BTreeMap::new(),
+        };
+
         let (dependencies, dev_dependencies, optional_dependencies) =
             dep_sections_from_direct_deps(importer_roots);
         packages.insert(
             importer_path.clone(),
             WriteNpmPackage {
-                name: Some(workspace_pkg.name.as_str()),
-                version: Some(workspace_pkg.version.as_str()),
+                name: Some(member_name),
+                version: member_version,
                 dependencies,
                 dev_dependencies,
                 optional_dependencies,
-                peer_dependencies: workspace_pkg
-                    .peer_dependencies
-                    .iter()
-                    .map(|(n, v)| (n.as_str(), v.as_str()))
-                    .collect(),
+                peer_dependencies,
                 ..Default::default()
             },
         );
         packages.insert(
-            format!("node_modules/{}", workspace_pkg.name),
+            format!("node_modules/{member_name}"),
             WriteNpmPackage {
                 resolved: Some(importer_path.clone()),
                 link: true,

@@ -2393,3 +2393,118 @@ fn test_parse_license_all_shapes() {
     );
     assert!(graph.packages["no-license@1.0.0"].license.is_none());
 }
+
+/// A multi-member `workspaces` monorepo resolved fresh from package.json
+/// (no source lockfile, so the graph carries NO `LocalSource::Link`
+/// member packages) must still round-trip through the npm writer with
+/// every member importer, its `node_modules/<member>` link record, and
+/// its child dependency entries present. The prior writer keyed member
+/// identity solely off a reader-synthesized `LocalSource::Link` package,
+/// so on a fresh resolve it dropped every member + child dep and
+/// `npm ci` rejected the lockfile with `Missing: <member> from lock
+/// file`. The writer now recovers member name/version from each member's
+/// `package.json` on disk, the same way the pnpm/bun writers do.
+#[test]
+fn test_write_emits_workspace_members_on_fresh_resolve() {
+    let proj = tempfile::tempdir().unwrap();
+    // Member manifests on disk — the only place a fresh resolve carries
+    // the members' name/version (no LocalSource::Link in the graph).
+    for (dir, name, dep) in [
+        ("packages/pkg-a", "@dedup/pkg-a", ("lodash", "^3.10.1")),
+        ("packages/pkg-b", "@dedup/pkg-b", ("lodash", "^4.17.0")),
+    ] {
+        let d = proj.path().join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("package.json"),
+            format!(
+                r#"{{"name":"{name}","version":"1.0.0","dependencies":{{"{}":"{}"}}}}"#,
+                dep.0, dep.1
+            ),
+        )
+        .unwrap();
+    }
+
+    let mut graph = LockfileGraph::default();
+    // Two registry child versions (the dedup case): lodash 3 + 4.
+    for (ver, integ) in [("3.10.1", "sha512-three"), ("4.18.1", "sha512-four")] {
+        let dep_path = format!("lodash@{ver}");
+        graph.packages.insert(
+            dep_path.clone(),
+            LockedPackage {
+                name: "lodash".to_string(),
+                version: ver.to_string(),
+                dep_path,
+                integrity: Some(integ.to_string()),
+                tarball_url: Some(format!(
+                    "https://registry.npmjs.org/lodash/-/lodash-{ver}.tgz"
+                )),
+                ..Default::default()
+            },
+        );
+    }
+    // Root importer: no deps. Member importers: their lodash dep, each
+    // pointing at the matching registry version (dedup).
+    graph.importers.insert(".".to_string(), Vec::new());
+    graph.importers.insert(
+        "packages/pkg-a".to_string(),
+        vec![DirectDep {
+            name: "lodash".to_string(),
+            dep_path: "lodash@3.10.1".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^3.10.1".to_string()),
+        }],
+    );
+    graph.importers.insert(
+        "packages/pkg-b".to_string(),
+        vec![DirectDep {
+            name: "lodash".to_string(),
+            dep_path: "lodash@4.18.1".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^4.17.0".to_string()),
+        }],
+    );
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("conform-workspace-dedup".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    let out = proj.path().join("package-lock.json");
+    write(&out, &graph, &manifest).unwrap();
+
+    let body = std::fs::read_to_string(&out).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let packages = &doc["packages"];
+
+    // Member importer entries carry name/version + their own deps.
+    assert_eq!(packages["packages/pkg-a"]["name"], "@dedup/pkg-a");
+    assert_eq!(packages["packages/pkg-a"]["version"], "1.0.0");
+    assert_eq!(packages["packages/pkg-a"]["dependencies"]["lodash"], "^3.10.1");
+    assert_eq!(packages["packages/pkg-b"]["name"], "@dedup/pkg-b");
+    assert_eq!(packages["packages/pkg-b"]["dependencies"]["lodash"], "^4.17.0");
+
+    // Root node_modules symlink record for each member.
+    assert_eq!(packages["node_modules/@dedup/pkg-a"]["link"], true);
+    assert_eq!(packages["node_modules/@dedup/pkg-a"]["resolved"], "packages/pkg-a");
+    assert_eq!(packages["node_modules/@dedup/pkg-b"]["link"], true);
+    assert_eq!(packages["node_modules/@dedup/pkg-b"]["resolved"], "packages/pkg-b");
+
+    // Both deduped child versions land as nested package entries under
+    // their owning member — npm ci rejects the lockfile if either is
+    // absent.
+    assert_eq!(
+        packages["packages/pkg-a/node_modules/lodash"]["version"],
+        "3.10.1"
+    );
+    assert_eq!(
+        packages["packages/pkg-b/node_modules/lodash"]["version"],
+        "4.18.1"
+    );
+
+    // Re-parsing the writer's output must recover all three importers,
+    // proving the write→read round-trip is whole.
+    let reparsed = parse(&out).unwrap();
+    assert!(reparsed.importers.contains_key("packages/pkg-a"));
+    assert!(reparsed.importers.contains_key("packages/pkg-b"));
+}
