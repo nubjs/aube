@@ -719,6 +719,14 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 license: None,
                 funding_url: None,
                 extra_meta,
+                // npm-specific verbatim flags — a pnpm lockfile doesn't
+                // record them on the package entry (pnpm keeps
+                // `deprecated` in `extra_meta` and derives the rest), so
+                // they stay at their defaults on a pnpm parse.
+                has_install_script: false,
+                has_shrinkwrap: false,
+                in_bundle: false,
+                deprecated: None,
             },
         );
     }

@@ -222,6 +222,11 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 bin: package_entry.bin.clone(),
                 license: package_entry.license.as_ref().and_then(|l| l.value.clone()),
                 funding_url: package_entry.funding.as_ref().and_then(|f| f.url.clone()),
+                has_install_script: package_entry.has_install_script,
+                has_shrinkwrap: package_entry.has_shrinkwrap,
+                in_bundle: package_entry.in_bundle,
+                deprecated: package_entry.deprecated.clone(),
+                bundled_dependencies: package_entry.bundle_dependencies.clone(),
                 ..Default::default()
             },
         );

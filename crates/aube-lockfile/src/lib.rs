@@ -474,12 +474,28 @@ pub struct LockedPackage {
     pub transitive_peer_dependencies: Vec<String>,
     /// Per-package-meta extras preserved verbatim from the source
     /// lockfile. Captures fields the typed model doesn't yet cover
-    /// (`deprecated`, `hasInstallScript`, bun's `optionalPeers`, and
-    /// anything a future lockfile bump adds) so a parse/write cycle
-    /// doesn't drop them. Each format's writer re-emits what makes
-    /// sense there — bun inlines the extras back on the package-entry
-    /// meta object, pnpm / yarn / npm currently ignore them.
+    /// (bun's `optionalPeers` and anything a future lockfile bump
+    /// adds) so a parse/write cycle doesn't drop them. Each format's
+    /// writer re-emits what makes sense there — bun inlines the extras
+    /// back on the package-entry meta object, pnpm / yarn / npm
+    /// currently ignore them.
     pub extra_meta: BTreeMap<String, serde_json::Value>,
+    /// npm `hasInstallScript: true` — set when the package declares an
+    /// install / preinstall / postinstall script. npm writes it on
+    /// every such entry; round-tripped verbatim so a parse → re-emit
+    /// cycle keeps it. `false` outside the npm parse/write path (other
+    /// formats don't record it).
+    pub has_install_script: bool,
+    /// npm `hasShrinkwrap: true` — set when the package ships its own
+    /// `npm-shrinkwrap.json`. Verbatim round-trip; `false` elsewhere.
+    pub has_shrinkwrap: bool,
+    /// npm `inBundle: true` — set when the package ships inside another
+    /// package's tarball. Verbatim round-trip; `false` elsewhere.
+    pub in_bundle: bool,
+    /// npm `deprecated: "<message>"` — the registry's deprecation
+    /// message, copied onto the lock so a later install can warn
+    /// offline. Verbatim round-trip; `None` elsewhere.
+    pub deprecated: Option<String>,
 }
 
 impl LockedPackage {
@@ -562,6 +578,10 @@ mod locked_package_tests {
             optional: false,
             transitive_peer_dependencies: Vec::new(),
             extra_meta: BTreeMap::new(),
+            has_install_script: false,
+            has_shrinkwrap: false,
+            in_bundle: false,
+            deprecated: None,
         }
     }
 
@@ -842,6 +862,26 @@ impl LockfileGraph {
             // already carry its own. `self`-side keys always win.
             for (k, v) in &prior_pkg.extra_meta {
                 pkg.extra_meta.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            // npm's per-entry verbatim flags aren't repopulated by a
+            // fresh corgi resolve (they come from the package's own
+            // manifest / the registry's packument flag), so carry them
+            // forward to keep the round-trip stable. `self`-side values
+            // win when already set.
+            if !pkg.has_install_script && prior_pkg.has_install_script {
+                pkg.has_install_script = true;
+            }
+            if !pkg.has_shrinkwrap && prior_pkg.has_shrinkwrap {
+                pkg.has_shrinkwrap = true;
+            }
+            if !pkg.in_bundle && prior_pkg.in_bundle {
+                pkg.in_bundle = true;
+            }
+            if pkg.deprecated.is_none() && prior_pkg.deprecated.is_some() {
+                pkg.deprecated = prior_pkg.deprecated.clone();
+            }
+            if pkg.bundled_dependencies.is_empty() && !prior_pkg.bundled_dependencies.is_empty() {
+                pkg.bundled_dependencies = prior_pkg.bundled_dependencies.clone();
             }
         }
         if self.bun_config_version.is_none() {

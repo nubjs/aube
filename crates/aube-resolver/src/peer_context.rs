@@ -1480,6 +1480,10 @@ pub(crate) fn dedupe_peer_suffixes(graph: LockfileGraph) -> LockfileGraph {
                 license: pkg.license,
                 funding_url: pkg.funding_url,
                 extra_meta: pkg.extra_meta,
+                has_install_script: pkg.has_install_script,
+                has_shrinkwrap: pkg.has_shrinkwrap,
+                in_bundle: pkg.in_bundle,
+                deprecated: pkg.deprecated,
             },
         );
     }
@@ -1940,6 +1944,10 @@ fn visit_peer_context<'g>(
             license: pkg.license.clone(),
             funding_url: pkg.funding_url.clone(),
             extra_meta: pkg.extra_meta.clone(),
+            has_install_script: pkg.has_install_script,
+            has_shrinkwrap: pkg.has_shrinkwrap,
+            in_bundle: pkg.in_bundle,
+            deprecated: pkg.deprecated.clone(),
         },
     );
     Some(contextualized)

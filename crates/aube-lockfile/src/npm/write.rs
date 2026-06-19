@@ -61,6 +61,22 @@ struct WriteNpmPackage<'a> {
     link: bool,
     dev: bool,
     optional: bool,
+    /// npm `bundleDependencies: ["name", …]` — a JSON array, so it
+    /// sorts with the non-object scalars (at `b`, before `cpu`).
+    /// Round-trip fidelity for packages declaring bundled deps.
+    bundle_dependencies: Vec<&'a str>,
+    /// npm `deprecated: "<message>"` — the registry deprecation message.
+    deprecated: Option<&'a str>,
+    /// npm `hasInstallScript: true` — present iff the package has an
+    /// install/preinstall/postinstall script. npm only writes it when
+    /// `true`, so the writer skips it when `false`.
+    has_install_script: bool,
+    /// npm `hasShrinkwrap: true` — present iff the package ships its own
+    /// `npm-shrinkwrap.json`.
+    has_shrinkwrap: bool,
+    /// npm `inBundle: true` — present iff the package ships inside
+    /// another package's tarball.
+    in_bundle: bool,
     /// npm v3 collapses the "reachable via dev *and* via optional,
     /// but never via production" case into a single `devOptional`
     /// flag. Emitting both `dev: true` and `optional: true` instead
@@ -97,15 +113,36 @@ impl Serialize for WriteNpmPackage<'_> {
             map.serialize_entry("integrity", v)?;
         }
         // remaining non-object keys, alphabetical:
-        // cpu, dev, devOptional, libc, license, link, optional, os
+        // bundleDependencies, cpu, deprecated, dev, devOptional,
+        // hasInstallScript, hasShrinkwrap, inBundle, libc, license,
+        // link, optional, os
+        //
+        // `bundleDependencies` is a JSON array, so `json-stringify-nice`
+        // treats it as a non-object and sorts it with the scalars (at
+        // `b`, ahead of `cpu`).
+        if !self.bundle_dependencies.is_empty() {
+            map.serialize_entry("bundleDependencies", &self.bundle_dependencies)?;
+        }
         if !self.cpu.is_empty() {
             map.serialize_entry("cpu", &self.cpu)?;
+        }
+        if let Some(v) = self.deprecated {
+            map.serialize_entry("deprecated", v)?;
         }
         if self.dev {
             map.serialize_entry("dev", &true)?;
         }
         if self.dev_optional {
             map.serialize_entry("devOptional", &true)?;
+        }
+        if self.has_install_script {
+            map.serialize_entry("hasInstallScript", &true)?;
+        }
+        if self.has_shrinkwrap {
+            map.serialize_entry("hasShrinkwrap", &true)?;
+        }
+        if self.in_bundle {
+            map.serialize_entry("inBundle", &true)?;
         }
         if !self.libc.is_empty() {
             map.serialize_entry("libc", &self.libc)?;
@@ -545,6 +582,15 @@ pub fn write(
                 dev,
                 optional,
                 dev_optional,
+                bundle_dependencies: pkg
+                    .bundled_dependencies
+                    .iter()
+                    .map(String::as_str)
+                    .collect(),
+                deprecated: pkg.deprecated.as_deref(),
+                has_install_script: pkg.has_install_script,
+                has_shrinkwrap: pkg.has_shrinkwrap,
+                in_bundle: pkg.in_bundle,
                 ..Default::default()
             },
         );

@@ -2508,3 +2508,106 @@ fn test_write_emits_workspace_members_on_fresh_resolve() {
     assert!(reparsed.importers.contains_key("packages/pkg-a"));
     assert!(reparsed.importers.contains_key("packages/pkg-b"));
 }
+
+/// `hasInstallScript`, `hasShrinkwrap`, `inBundle`, `deprecated`, and
+/// `bundleDependencies` are npm's canonical per-package verbatim keys.
+/// npm writes them on every matching entry; before this fix the reader
+/// dropped them and the writer never re-emitted them, so each
+/// `nub`-mediated rewrite of a real npm lockfile produced a spurious
+/// diff on exactly the security-relevant packages (native addons carry
+/// `hasInstallScript`). This guards the read → graph → write → re-read
+/// round-trip for all five, plus npm's exact key *placement*
+/// (`json-stringify-nice`'s type-then-alpha order).
+#[test]
+fn test_roundtrip_preserves_npm_verbatim_meta_fields() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    // `node_modules/native-addon` carries every field; `inner` is its
+    // bundled child (`inBundle: true`). Field values pulled from a real
+    // npm 11.x lockfile shape.
+    let content = r#"{
+        "name": "test",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "test",
+                "version": "1.0.0",
+                "dependencies": { "native-addon": "^1.0.0" }
+            },
+            "node_modules/native-addon": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/native-addon/-/native-addon-1.0.0.tgz",
+                "integrity": "sha512-aaa",
+                "hasInstallScript": true,
+                "hasShrinkwrap": true,
+                "deprecated": "use native-addon@2 instead",
+                "bundleDependencies": ["inner"],
+                "dependencies": { "inner": "2.0.0" }
+            },
+            "node_modules/native-addon/node_modules/inner": {
+                "version": "2.0.0",
+                "integrity": "sha512-bbb",
+                "inBundle": true
+            }
+        }
+    }"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let graph = parse(tmp.path()).unwrap();
+    let addon = &graph.packages["native-addon@1.0.0"];
+    assert!(addon.has_install_script, "hasInstallScript should parse");
+    assert!(addon.has_shrinkwrap, "hasShrinkwrap should parse");
+    assert_eq!(
+        addon.deprecated.as_deref(),
+        Some("use native-addon@2 instead"),
+    );
+    assert_eq!(addon.bundled_dependencies, vec!["inner".to_string()]);
+    let inner = &graph.packages["inner@2.0.0"];
+    assert!(inner.in_bundle, "inBundle should parse");
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("test".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: [("native-addon".to_string(), "^1.0.0".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let body = std::fs::read_to_string(out.path()).unwrap();
+
+    // Fields re-emitted at all.
+    assert!(body.contains("\"hasInstallScript\": true"), "got:\n{body}");
+    assert!(body.contains("\"hasShrinkwrap\": true"), "got:\n{body}");
+    assert!(body.contains("\"inBundle\": true"), "got:\n{body}");
+    assert!(
+        body.contains("\"deprecated\": \"use native-addon@2 instead\""),
+        "got:\n{body}"
+    );
+    assert!(body.contains("\"bundleDependencies\""), "got:\n{body}");
+    assert!(body.contains("\"inner\""), "got:\n{body}");
+
+    // npm's `json-stringify-nice` ordering: `bundleDependencies` (an
+    // array → non-object) sorts at `b` ahead of `integrity`'s scalar
+    // group; `deprecated` follows `integrity`; the `hasInstallScript` /
+    // `hasShrinkwrap` bools sort after `integrity` and before
+    // `dependencies` (the only object key). Assert relative placement so
+    // a future reorder can't silently produce churn vs npm.
+    let pos = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle}\n{body}"));
+    assert!(pos("\"bundleDependencies\"") < pos("\"deprecated\""));
+    assert!(pos("\"deprecated\"") < pos("\"hasInstallScript\""));
+    assert!(pos("\"hasInstallScript\"") < pos("\"hasShrinkwrap\""));
+    // Object key `dependencies` comes after all the scalars.
+    assert!(pos("\"hasShrinkwrap\"") < body.rfind("\"dependencies\"").unwrap());
+
+    // Re-parse: every field survives a full cycle.
+    let reparsed = parse(out.path()).unwrap();
+    let addon2 = &reparsed.packages["native-addon@1.0.0"];
+    assert!(addon2.has_install_script);
+    assert!(addon2.has_shrinkwrap);
+    assert_eq!(addon2.deprecated.as_deref(), Some("use native-addon@2 instead"));
+    assert_eq!(addon2.bundled_dependencies, vec!["inner".to_string()]);
+    assert!(reparsed.packages["inner@2.0.0"].in_bundle);
+}

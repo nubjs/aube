@@ -84,6 +84,41 @@ pub(super) struct RawNpmPackage {
     pub(super) license: Option<RawNpmLicense>,
     #[serde(default)]
     pub(super) funding: Option<RawNpmFunding>,
+    /// npm writes `hasInstallScript: true` on every package whose
+    /// manifest declares an `install` / `preinstall` / `postinstall`
+    /// script (or whose registry packument carried the flag). Captured
+    /// verbatim so a parse → re-emit cycle doesn't drop it. npm only
+    /// ever writes the field when `true`, so a missing key reads as
+    /// `false` and the writer skips it — matching npm exactly.
+    #[serde(default)]
+    pub(super) has_install_script: bool,
+    /// npm writes `hasShrinkwrap: true` on a package that ships its own
+    /// `npm-shrinkwrap.json`. Rare in modern packages but part of npm's
+    /// canonical per-package key set; preserved verbatim for round-trip.
+    #[serde(default)]
+    pub(super) has_shrinkwrap: bool,
+    /// npm writes `inBundle: true` on a package that ships *inside*
+    /// another package's tarball (its parent's `bundleDependencies`).
+    /// npm records it so the installer doesn't try to fetch the entry
+    /// from the registry. Preserved verbatim; the install path keys off
+    /// the parent's `bundled_dependencies`, so this is round-trip
+    /// fidelity only.
+    #[serde(default)]
+    pub(super) in_bundle: bool,
+    /// npm copies the registry's deprecation message onto the locked
+    /// entry (`deprecated: "<message>"`) so a later install can warn
+    /// without re-hitting the registry. Verbatim round-trip.
+    #[serde(default)]
+    pub(super) deprecated: Option<String>,
+    /// npm writes `bundleDependencies: ["name", …]` on a package that
+    /// declares bundled deps. Already parsed at the manifest layer, but
+    /// the lockfile reader needs to capture it too so a parse → re-emit
+    /// cycle preserves the field on the package entry. npm tolerates the
+    /// legacy `bundledDependencies` spelling on read; it always writes
+    /// the `bundleDependencies` spelling, so we normalize to that on
+    /// emit.
+    #[serde(default, alias = "bundledDependencies")]
+    pub(super) bundle_dependencies: Vec<String>,
 }
 
 /// npm's `license:` field on a package entry. Modern npm writes the

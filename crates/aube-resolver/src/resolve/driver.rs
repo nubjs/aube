@@ -1223,6 +1223,19 @@ impl<'a> ResolveDriver<'a> {
                         )])
                     })
                     .unwrap_or_default(),
+                // npm's typed per-entry verbatim flags. `has_install_script`
+                // and `deprecated` come straight off the packument so a
+                // fresh resolve (no prior lockfile) still emits npm's
+                // exact `package-lock.json` shape — closing the round-trip
+                // churn the survey caught on every `nub add`. `inBundle`
+                // and `hasShrinkwrap` aren't recoverable from a packument
+                // (they're placement / tarball-shipped properties), so they
+                // default to false here and survive only when carried in
+                // from a parsed npm lockfile.
+                has_install_script: version_meta.has_install_script,
+                has_shrinkwrap: false,
+                in_bundle: false,
+                deprecated: version_meta.deprecated.clone(),
             },
         );
 
@@ -2131,6 +2144,10 @@ impl<'a> ResolveDriver<'a> {
                     license: locked_pkg.license.clone(),
                     funding_url: locked_pkg.funding_url.clone(),
                     extra_meta: locked_pkg.extra_meta.clone(),
+                    has_install_script: locked_pkg.has_install_script,
+                    has_shrinkwrap: locked_pkg.has_shrinkwrap,
+                    in_bundle: locked_pkg.in_bundle,
+                    deprecated: locked_pkg.deprecated.clone(),
                 },
             );
 
