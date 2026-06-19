@@ -21,20 +21,19 @@ impl Linker {
     /// falls back to `fs::copy` per file silently, thousands of
     /// wasted syscalls, user thinks they got hardlinks.
     ///
-    /// Returns the best available zero-/low-cost strategy: `Reflink`
-    /// when the filesystem supports copy-on-write clones (APFS
-    /// clonefile, btrfs/xfs FICLONE), else `Hardlink` when same-mount
-    /// hard links work, else `Copy`. `auto` prefers reflink because a
-    /// clone is measurably cheaper than a hard link on every CoW
-    /// filesystem we benchmark — APFS clonefile runs ~2.5x faster than
-    /// `hard_link` on node_modules' small-file profile (the dominant
-    /// case), and reflinked files also get independent inodes so a
-    /// later in-place patch can't corrupt the shared store entry.
-    /// Mirrors pnpm's `auto` importer, which probes clone first and
-    /// only falls back to hardlink (`fs/indexed-pkg-importer`). The
-    /// exception is Windows, where reflink (ReFS Dev Drive) is ~10x
-    /// slower than the default path, so the probe keeps hardlink-first
-    /// there.
+    /// Returns the OS-specific same-filesystem strategy when same-mount
+    /// links work, else `Copy`. The same-FS strategy `auto` resolves to
+    /// is OS-split by measured link-phase cost: `Reflink` on macOS,
+    /// where APFS clonefile runs ~1.91x faster than `hard_link` on
+    /// node_modules' small-file profile (and reflinked files get
+    /// independent inodes so a later in-place patch can't corrupt the
+    /// shared store entry), and `Hardlink` on Linux and other targets,
+    /// where btrfs/xfs hardlink runs ~2.4-2.6x faster than FICLONE
+    /// reflink. Windows stays `Hardlink` too — reflink there means ReFS
+    /// Dev Drive, ~10x slower than the default path. A same-mount
+    /// hardlink probe detects same-FS (APFS clonefile / btrfs FICLONE
+    /// also require the same FS); on macOS the resolved `Reflink` keeps
+    /// its own graceful copy fallback when the FS lacks CoW support.
     pub fn detect_strategy(path: &Path) -> LinkStrategy {
         Self::detect_strategy_cross(path, path)
     }
@@ -42,11 +41,21 @@ impl Linker {
     /// Two-arg probe. src is the store shard (or any dir on the
     /// store FS), dst is the project modules dir (or any dir on the
     /// destination FS). The probe creates a real cross-mount src file
-    /// and, on non-Windows, first tries to reflink it into dst (CoW
-    /// clone); on success it returns `Reflink`. Otherwise it tries a
-    /// hardlink, which also catches EXDEV up front, and returns
-    /// `Hardlink` on success or `Copy` when neither works.
+    /// and tries to hardlink it into dst, which catches EXDEV up front
+    /// and doubles as the same-FS detector (reflink targets require the
+    /// same FS too). On success it returns the OS-specific same-FS
+    /// strategy (`Reflink` on macOS, `Hardlink` elsewhere), `Copy` when
+    /// the link fails.
     pub fn detect_strategy_cross(src_dir: &Path, dst_dir: &Path) -> LinkStrategy {
+        // Same-FS strategy `auto` resolves to once the hardlink probe
+        // proves src and dst share a mount. macOS/APFS clonefile is
+        // measurably faster than hardlink there; Linux btrfs/xfs (and
+        // Windows) hardlink is measurably faster than reflink.
+        #[cfg(target_os = "macos")]
+        const SAME_FS_STRATEGY: LinkStrategy = LinkStrategy::Reflink;
+        #[cfg(not(target_os = "macos"))]
+        const SAME_FS_STRATEGY: LinkStrategy = LinkStrategy::Hardlink;
+
         // Memoize per (src_dir, dst_dir) for the process lifetime.
         // The probe writes a real test file and tries hardlink,
         // ~2 syscalls + 2 unlinks. Multiple Linker instances within
@@ -66,28 +75,14 @@ impl Linker {
         let test_dst = dst_dir.join(".aube-link-test-dst");
 
         let strategy = if std::fs::write(&test_src, b"test").is_ok() {
-            // Probe order mirrors pnpm's `auto`: prefer a copy-on-write
-            // reflink (cheapest on APFS/btrfs/xfs and store-safe), fall
-            // back to a same-mount hardlink, then to per-file copy.
-            // Windows keeps hardlink-first — reflink there means ReFS
-            // Dev Drive, which clones ~10x slower than the default path.
-            let probe_reflink = || {
-                // `reflink` refuses to overwrite, so clear any leftover
-                // dst from a prior probe before testing.
-                let _ = std::fs::remove_file(&test_dst);
-                reflink_copy::reflink(&test_src, &test_dst).is_ok()
-            };
-            let result = if !cfg!(windows) && probe_reflink() {
-                LinkStrategy::Reflink
+            // A successful same-mount hardlink proves src and dst share
+            // a filesystem, so it serves as the same-FS detector for the
+            // resolved strategy (clonefile/FICLONE require the same FS).
+            // On macOS that strategy is Reflink; elsewhere Hardlink.
+            let result = if std::fs::hard_link(&test_src, &test_dst).is_ok() {
+                SAME_FS_STRATEGY
             } else {
-                // A failed reflink probe can leave a partial dst; clear
-                // it so the hardlink attempt isn't an EEXIST false-negative.
-                let _ = std::fs::remove_file(&test_dst);
-                if std::fs::hard_link(&test_src, &test_dst).is_ok() {
-                    LinkStrategy::Hardlink
-                } else {
-                    LinkStrategy::Copy
-                }
+                LinkStrategy::Copy
             };
             let _ = std::fs::remove_file(&test_src);
             let _ = std::fs::remove_file(&test_dst);
@@ -101,8 +96,10 @@ impl Linker {
         // (src_dir, dst_dir) can race on the test files: one observes
         // hardlink-ok, the other sees the first writer's leftover and
         // falls back to Copy. `.insert()` would let the wrong Copy
-        // result clobber the correct Hardlink for the rest of the
-        // process; `or_insert` keeps whichever value landed first.
+        // result clobber the correct same-FS strategy for the rest of
+        // the process; `or_insert` keeps whichever value landed first.
+        // (The value at stake is the same-FS strategy — Reflink on
+        // macOS, Hardlink elsewhere — not literally Hardlink.)
         *cache
             .write()
             .expect("probe cache poisoned")

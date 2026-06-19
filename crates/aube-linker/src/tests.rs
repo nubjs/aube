@@ -92,16 +92,23 @@ fn make_graph() -> LockfileGraph {
 fn test_detect_strategy() {
     let dir = tempfile::tempdir().unwrap();
     let strategy = Linker::detect_strategy(dir.path());
-    // The probe returns whichever low-cost strategy the filesystem
-    // supports: `Reflink` on CoW filesystems (APFS/btrfs/xfs — the
-    // common dev-machine case), `Hardlink` on same-mount non-CoW
-    // filesystems (ext4/NTFS), or `Copy` as the last resort. All three
-    // are valid verdicts; the test just pins that probing succeeds and
-    // returns a real strategy rather than panicking. On Windows the
-    // probe never returns `Reflink` (hardlink-first there), but that's
-    // a tighter assertion than this cross-platform test needs.
+    // The probe resolves a same-FS hardlink success to the OS-specific
+    // `auto` strategy and a cross-FS failure to `Copy`. On macOS the
+    // same-FS strategy is `Reflink` (APFS clonefile); elsewhere
+    // `Hardlink`. Whether the tempdir's FS supports the same-mount link
+    // depends on the runner, so accept the OS's same-FS strategy or
+    // `Copy`, but reject the *other* OS's same-FS strategy — that would
+    // mean the cfg gate resolved on the wrong target.
     match strategy {
-        LinkStrategy::Reflink | LinkStrategy::Hardlink | LinkStrategy::Copy => {}
+        LinkStrategy::Copy => {}
+        #[cfg(target_os = "macos")]
+        LinkStrategy::Reflink => {}
+        #[cfg(target_os = "macos")]
+        LinkStrategy::Hardlink => panic!("macOS `auto` must resolve same-FS to Reflink"),
+        #[cfg(not(target_os = "macos"))]
+        LinkStrategy::Hardlink => {}
+        #[cfg(not(target_os = "macos"))]
+        LinkStrategy::Reflink => panic!("non-macOS `auto` must resolve same-FS to Hardlink"),
     }
 }
 
