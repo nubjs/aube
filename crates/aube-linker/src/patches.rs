@@ -192,11 +192,11 @@ pub(crate) fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result
         } else {
             String::new()
         };
-        // `+++ /dev/null` means the patch deletes the file. Skip diffy
-        // entirely — `diffy::apply` would otherwise produce an empty
-        // string and we'd write a zero-byte file in place of the
-        // original, leaving `require('./removed')` resolving to an
-        // empty module instead of the expected `MODULE_NOT_FOUND`.
+        // `+++ /dev/null` means the patch deletes the file. Skip the
+        // hunk applier entirely — emptying the file would write a
+        // zero-byte file in place of the original, leaving
+        // `require('./removed')` resolving to an empty module instead of
+        // the expected `MODULE_NOT_FOUND`.
         if section.is_deletion {
             if target.exists() {
                 std::fs::remove_file(&target)
@@ -206,19 +206,20 @@ pub(crate) fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result
         }
         // git-style patches always use LF line endings, but published
         // tarballs frequently ship files with CRLF (Windows editors,
-        // `core.autocrlf=true` checkouts). Diffy is byte-exact and
-        // refuses to match CRLF context against LF hunk lines, so we
+        // `core.autocrlf=true` checkouts). The hunk matcher's trailing-ws
+        // trim absorbs a lone `\r`, but to keep the WRITTEN bytes CRLF we
         // normalize the original to LF before applying and restore the
-        // CRLF on write. pnpm's patch applier does the same thing.
+        // CRLF on write. This CRLF wrapper is a deliberate improvement
+        // over raw pnpm, which has no CRLF awareness and would write LF.
         let was_crlf = original.contains("\r\n");
         let normalized = if was_crlf {
             original.replace("\r\n", "\n")
         } else {
             original
         };
-        let parsed = diffy::Patch::from_str(&section.body)
+        let hunks = parse_hunks(&section.body)
             .map_err(|e| format!("failed to parse patch for {rel}: {e}"))?;
-        let patched_lf = apply_with_eof_tolerance(&normalized, &parsed)
+        let patched_lf = apply_hunks(&normalized, &hunks)
             .map_err(|e| format!("failed to apply patch for {rel}: {e}"))?;
         let patched = if was_crlf {
             // Promote bare `\n` to `\r\n`, then collapse any `\r\r\n`
@@ -256,70 +257,309 @@ pub(crate) fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result
     Ok(())
 }
 
-/// Apply a single-file diff, tolerating a missing `\ No newline at end
-/// of file` marker on a final *context* line — the way pnpm and GNU
-/// `patch` do, but `git apply` (and a bare `diffy::apply`) do not.
+/// One contiguous run of like-typed lines inside a hunk — a block of
+/// context, a block of deletions, or a block of insertions. Mirrors
+/// pnpm's `PatchMutationPart` (`@pnpm/patch-package`'s `parse.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartType {
+    Context,
+    Deletion,
+    Insertion,
+}
+
+struct HunkPart {
+    kind: PartType,
+    lines: Vec<String>,
+    /// The `\ No newline at end of file` pragma followed this part, so
+    /// the part's last line is the file's EOF line and carries no
+    /// trailing newline.
+    no_newline_at_eof: bool,
+}
+
+struct Hunk {
+    /// 1-based original-file start line from the `@@ -start,len ...` header.
+    original_start: usize,
+    /// Original-file span length (the `len` in `-start,len`).
+    original_length: usize,
+    parts: Vec<HunkPart>,
+}
+
+/// Parse the single-file unified-diff body produced by
+/// `split_patch_sections` into a list of hunks, faithfully mirroring
+/// pnpm's `parsePatchLines` line classification: a leading `@` opens a
+/// hunk header, `-`/`+`/` ` are deletion/insertion/context, `\` is the
+/// no-newline pragma, and a blank / `\r`-only line is treated as
+/// **context** (pnpm's `hunkLinetypes` maps `undefined` and `"\r"` to
+/// context). The body's `--- `/`+++ ` header lines and any pre-hunk
+/// lines are skipped — the path + deletion handling already happened in
+/// `split_patch_sections`.
 ///
-/// pnpm's `pnpm patch` generates patches that omit the marker when a
-/// hunk's last line is the file's final line and that line has no
-/// trailing newline. Diffy is byte-exact: it parses the marker-less
-/// final context line as `\n`-terminated, so it fails to match the
-/// file's final line (which has none) and rejects the hunk
-/// (`error applying hunk #1`). A dependency patched with `pnpm patch`
-/// then installs under pnpm but not under aube/nub.
-///
-/// The fix mirrors GNU patch's tolerance precisely: when the strict
-/// apply fails, the original file has no trailing newline, and the
-/// patch's last hunk ends in a *context* line, retry against the file
-/// with a synthetic trailing newline so the EOF line matches, then
-/// strip that synthetic newline back off the result. The retry is
-/// gated on a context final line so we do NOT accept patches GNU patch
-/// itself rejects — a final *inserted* or *modified* line with a
-/// missing marker still fails (GNU patch rejects those too), and a
-/// genuinely non-applying patch still fails because the padded retry
-/// surfaces the original strict error.
-fn apply_with_eof_tolerance(
-    base_image: &str,
-    parsed: &diffy::Patch<'_, str>,
-) -> Result<String, diffy::ApplyError> {
-    match diffy::apply(base_image, parsed) {
-        Ok(out) => Ok(out),
-        Err(strict_err) => {
-            let last_line_is_context = parsed
-                .hunks()
-                .last()
-                .and_then(|h| h.lines().last())
-                .map(|l| matches!(l, diffy::Line::Context(_)))
-                .unwrap_or(false);
-            if base_image.is_empty() || base_image.ends_with('\n') || !last_line_is_context {
-                return Err(strict_err);
+/// We split on `\n` (newline-agnostic, like pnpm's `split(/\n/)`) so a
+/// final line without a trailing newline round-trips for free.
+fn parse_hunks(body: &str) -> Result<Vec<Hunk>, String> {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut in_hunk = false;
+
+    // Split newline-agnostically, then drop a single trailing empty line —
+    // `split_patch_sections` terminates the body with a `\n`, so the split
+    // yields a spurious final `""`. pnpm's `parsePatchFile` does the same
+    // (`if (lines[lines.length-1] === "") lines.pop()`). A genuinely blank
+    // line inside the patch arrives as a `" "`-prefixed context line, not a
+    // zero-length one, so this only sheds the terminator artifact.
+    let mut split: Vec<&str> = body.split('\n').collect();
+    if split.last() == Some(&"") {
+        split.pop();
+    }
+
+    for raw in split {
+        // `split_patch_sections` already trimmed trailing `\r`, but stay
+        // defensive: a `\r`-only line classifies as context below.
+        let first = raw.chars().next();
+        match first {
+            Some('@') if raw.starts_with("@@") => {
+                let header = parse_hunk_header(raw)?;
+                hunks.push(header);
+                in_hunk = true;
             }
-            let padded = format!("{base_image}\n");
-            // If the padded retry also fails, surface the ORIGINAL strict
-            // error so the caller's message is unchanged for a genuinely
-            // non-applying patch.
-            let patched = diffy::apply(&padded, parsed).map_err(|_| strict_err)?;
-            // The synthetic newline lands as the result's final byte only
-            // when the patch left the EOF line as unchanged context, which
-            // the context-final-line gate guarantees. Strip it to restore
-            // the no-trailing-newline EOF state pnpm/GNU patch produce.
-            Ok(patched
-                .strip_suffix('\n')
-                .map(str::to_string)
-                .unwrap_or(patched))
+            _ if !in_hunk => {
+                // Pre-hunk header line (`--- `/`+++ `/blank). Skip.
+            }
+            Some('\\') => {
+                // `\ No newline at end of file` pragma attaches to the
+                // current part's last line.
+                if !raw.starts_with("\\ No newline at end of file") {
+                    return Err(format!("unrecognized pragma in patch: {raw:?}"));
+                }
+                let hunk = hunks
+                    .last_mut()
+                    .ok_or_else(|| "no-newline pragma before any hunk".to_string())?;
+                let part = hunk
+                    .parts
+                    .last_mut()
+                    .ok_or_else(|| "no-newline pragma without a preceding line".to_string())?;
+                part.no_newline_at_eof = true;
+            }
+            Some('-') => push_line(&mut hunks, PartType::Deletion, &raw[1..])?,
+            Some('+') => push_line(&mut hunks, PartType::Insertion, &raw[1..])?,
+            Some(' ') => push_line(&mut hunks, PartType::Context, &raw[1..])?,
+            // Blank line or a lone `\r`: pnpm treats these as context.
+            // The line's text is the whole `raw` (no type prefix char).
+            None => push_line(&mut hunks, PartType::Context, "")?,
+            Some('\r') => push_line(&mut hunks, PartType::Context, raw)?,
+            // Anything else (e.g. a stray `diff`/`index` line that slipped
+            // through) terminates hunk parsing for this body.
+            Some(_) => {
+                in_hunk = false;
+            }
         }
     }
+    Ok(hunks)
+}
+
+/// Append a line to the current hunk's trailing part, opening a new part
+/// when the type changes — pnpm coalesces consecutive same-type lines
+/// into one `PatchMutationPart`.
+fn push_line(hunks: &mut [Hunk], kind: PartType, text: &str) -> Result<(), String> {
+    let hunk = hunks
+        .last_mut()
+        .ok_or_else(|| "hunk line encountered before any hunk header".to_string())?;
+    match hunk.parts.last_mut() {
+        Some(part) if part.kind == kind && !part.no_newline_at_eof => {
+            part.lines.push(text.to_string());
+        }
+        _ => hunk.parts.push(HunkPart {
+            kind,
+            lines: vec![text.to_string()],
+            no_newline_at_eof: false,
+        }),
+    }
+    Ok(())
+}
+
+/// Parse `@@ -origStart,origLen +newStart,newLen @@` (lengths default to
+/// 1 when omitted), matching pnpm's `parseHunkHeaderLine` — including its
+/// `Math.max(start, 1)` clamp.
+fn parse_hunk_header(line: &str) -> Result<Hunk, String> {
+    let body = line
+        .trim()
+        .strip_prefix("@@ -")
+        .ok_or_else(|| format!("bad hunk header: {line:?}"))?;
+    // `body` is now `origStart[,origLen] +newStart[,newLen] @@ ...`.
+    let (orig, _rest) = body
+        .split_once(" +")
+        .ok_or_else(|| format!("bad hunk header: {line:?}"))?;
+    let (start_s, len_s) = match orig.split_once(',') {
+        Some((s, l)) => (s, Some(l)),
+        None => (orig, None),
+    };
+    let start: usize = start_s
+        .parse()
+        .map_err(|_| format!("bad hunk header start: {line:?}"))?;
+    let length: usize = match len_s {
+        Some(l) => l
+            .parse()
+            .map_err(|_| format!("bad hunk header length: {line:?}"))?,
+        None => 1,
+    };
+    Ok(Hunk {
+        original_start: start.max(1),
+        original_length: length,
+        parts: Vec::new(),
+    })
+}
+
+/// `trimRight` — strip trailing ASCII whitespace, matching pnpm's
+/// `s.replace(/\s+$/, "")`. JS `\s` covers space, tab, CR, LF, vertical
+/// tab, form feed; `trim_end()` (Unicode whitespace) is a strict
+/// superset on the ASCII bytes patches contain, so it matches pnpm here.
+fn trim_right(s: &str) -> &str {
+    s.trim_end()
+}
+
+/// Trailing-whitespace-tolerant line equality — pnpm's `linesAreEqual`.
+/// Trims the RIGHT only; leading whitespace must match exactly (finding
+/// 5: leading-ws drift is rejected by pnpm and must be by us).
+fn lines_are_equal(a: &str, b: &str) -> bool {
+    trim_right(a) == trim_right(b)
+}
+
+/// One edit to apply to the working line array — pnpm's `Modificaiton`.
+enum Modification {
+    Splice {
+        index: usize,
+        num_to_delete: usize,
+        lines_to_insert: Vec<String>,
+    },
+    Pop,
+    Push(String),
+}
+
+/// Try to place `hunk` at its stated original line shifted by
+/// `fuzzing_offset`, matching context+deletion lines trailing-ws-loosely.
+/// Returns the list of modifications on success, `None` if the hunk does
+/// not line up at this offset — a faithful port of pnpm's `evaluateHunk`.
+fn evaluate_hunk(
+    hunk: &Hunk,
+    file_lines: &[String],
+    fuzzing_offset: isize,
+) -> Option<Vec<Modification>> {
+    let mut result = Vec::new();
+    // `original.start - 1 + fuzzingOffset`, with signed bounds checks
+    // before indexing (pnpm returns null on a negative index).
+    let base = hunk.original_start as isize - 1 + fuzzing_offset;
+    if base < 0 {
+        return None;
+    }
+    let mut context_index = base as usize;
+    // `fileLines.length - contextIndex < original.length` → null.
+    if file_lines.len() < context_index
+        || file_lines.len() - context_index < hunk.original_length
+    {
+        return None;
+    }
+
+    for part in &hunk.parts {
+        match part.kind {
+            PartType::Deletion | PartType::Context => {
+                for line in &part.lines {
+                    let original_line = file_lines.get(context_index)?;
+                    if !lines_are_equal(original_line, line) {
+                        return None;
+                    }
+                    context_index += 1;
+                }
+                if part.kind == PartType::Deletion {
+                    result.push(Modification::Splice {
+                        index: context_index - part.lines.len(),
+                        num_to_delete: part.lines.len(),
+                        lines_to_insert: Vec::new(),
+                    });
+                    if part.no_newline_at_eof {
+                        result.push(Modification::Push(String::new()));
+                    }
+                }
+            }
+            PartType::Insertion => {
+                result.push(Modification::Splice {
+                    index: context_index,
+                    num_to_delete: 0,
+                    lines_to_insert: part.lines.clone(),
+                });
+                if part.no_newline_at_eof {
+                    result.push(Modification::Pop);
+                }
+            }
+        }
+    }
+    Some(result)
+}
+
+/// Apply all hunks to `base_image`, porting pnpm's `applyPatch`:
+/// split the file into a newline-agnostic line array, fuzz each hunk
+/// over offsets `0, -1, +1, -2, +2, …` capped at `|20|` (refusing
+/// beyond — finding 4: nub must NOT over-apply where pnpm refuses),
+/// then splice/pop/push the recorded modifications and rejoin on `\n`.
+fn apply_hunks(base_image: &str, hunks: &[Hunk]) -> Result<String, String> {
+    let mut file_lines: Vec<String> = base_image.split('\n').map(str::to_string).collect();
+
+    let mut all_mods: Vec<Vec<Modification>> = Vec::with_capacity(hunks.len());
+    for (i, hunk) in hunks.iter().enumerate() {
+        let mut fuzzing_offset: isize = 0;
+        let mods = loop {
+            if let Some(m) = evaluate_hunk(hunk, &file_lines, fuzzing_offset) {
+                break m;
+            }
+            // pnpm: `fuzzingOffset < 0 ? *-1 : *-1 - 1`
+            //   → 0, -1, +1, -2, +2, -3, +3, …
+            fuzzing_offset = if fuzzing_offset < 0 {
+                -fuzzing_offset
+            } else {
+                -fuzzing_offset - 1
+            };
+            if fuzzing_offset.abs() > 20 {
+                return Err(format!("could not apply hunk {i} (offset drift > 20 lines)"));
+            }
+        };
+        all_mods.push(mods);
+    }
+
+    // Apply modifications, tracking the cumulative line-count delta so
+    // later splices land at the right index (pnpm's `diffOffset`).
+    let mut diff_offset: isize = 0;
+    for mods in &all_mods {
+        for m in mods {
+            match m {
+                Modification::Splice {
+                    index,
+                    num_to_delete,
+                    lines_to_insert,
+                } => {
+                    let at = (*index as isize + diff_offset) as usize;
+                    let end = (at + num_to_delete).min(file_lines.len());
+                    let removed: Vec<String> = file_lines.splice(at..end, lines_to_insert.iter().cloned()).collect();
+                    diff_offset += lines_to_insert.len() as isize - removed.len() as isize;
+                }
+                Modification::Pop => {
+                    file_lines.pop();
+                }
+                Modification::Push(line) => {
+                    file_lines.push(line.clone());
+                }
+            }
+        }
+    }
+
+    Ok(file_lines.join("\n"))
 }
 
 struct PatchSection {
     rel_path: Option<String>,
-    /// Single-file unified diff body — `diffy::Patch::from_str` parses
-    /// this directly. Always begins with `--- ` so the diffy parser
-    /// finds its anchor.
+    /// Single-file unified diff body — `parse_hunks` reads this directly.
+    /// Always begins with `--- ` so the parser has a stable anchor.
     body: String,
     /// `+++ /dev/null` was seen in the header — the patch deletes this
     /// file, so the linker should `remove_file` instead of writing
-    /// patched bytes (which `diffy::apply` would emit as an empty
+    /// patched bytes (which the hunk applier would emit as an empty
     /// string).
     is_deletion: bool,
 }
@@ -328,7 +568,7 @@ struct PatchSection {
 /// We look for `diff --git a/<path> b/<path>` markers, pull the path
 /// out of the `b/...` half (post-edit name), and capture everything
 /// from the next `--- ` line until the following `diff --git ` (or
-/// EOF) as the diffy-compatible body.
+/// EOF) as the single-file diff body.
 fn parse_diff_git_b_path(rest: &str) -> Option<String> {
     if let Some(after) = rest.strip_prefix("\"a/") {
         let end_a = after.find("\" \"b/")?;
@@ -452,9 +692,9 @@ fn split_patch_sections(text: &str) -> Vec<PatchSection> {
             if stripped.starts_with("--- ") {
                 in_body = true;
                 // Rewrite `--- /dev/null` (file addition) to `--- a/<path>`
-                // so diffy's parser still gets a valid header. The
-                // original file content we feed `diffy::apply` is empty
-                // for additions, which is what diffy expects.
+                // so the body still carries a valid `--- ` anchor. The
+                // original file content we apply against is empty for
+                // additions, which the hunk applier handles directly.
                 if stripped == "--- /dev/null"
                     && let Some(rel) = current_path.as_deref()
                 {
@@ -465,14 +705,13 @@ fn split_patch_sections(text: &str) -> Vec<PatchSection> {
                 }
             }
             // Skip git's `index ...` / `new file mode ...` /
-            // `similarity index ...` decorations — diffy doesn't
-            // understand them and they aren't needed once we know
-            // the target path.
+            // `similarity index ...` decorations — the hunk parser
+            // doesn't need them once we know the target path.
             continue;
         }
         if stripped == "+++ /dev/null" {
             // File deletion — note it and drop this header line. The
-            // linker will `remove_file` and skip the diffy apply path
+            // linker will `remove_file` and skip the hunk applier
             // entirely, so the rest of the body (the hunk that empties
             // the file) is intentionally discarded.
             is_deletion = true;
@@ -610,9 +849,9 @@ mod tests {
     #[test]
     fn applies_lf_patch_against_crlf_file() {
         // Tarballs published from Windows editors ship CRLF text. pnpm
-        // / git emit LF-only patches even against those files. Diffy is
-        // byte-exact, so the apply path normalizes CRLF -> LF before
-        // matching and restores CRLF on write.
+        // / git emit LF-only patches even against those files. The apply
+        // path normalizes CRLF -> LF before matching and restores CRLF
+        // on write, so the patched file keeps its CRLF endings.
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("pkg");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -701,50 +940,151 @@ mod tests {
         );
     }
 
+    // ---- Ported-applier core: helper to drive parse_hunks + apply_hunks
+    // directly on a single-file body (the unit the section split feeds in).
+    fn apply_body(original: &str, body: &str) -> Result<String, String> {
+        let hunks = parse_hunks(body)?;
+        apply_hunks(original, &hunks)
+    }
+
     #[test]
-    fn eof_tolerance_preserves_marker_terminated_patch() {
-        // A patch that DOES carry the `\ No newline at end of file`
-        // marker still applies through the same path and keeps the
-        // no-trailing-newline EOF. (Regression guard: the tolerance
-        // retry must not change behavior for marker-bearing patches.)
+    fn marker_terminated_no_eof_patch_preserves_eof() {
+        // A patch that carries the `\ No newline at end of file` marker
+        // on its final context line still applies and keeps the
+        // no-trailing-newline EOF. With the newline-agnostic line array
+        // this round-trips for free — the marker is informational here.
         let original = "a\nb\nlast";
         let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n last\n\\ No newline at end of file\n";
-        let parsed = diffy::Patch::from_str(body).unwrap();
-        let out = apply_with_eof_tolerance(original, &parsed).unwrap();
-        assert_eq!(out, "a\nB\nlast");
+        assert_eq!(apply_body(original, body).unwrap(), "a\nB\nlast");
     }
 
     #[test]
-    fn eof_tolerance_leaves_newline_terminated_file_untouched() {
-        // A normally newline-terminated file takes the strict path and
-        // never triggers the retry; its trailing newline is preserved.
+    fn newline_terminated_file_keeps_trailing_newline() {
+        // A normally newline-terminated file round-trips its trailing
+        // newline: `"a\nb\nc\n".split('\n')` → ["a","b","c",""], and the
+        // empty final element rejoins to a trailing `\n`.
         let original = "a\nb\nc\n";
         let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
-        let parsed = diffy::Patch::from_str(body).unwrap();
-        let out = apply_with_eof_tolerance(original, &parsed).unwrap();
-        assert_eq!(out, "a\nB\nc\n");
+        assert_eq!(apply_body(original, body).unwrap(), "a\nB\nc\n");
     }
 
     #[test]
-    fn eof_tolerance_still_rejects_non_applying_patch() {
-        // The widened tolerance must NOT become "accept anything." A
-        // patch whose context does not exist in the file still fails,
-        // even on a no-trailing-newline file with a context final line.
+    fn rejects_patch_whose_context_is_absent() {
+        // The ported applier must NOT become "accept anything": a hunk
+        // whose deletion line matches nowhere within ±20 still fails.
         let original = "a\nb\n//# map";
         let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-NONEXISTENT\n+X\n //# map\n";
-        let parsed = diffy::Patch::from_str(body).unwrap();
-        assert!(apply_with_eof_tolerance(original, &parsed).is_err());
+        assert!(apply_body(original, body).is_err());
+    }
+
+    // ===== The 5 differential findings vs pnpm (`@pnpm/patch-package`).
+    // Each closes a divergence the patch-applier-fidelity investigation
+    // found between aube's old diffy (byte-exact) apply and pnpm's
+    // lenient line-array apply. Behavior here matches pnpm exactly.
+
+    #[test]
+    fn finding1_no_eol_final_context_marker_omitted_applies() {
+        // #25: file's last line has NO trailing newline and the patch
+        // OMITS the `\ No newline` marker (pnpm/git routinely do). The
+        // old diffy byte-exact match rejected this; the line array
+        // matches and preserves the no-eol, exactly like pnpm.
+        let original = "a\nb\nlast";
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n last\n";
+        assert_eq!(apply_body(original, body).unwrap(), "a\nB\nlast");
     }
 
     #[test]
-    fn eof_tolerance_does_not_accept_what_gnu_patch_rejects() {
-        // GNU patch rejects a marker-less patch whose final line is an
-        // *insertion* (not context) against a no-trailing-newline file.
-        // The context-final-line gate must reject it too, so we don't
-        // become MORE tolerant than GNU patch / pnpm.
-        let original = "a\nb";
-        let body = "--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n a\n b\n+c\n";
-        let parsed = diffy::Patch::from_str(body).unwrap();
-        assert!(apply_with_eof_tolerance(original, &parsed).is_err());
+    fn finding2_trailing_ws_drift_on_context_line_tolerated() {
+        // The patch's context line lacks trailing whitespace the file
+        // line has (or vice versa). pnpm `trimRight`s both before
+        // comparing; the old diffy byte-exact match rejected. We match.
+        let original = "alpha   \nbeta\ngamma\n"; // "alpha" has trailing spaces
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n";
+        assert_eq!(apply_body(original, body).unwrap(), "alpha   \nBETA\ngamma\n");
+    }
+
+    #[test]
+    fn finding3_trailing_ws_drift_on_deleted_line_tolerated() {
+        // Same tolerance applies to a DELETED (`-`) line: the file's
+        // deleted line carries trailing whitespace the patch omits.
+        let original = "one\ntwo  \nthree\n"; // "two" has trailing spaces
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,2 @@\n one\n-two\n three\n";
+        assert_eq!(apply_body(original, body).unwrap(), "one\nthree\n");
+    }
+
+    #[test]
+    fn finding4_offset_drift_beyond_20_lines_rejected() {
+        // diffy's offset search was UNBOUNDED — nub silently applied a
+        // patch pnpm REFUSES. pnpm caps fuzz at ±20; beyond that it
+        // throws. The hunk claims line 1, but the matching context sits
+        // 30 lines down → must be REJECTED (anti-over-apply guarantee).
+        let mut original = String::new();
+        for _ in 0..30 {
+            original.push_str("filler\n");
+        }
+        original.push_str("anchor\ntarget\ntail\n");
+        // Hunk header says the context is at line 1, but it's at line 31.
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n anchor\n-target\n+TARGET\n tail\n";
+        let err = apply_body(&original, body).unwrap_err();
+        assert!(
+            err.contains("offset drift"),
+            "expected an offset-drift rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn finding4_offset_drift_within_20_lines_applies() {
+        // The complement to finding 4: drift of exactly 20 lines is at
+        // the boundary pnpm still accepts, so nub must apply it.
+        let mut original = String::new();
+        for _ in 0..20 {
+            original.push_str("filler\n");
+        }
+        original.push_str("anchor\ntarget\ntail\n");
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n anchor\n-target\n+TARGET\n tail\n";
+        let out = apply_body(&original, body).unwrap();
+        assert!(out.contains("anchor\nTARGET\ntail\n"));
+    }
+
+    #[test]
+    fn finding5_leading_ws_drift_rejected() {
+        // pnpm's whitespace tolerance is TRAILING-only — `trimRight`,
+        // never `trimLeft`. A LEADING-whitespace mismatch on a context
+        // line must be REJECTED, matching pnpm (and bounding the trim).
+        let original = "  indented\nbody\ntail\n"; // two leading spaces
+        // Patch's context line has NO leading spaces → must not match.
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n indented\n-body\n+BODY\n tail\n";
+        assert!(apply_body(original, body).is_err());
+    }
+
+    // ===== Happy-path byte-identity guards (g01/g05/g09 from the matrix):
+    // the common case must produce the SAME bytes as before the port.
+
+    #[test]
+    fn happy_path_simple_edit_byte_identical() {
+        let original = "module.exports = 'old';\n";
+        let body = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-module.exports = 'old';\n+module.exports = 'new';\n";
+        assert_eq!(apply_body(original, body).unwrap(), "module.exports = 'new';\n");
+    }
+
+    #[test]
+    fn happy_path_multi_hunk_byte_identical() {
+        let original = "1\n2\n3\n4\n5\n6\n7\n8\n";
+        let body = "--- a/x\n+++ b/x\n\
+                    @@ -1,3 +1,3 @@\n 1\n-2\n+TWO\n 3\n\
+                    @@ -6,3 +6,3 @@\n 6\n-7\n+SEVEN\n 8\n";
+        assert_eq!(apply_body(original, body).unwrap(), "1\nTWO\n3\n4\n5\n6\nSEVEN\n8\n");
+    }
+
+    #[test]
+    fn happy_path_append_to_no_eol_file() {
+        // g06: append a line to a file that ends without a newline. The
+        // final inserted line should become the new no-eol EOF line, and
+        // the previously-final line gains a newline.
+        let original = "first\nsecond";
+        // pnpm-style: the old last line `second` carries the no-newline
+        // marker (deletion side), and the new content does too.
+        let body = "--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n first\n-second\n\\ No newline at end of file\n+second\n+third\n\\ No newline at end of file\n";
+        assert_eq!(apply_body(original, body).unwrap(), "first\nsecond\nthird");
     }
 }
