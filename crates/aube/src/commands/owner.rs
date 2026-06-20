@@ -61,6 +61,13 @@ pub async fn run(args: OwnerArgs) -> miette::Result<()> {
                 .change_owner(&package, &user, true, otp)
                 .await
                 .map_err(map_err)?;
+            // Drop the full-packument cache so a same-process `owner ls` /
+            // `view` in the TTL window doesn't serve the pre-change document
+            // (matches the sibling `deprecate` write path).
+            client.invalidate_full_packument_cache(
+                &package,
+                &crate::commands::packument_full_cache_dir(),
+            );
             println!("+{user}: {package}");
         }
         OwnerCommand::Rm { package, user } => {
@@ -68,6 +75,10 @@ pub async fn run(args: OwnerArgs) -> miette::Result<()> {
                 .change_owner(&package, &user, false, otp)
                 .await
                 .map_err(map_err)?;
+            client.invalidate_full_packument_cache(
+                &package,
+                &crate::commands::packument_full_cache_dir(),
+            );
             println!("-{user}: {package}");
         }
     }
