@@ -9,6 +9,7 @@ mod dist_tags;
 mod endpoints;
 mod http;
 mod lifecycle;
+mod npm_verbs;
 mod packument;
 mod parse;
 mod request;
@@ -24,6 +25,7 @@ mod slow_tarball_tests;
 pub use cache::CachedPackumentLookup;
 use dist_tags::*;
 use http::*;
+pub use npm_verbs::{Owner, TokenInfo};
 use parse::parse_full_response;
 
 /// Accept header for packument requests. `vnd.npm.install-v1+json` is the
