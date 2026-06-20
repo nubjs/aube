@@ -218,7 +218,7 @@ pub(crate) fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result
         };
         let parsed = diffy::Patch::from_str(&section.body)
             .map_err(|e| format!("failed to parse patch for {rel}: {e}"))?;
-        let patched_lf = diffy::apply(&normalized, &parsed)
+        let patched_lf = apply_with_eof_tolerance(&normalized, &parsed)
             .map_err(|e| format!("failed to apply patch for {rel}: {e}"))?;
         let patched = if was_crlf {
             // Promote bare `\n` to `\r\n`, then collapse any `\r\r\n`
@@ -254,6 +254,61 @@ pub(crate) fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result
         })?;
     }
     Ok(())
+}
+
+/// Apply a single-file diff, tolerating a missing `\ No newline at end
+/// of file` marker on a final *context* line — the way pnpm and GNU
+/// `patch` do, but `git apply` (and a bare `diffy::apply`) do not.
+///
+/// pnpm's `pnpm patch` generates patches that omit the marker when a
+/// hunk's last line is the file's final line and that line has no
+/// trailing newline. Diffy is byte-exact: it parses the marker-less
+/// final context line as `\n`-terminated, so it fails to match the
+/// file's final line (which has none) and rejects the hunk
+/// (`error applying hunk #1`). A dependency patched with `pnpm patch`
+/// then installs under pnpm but not under aube/nub.
+///
+/// The fix mirrors GNU patch's tolerance precisely: when the strict
+/// apply fails, the original file has no trailing newline, and the
+/// patch's last hunk ends in a *context* line, retry against the file
+/// with a synthetic trailing newline so the EOF line matches, then
+/// strip that synthetic newline back off the result. The retry is
+/// gated on a context final line so we do NOT accept patches GNU patch
+/// itself rejects — a final *inserted* or *modified* line with a
+/// missing marker still fails (GNU patch rejects those too), and a
+/// genuinely non-applying patch still fails because the padded retry
+/// surfaces the original strict error.
+fn apply_with_eof_tolerance(
+    base_image: &str,
+    parsed: &diffy::Patch<'_, str>,
+) -> Result<String, diffy::ApplyError> {
+    match diffy::apply(base_image, parsed) {
+        Ok(out) => Ok(out),
+        Err(strict_err) => {
+            let last_line_is_context = parsed
+                .hunks()
+                .last()
+                .and_then(|h| h.lines().last())
+                .map(|l| matches!(l, diffy::Line::Context(_)))
+                .unwrap_or(false);
+            if base_image.is_empty() || base_image.ends_with('\n') || !last_line_is_context {
+                return Err(strict_err);
+            }
+            let padded = format!("{base_image}\n");
+            // If the padded retry also fails, surface the ORIGINAL strict
+            // error so the caller's message is unchanged for a genuinely
+            // non-applying patch.
+            let patched = diffy::apply(&padded, parsed).map_err(|_| strict_err)?;
+            // The synthetic newline lands as the result's final byte only
+            // when the patch left the EOF line as unchanged context, which
+            // the context-final-line gate guarantees. Strip it to restore
+            // the no-trailing-newline EOF state pnpm/GNU patch produce.
+            Ok(patched
+                .strip_suffix('\n')
+                .map(str::to_string)
+                .unwrap_or(patched))
+        }
+    }
 }
 
 struct PatchSection {
@@ -608,5 +663,88 @@ mod tests {
         let path = parse_diff_git_b_path("\"a/caf\\303\\251.js\" \"b/caf\\303\\251.js\"")
             .expect("octal parse");
         assert_eq!(path, "café.js");
+    }
+
+    // The `pnpm patch` output for `@convex-dev/resend@0.2.4` in issue #25:
+    // the file's last line has no trailing newline, and pnpm omits the
+    // `\ No newline at end of file` marker. pnpm + GNU `patch` apply it;
+    // `git apply` + a bare `diffy::apply` reject it.
+    #[test]
+    fn applies_pnpm_patch_with_no_trailing_newline_and_missing_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        // Pristine tarball file: final line has NO trailing newline.
+        std::fs::write(
+            pkg.join("shared.d.ts"),
+            "export type RunMutationCtx = {\n    runMutation: GenericMutationCtx;\n};\n//# sourceMappingURL=shared.d.ts.map",
+        )
+        .unwrap();
+
+        // pnpm-authored patch: the final context line carries the patch
+        // file's own `\n`, and there is NO `\ No newline` marker.
+        let patch = "diff --git a/shared.d.ts b/shared.d.ts\n\
+                     --- a/shared.d.ts\n\
+                     +++ b/shared.d.ts\n\
+                     @@ -1,4 +1,4 @@\n\
+                     \x20export type RunMutationCtx = {\n\
+                     -    runMutation: GenericMutationCtx;\n\
+                     +    runMutation: import(\"convex/server\").GenericActionCtx;\n\
+                     \x20};\n\
+                     \x20//# sourceMappingURL=shared.d.ts.map\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        // The patched line is applied AND the no-trailing-newline EOF
+        // state is preserved (matching pnpm / GNU patch byte-for-byte).
+        assert_eq!(
+            std::fs::read_to_string(pkg.join("shared.d.ts")).unwrap(),
+            "export type RunMutationCtx = {\n    runMutation: import(\"convex/server\").GenericActionCtx;\n};\n//# sourceMappingURL=shared.d.ts.map"
+        );
+    }
+
+    #[test]
+    fn eof_tolerance_preserves_marker_terminated_patch() {
+        // A patch that DOES carry the `\ No newline at end of file`
+        // marker still applies through the same path and keeps the
+        // no-trailing-newline EOF. (Regression guard: the tolerance
+        // retry must not change behavior for marker-bearing patches.)
+        let original = "a\nb\nlast";
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n last\n\\ No newline at end of file\n";
+        let parsed = diffy::Patch::from_str(body).unwrap();
+        let out = apply_with_eof_tolerance(original, &parsed).unwrap();
+        assert_eq!(out, "a\nB\nlast");
+    }
+
+    #[test]
+    fn eof_tolerance_leaves_newline_terminated_file_untouched() {
+        // A normally newline-terminated file takes the strict path and
+        // never triggers the retry; its trailing newline is preserved.
+        let original = "a\nb\nc\n";
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+        let parsed = diffy::Patch::from_str(body).unwrap();
+        let out = apply_with_eof_tolerance(original, &parsed).unwrap();
+        assert_eq!(out, "a\nB\nc\n");
+    }
+
+    #[test]
+    fn eof_tolerance_still_rejects_non_applying_patch() {
+        // The widened tolerance must NOT become "accept anything." A
+        // patch whose context does not exist in the file still fails,
+        // even on a no-trailing-newline file with a context final line.
+        let original = "a\nb\n//# map";
+        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-NONEXISTENT\n+X\n //# map\n";
+        let parsed = diffy::Patch::from_str(body).unwrap();
+        assert!(apply_with_eof_tolerance(original, &parsed).is_err());
+    }
+
+    #[test]
+    fn eof_tolerance_does_not_accept_what_gnu_patch_rejects() {
+        // GNU patch rejects a marker-less patch whose final line is an
+        // *insertion* (not context) against a no-trailing-newline file.
+        // The context-final-line gate must reject it too, so we don't
+        // become MORE tolerant than GNU patch / pnpm.
+        let original = "a\nb";
+        let body = "--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n a\n b\n+c\n";
+        let parsed = diffy::Patch::from_str(body).unwrap();
+        assert!(apply_with_eof_tolerance(original, &parsed).is_err());
     }
 }
