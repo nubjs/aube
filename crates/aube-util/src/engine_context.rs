@@ -76,7 +76,37 @@ pub struct EngineContext {
     /// another tool's state and must not be read (a name-based policy). The
     /// tool's own branded YAML/namespace, `.npmrc`, and `npmrcAuthFile`
     /// sources are unaffected.
+    ///
+    /// NOTE: this posture gates only the PROJECT-scoped pnpm surfaces (the
+    /// workspace yaml + the `pnpm` package.json namespace). The GLOBAL /
+    /// user-scope pnpm-named files (`<configDir>/config.yaml` and
+    /// `<configDir>/auth.ini`) are gated by the separate
+    /// [`read_pnpm_global_config`](Self::read_pnpm_global_config) posture —
+    /// they must NOT ride a project-derived (cwd-dependent) gate, since global
+    /// config has no project incumbent.
     pub read_branded_pnpm_config: bool,
+
+    /// Whether aube reads pnpm's GLOBAL / user-scope pnpm-named config files:
+    /// `<configDir>/config.yaml` (pnpm v11's global settings file) and
+    /// `<configDir>/auth.ini` (pnpm's global auth file). `true` (default)
+    /// preserves upstream behavior — standalone aube IS a pnpm-compatible PM
+    /// and reads pnpm's global config unconditionally.
+    ///
+    /// This is DELIBERATELY SEPARATE from
+    /// [`read_branded_pnpm_config`](Self::read_branded_pnpm_config). That
+    /// posture is derived from the project's incumbent PM (a cwd-scoped
+    /// concept) and correctly gates the PROJECT-scoped pnpm surfaces. Global
+    /// config, by contrast, has no project and no incumbent — gating it on the
+    /// cwd's incumbent would mean "read pnpm's global config only when you
+    /// happen to be standing in a pnpm project", which is incoherent. This
+    /// separate posture lets an embedder read the global pnpm-named files
+    /// UNGATED by the cwd. nub sets this `true` unconditionally: it honors
+    /// whatever global config the user already has from any tool (npm's
+    /// `~/.npmrc`, pnpm's global `config.yaml` / `auth.ini`), independent of
+    /// the cwd. (nub keeps global WRITES neutral — never writing back a
+    /// pnpm-branded global file — but that is the embedder's write-path
+    /// concern, not this read gate.)
+    pub read_pnpm_global_config: bool,
 
     /// Whether aube reads Yarn Berry's `.yarnrc.yml` config surface and
     /// translates the subset that maps cleanly onto the existing npmrc-shaped
@@ -180,6 +210,7 @@ impl Default for EngineContext {
             embedder_overrides: None,
             trusted_dependencies_honored: true,
             read_branded_pnpm_config: true,
+            read_pnpm_global_config: true,
             read_yarn_config: false,
             yarn_is_classic: false,
             read_bun_config: false,
@@ -242,6 +273,7 @@ mod tests {
         assert_eq!(ctx.embedder_overrides, None);
         assert!(ctx.trusted_dependencies_honored);
         assert!(ctx.read_branded_pnpm_config);
+        assert!(ctx.read_pnpm_global_config);
         assert!(!ctx.read_yarn_config);
         assert!(!ctx.yarn_is_classic);
         assert!(!ctx.read_bun_config);

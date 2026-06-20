@@ -166,15 +166,17 @@ impl FileSources {
 /// macOS `~/Library/Preferences/pnpm`, Windows
 /// `%LOCALAPPDATA%\pnpm\config`, Linux `~/.config/pnpm`.
 ///
-/// `config.yaml` is a pnpm-NAMED global file, so the pnpm-named-paths
-/// hard gate applies: it is read ONLY when pnpm is the provable
-/// incumbent (`engine_context().read_branded_pnpm_config`). Under any
-/// non-pnpm incumbent it's another tool's state and an empty map is
-/// returned. A missing/empty/unparseable file is also an empty map —
-/// global config is best-effort and must never fail a command.
+/// `config.yaml` is a pnpm-NAMED GLOBAL file, so it is gated by the
+/// GLOBAL-scope posture `engine_context().read_pnpm_global_config` — NOT
+/// the project-derived `read_branded_pnpm_config`. Global config has no
+/// project incumbent, so an embedder whose global config is its own neutral
+/// surface (e.g. nub) clears `read_pnpm_global_config` UNCONDITIONALLY and
+/// this file is never read, regardless of the cwd's incumbent PM. A
+/// missing/empty/unparseable file is also an empty map — global config is
+/// best-effort and must never fail a command.
 pub(crate) fn load_global_config_yaml() -> std::collections::BTreeMap<String, yaml_serde::Value> {
     let empty = std::collections::BTreeMap::new;
-    if !aube_util::engine_context().read_branded_pnpm_config {
+    if !aube_util::engine_context().read_pnpm_global_config {
         return empty();
     }
     let Some(config_dir) = aube_util::env::pnpm_config_dir() else {

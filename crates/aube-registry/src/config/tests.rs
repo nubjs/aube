@@ -2362,13 +2362,15 @@ fn pnpm_global_auth_ini_loses_to_project_npmrc() {
 
 #[test]
 fn pnpm_global_auth_ini_not_read_when_gate_disabled() {
-    // Brand-boundary gate (Colin 2026-06-11): under a non-pnpm incumbent the
-    // embedder clears `read_branded_pnpm_config` on the context, and the pnpm-NAMED
-    // `~/.config/pnpm/auth.ini` must then not be read at all — its token is
-    // never applied. The `~/.npmrc` user source is untouched, so the stale
-    // npmrc token (not the auth.ini one) is what survives. Restores the gate
-    // to the upstream default (`true`) inside the lock so other auth.ini
-    // tests see the normal behavior.
+    // The pnpm-NAMED GLOBAL `~/.config/pnpm/auth.ini` is gated by the
+    // GLOBAL-scope `read_pnpm_global_config` posture — NOT the project-scope
+    // `read_branded_pnpm_config` (asymmetric read/write model, 2026-06-20): a
+    // GLOBAL file has no project incumbent, so its read must not ride the
+    // cwd-derived project gate. With the global gate OFF the auth.ini token is
+    // never applied (the `~/.npmrc` user source is untouched, so the stale
+    // npmrc token survives); with it ON (the upstream default), auth.ini wins.
+    // Restores the gate to the default (`true`) inside the lock so other
+    // auth.ini tests see the normal behavior.
     let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home_dir = tempfile::tempdir().unwrap();
     let proj_dir = tempfile::tempdir().unwrap();
@@ -2390,27 +2392,29 @@ fn pnpm_global_auth_ini_not_read_when_gate_disabled() {
     )
     .unwrap();
 
-    aube_util::update_engine_context(|ctx| ctx.read_branded_pnpm_config = false);
+    aube_util::update_engine_context(|ctx| ctx.read_pnpm_global_config = false);
     let disabled = load_npmrc_entries_with_home(Some(home_dir.path()), None, proj_dir.path(), None);
-    aube_util::update_engine_context(|ctx| ctx.read_branded_pnpm_config = true);
+    aube_util::update_engine_context(|ctx| ctx.read_pnpm_global_config = true);
 
     let mut cfg = NpmConfig::default();
     cfg.apply(disabled);
     assert_eq!(
         cfg.auth_token_for("https://registry.example.com/"),
         Some("npmrc-token"),
-        "auth.ini token must not be applied when the pnpm auth.ini gate is off",
+        "auth.ini token must not be applied when the global pnpm gate is off",
     );
 
-    // Sanity check the other direction in the same fixture: with the gate
-    // back on (the upstream default), the auth.ini token wins over ~/.npmrc.
+    // The other direction in the same fixture: with the global gate ON (the
+    // upstream default), auth.ini is read and its token wins over ~/.npmrc —
+    // and this holds INDEPENDENT of the project gate (here left at its
+    // default), the whole point of decoupling global from cwd incumbency.
     let enabled = load_npmrc_entries_with_home(Some(home_dir.path()), None, proj_dir.path(), None);
     let mut cfg = NpmConfig::default();
     cfg.apply(enabled);
     assert_eq!(
         cfg.auth_token_for("https://registry.example.com/"),
         Some("auth-ini-token"),
-        "with the gate on, pnpm auth.ini is read and overrides ~/.npmrc",
+        "with the global gate on, pnpm auth.ini is read and overrides ~/.npmrc",
     );
 }
 

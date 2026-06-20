@@ -53,6 +53,51 @@ pub fn run(args: SetArgs) -> miette::Result<()> {
     set_value(&args.key, &args.value, args.effective_location(), true)
 }
 
+/// Write a NON-auth scalar setting to the project workspace yaml,
+/// FORCE-creating the file if it doesn't exist yet.
+///
+/// This is the embedder seam for a host (nub) that, under a pnpm
+/// incumbent, wants `config set <scalar>` to land in `pnpm-workspace.yaml`
+/// for round-trip fidelity with pnpm — which always writes the workspace
+/// yaml even when none exists yet, unlike [`set_value`]'s project-scope
+/// path (step 5), which only diverts to a workspace yaml that already
+/// exists on disk and otherwise falls back to `config.toml`.
+///
+/// `key` is a canonical setting name or `.npmrc`/yaml alias. Returns
+/// `Ok(Some(path))` with the file written when the setting has a
+/// top-level workspace-yaml key; `Ok(None)` when it has no workspace-yaml
+/// mapping (the caller routes such keys elsewhere, e.g. the project
+/// `.npmrc`). Object-typed (map) settings are rejected — they need
+/// structural edits, not a scalar write — mirroring [`set_value`] step 3.
+///
+/// The workspace-yaml target name is resolved by
+/// [`aube_manifest::workspace::workspace_yaml_target`], which under a
+/// pnpm incumbent (the only context an embedder calls this in) is
+/// `pnpm-workspace.yaml`. The typed value coercion and comment-preserving
+/// write reuse [`aube_config::set_workspace_yaml_value`], so this is the
+/// same on-disk result step 5 produces for an existing yaml.
+pub fn set_project_scalar_to_workspace_yaml(
+    key: &str,
+    value: &str,
+) -> miette::Result<Option<std::path::PathBuf>> {
+    // Object-typed (map) settings can't be written as a single scalar.
+    if let Some(meta) = setting_for_key(key)
+        && meta.type_ == "object"
+    {
+        return Err(reject_aube_map_key(key, meta));
+    }
+    let Some(meta) = aube_config::is_aube_config_key(key) else {
+        return Ok(None);
+    };
+    let Some(yaml_key) = aube_config::preferred_workspace_yaml_key(meta) else {
+        return Ok(None);
+    };
+    let cwd = crate::dirs::project_root_or_cwd()?;
+    let path = aube_manifest::workspace::workspace_yaml_target(&cwd);
+    aube_config::set_workspace_yaml_value(&path, meta, yaml_key, value)?;
+    Ok(Some(path))
+}
+
 pub(super) fn set_value(
     key: &str,
     value: &str,

@@ -118,6 +118,7 @@ pub(crate) use aube_config::{
     load_user_entries as load_user_aube_config_entries,
 };
 pub(crate) use get_cmd::GetArgs;
+pub use set_cmd::set_project_scalar_to_workspace_yaml;
 pub(crate) use set_cmd::SetArgs;
 
 impl Location {
@@ -546,6 +547,27 @@ mod tests {
         }
     }
 
+    /// Toggles the GLOBAL pnpm-named-files gate (`read_pnpm_global_config`),
+    /// which is independent of the project gate above.
+    struct PnpmGlobalGateGuard {
+        old: bool,
+    }
+
+    impl PnpmGlobalGateGuard {
+        fn set(enabled: bool) -> Self {
+            let old = aube_util::engine_context().read_pnpm_global_config;
+            aube_util::update_engine_context(|ctx| ctx.read_pnpm_global_config = enabled);
+            Self { old }
+        }
+    }
+
+    impl Drop for PnpmGlobalGateGuard {
+        fn drop(&mut self) {
+            let old = self.old;
+            aube_util::update_engine_context(|ctx| ctx.read_pnpm_global_config = old);
+        }
+    }
+
     #[cfg(unix)]
     fn mkfifo(path: &Path) {
         let status = std::process::Command::new("mkfifo")
@@ -788,9 +810,15 @@ mod tests {
     }
 
     #[test]
-    fn config_get_and_list_keep_pnpm_yaml_sources_gated_off() {
+    fn config_get_keeps_the_project_pnpm_yaml_gated_off() {
+        // PROJECT pnpm-workspace.yaml is gated by the project-scope
+        // `read_branded_pnpm_config`. With it off (non-pnpm incumbent), the
+        // project pnpm-workspace.yaml stays inert; the project `.npmrc` wins.
+        // The GLOBAL config.yaml is gated separately — turn it off here too so
+        // this test isolates the PROJECT gate.
         let _lock = config_test_lock();
         let _gate = PnpmReadGateGuard::set(false);
+        let _global_gate = PnpmGlobalGateGuard::set(false);
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         let home = dir.path().join("home");
@@ -804,11 +832,6 @@ mod tests {
             "autoInstallPeers: false\n",
         )
         .unwrap();
-        fs::write(
-            xdg.join("pnpm").join("config.yaml"),
-            "autoInstallPeers: false\n",
-        )
-        .unwrap();
 
         let _home = EnvGuard::set("HOME", &home);
         let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
@@ -819,15 +842,63 @@ mod tests {
         assert_eq!(
             get_cmd::find_value(&entries, &aliases).as_deref(),
             Some("true"),
-            "pnpm-named YAML sources must stay inert when the incumbent gate is off"
+            "project pnpm-workspace.yaml must stay inert when the project incumbent gate is off"
         );
 
         let seen = list::collect_seen(entries);
         assert_eq!(
             seen.get("auto-install-peers").map(String::as_str),
             Some("true"),
-            "config list must preserve the same pnpm-source gate"
+            "config list must preserve the same project pnpm-source gate"
         );
+    }
+
+    #[test]
+    fn config_get_reads_global_config_yaml_independent_of_the_project_gate() {
+        // GLOBAL config.yaml is gated by `read_pnpm_global_config`, NOT the
+        // project-scope `read_branded_pnpm_config`. So even with the PROJECT
+        // gate OFF (non-pnpm incumbent), the user's GLOBAL pnpm config.yaml is
+        // still read when the global gate is on (the asymmetric-read model:
+        // honor whatever global config the user has, ungated by cwd). With the
+        // global gate OFF, it goes inert.
+        let _lock = config_test_lock();
+        let _gate = PnpmReadGateGuard::set(false);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(xdg.join("pnpm")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        // No project sources — only the user's GLOBAL config.yaml sets it.
+        fs::write(
+            xdg.join("pnpm").join("config.yaml"),
+            "networkConcurrency: 3\n",
+        )
+        .unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _xdg = EnvGuard::set("XDG_CONFIG_HOME", &xdg);
+        let aliases = resolve_aliases("networkConcurrency");
+
+        {
+            let _global_gate = PnpmGlobalGateGuard::set(true);
+            let entries = read_merged(&project).unwrap();
+            assert_eq!(
+                get_cmd::find_value(&entries, &aliases).as_deref(),
+                Some("3"),
+                "global config.yaml must be read when the global gate is on, even with the project gate off"
+            );
+        }
+        {
+            let _global_gate = PnpmGlobalGateGuard::set(false);
+            let entries = read_merged(&project).unwrap();
+            assert_eq!(
+                get_cmd::find_value(&entries, &aliases).as_deref(),
+                None,
+                "global config.yaml must go inert when the global gate is off"
+            );
+        }
     }
 
     #[test]

@@ -7,16 +7,19 @@ use super::yarnrc;
 
 /// Whether the loader reads pnpm's global `~/.config/pnpm/auth.ini`
 /// (`<XDG_CONFIG_HOME>/pnpm/auth.ini`). Sourced from the engine context's
-/// `read_branded_pnpm_config` posture; defaults to `true` (upstream behavior:
+/// `read_pnpm_global_config` posture; defaults to `true` (upstream behavior:
 /// the file is read on every load and its auth tokens merged into the
-/// user-scope config). An embedder whose active package manager isn't pnpm
-/// clears that posture — under a non-pnpm incumbent that pnpm-named global file
-/// is another tool's state and must not be read at all (a name-based policy:
-/// anything with "pnpm" in the path is off unless pnpm is the incumbent). The
-/// `.npmrc` / `npmrcAuthFile` sources are unaffected; only the pnpm-named
-/// `auth.ini` is gated.
+/// user-scope config).
+///
+/// This is a GLOBAL / user-scope pnpm-named file, so it is gated by
+/// `read_pnpm_global_config` — NOT by the project-derived
+/// `read_branded_pnpm_config`. Global config has no project incumbent, so an
+/// embedder whose global config is its own neutral surface (e.g. nub) clears
+/// `read_pnpm_global_config` UNCONDITIONALLY and this file is never read,
+/// regardless of the cwd's incumbent PM. The `.npmrc` / `npmrcAuthFile`
+/// sources are unaffected; only the pnpm-named `auth.ini` is gated.
 fn pnpm_auth_ini_enabled() -> bool {
-    aube_util::engine_context().read_branded_pnpm_config
+    aube_util::engine_context().read_pnpm_global_config
 }
 
 impl NpmConfig {
