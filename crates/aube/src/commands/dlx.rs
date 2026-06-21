@@ -159,12 +159,17 @@ pub async fn run(args: DlxArgs) -> miette::Result<Option<i32>> {
         }
     }
 
+    // The user's real working directory, captured before we switch into the
+    // scratch dir below. Project-scope config (`.nvmrc`, `.npmrc`) is read
+    // from here, not from the throwaway scratch project.
+    let user_cwd = crate::dirs::cwd()?;
+
     // Resolve the runtime from the *user's* project before switching
     // into the scratch dir — a dlx scratch project has no version
     // config, and the OnceCell context is process-global, so resolving
     // here (original cwd) is what makes `aubx` honor the project's
     // .nvmrc / devEngines.
-    crate::runtime::ensure_for_cwd(&crate::dirs::cwd()?).await?;
+    crate::runtime::ensure_for_cwd(&user_cwd).await?;
 
     let tmp = tempfile::Builder::new()
         .prefix("aube-dlx-")
@@ -178,6 +183,19 @@ pub async fn run(args: DlxArgs) -> miette::Result<Option<i32>> {
     aube_util::fs_atomic::atomic_write(&project_dir.join("package.json"), &manifest_bytes)
         .into_diagnostic()
         .wrap_err("failed to write dlx package.json")?;
+
+    // Carry the user's *project-scope* `.npmrc` into the scratch project, so
+    // the transient install reads the same project config npm's `npx` does:
+    // the project registry, scoped registries + auth, and supply-chain knobs
+    // like `minimumReleaseAge` all apply to a dlx'd tool, not only the
+    // user-scope `~/.npmrc` + built-in defaults. Without this the scratch dir
+    // (under TMPDIR) has no project config and a per-project override would
+    // silently not apply to `aube dlx` / `aubx`. User- and global-scope npmrc
+    // are read by `install::run` regardless of cwd (they are not walked up
+    // from the project dir), so only the project scope needs forwarding —
+    // mirroring how the runtime resolution above is taken from the user's
+    // project rather than the scratch dir.
+    write_project_npmrc_into_scratch(&user_cwd, &project_dir)?;
 
     // install::run pulls its project dir from std::env::current_dir(), which
     // is process-global state. The CwdGuard below captures the current dir,
@@ -370,6 +388,44 @@ fn dlx_install_options(allow_build: &[String]) -> InstallOptions {
         opts.build_policy_override = Some(Arc::new(dlx_build_policy(allow_build)));
     }
     opts
+}
+
+/// Forward the user's project-scope `.npmrc` into the dlx scratch project so
+/// the transient install reads the same per-project config `npx` would: the
+/// project registry, scoped registries + auth, and supply-chain settings like
+/// `minimumReleaseAge`. Only the *project* scope is forwarded — user/global
+/// npmrc are read by `install::run` independent of cwd, so re-emitting them
+/// would double-apply.
+///
+/// Entries come back already normalized to `key=value` pairs from the same
+/// loader `install::run` consumes, so re-parsing the synthesized file yields
+/// identical values. Values are written verbatim (npm/aube parse the whole
+/// remainder after the first `=` as the value); a stray newline in a value —
+/// which `.npmrc` cannot represent and the loader could never have produced —
+/// is dropped defensively so a single entry can't inject extra lines.
+///
+/// Best-effort: a missing project `.npmrc` writes nothing, and the install
+/// still runs with user-scope config + built-in defaults (the prior behavior).
+fn write_project_npmrc_into_scratch(
+    user_cwd: &std::path::Path,
+    scratch_dir: &std::path::Path,
+) -> miette::Result<()> {
+    let entries = aube_registry::config::load_project_npmrc_entries(user_cwd);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut body = String::new();
+    for (key, value) in entries {
+        let value = value.replace(['\n', '\r'], "");
+        body.push_str(&key);
+        body.push('=');
+        body.push_str(&value);
+        body.push('\n');
+    }
+    aube_util::fs_atomic::atomic_write(&scratch_dir.join(".npmrc"), body.as_bytes())
+        .into_diagnostic()
+        .wrap_err("failed to write dlx scratch .npmrc")?;
+    Ok(())
 }
 
 fn dlx_build_policy(allow_build: &[String]) -> aube_scripts::BuildPolicy {
