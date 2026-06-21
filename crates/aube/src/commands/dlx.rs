@@ -710,6 +710,47 @@ mod tests {
     }
 
     #[test]
+    fn write_project_npmrc_forwards_project_scope_into_scratch() {
+        // A project `.npmrc` in the user's cwd is forwarded into the scratch
+        // project's `.npmrc`, so a dlx install reads the same project config
+        // `npx` would (registry / minimumReleaseAge / scoped auth).
+        let user = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user.path().join(".npmrc"),
+            "minimumReleaseAge=4321\nregistry=https://registry.example.test/\n",
+        )
+        .unwrap();
+
+        write_project_npmrc_into_scratch(user.path(), scratch.path()).unwrap();
+
+        let written = std::fs::read_to_string(scratch.path().join(".npmrc")).unwrap();
+        assert!(
+            written.contains("minimumReleaseAge=4321"),
+            "project minimumReleaseAge must be forwarded, got: {written:?}"
+        );
+        assert!(
+            written.contains("registry=https://registry.example.test/"),
+            "project registry must be forwarded, got: {written:?}"
+        );
+    }
+
+    #[test]
+    fn write_project_npmrc_no_project_config_writes_nothing() {
+        // No project `.npmrc` → no scratch `.npmrc` written; the install then
+        // runs on user-scope config + built-in defaults (the prior behavior).
+        let user = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        write_project_npmrc_into_scratch(user.path(), scratch.path()).unwrap();
+
+        assert!(
+            !scratch.path().join(".npmrc").exists(),
+            "no project .npmrc should leave the scratch dir without one"
+        );
+    }
+
+    #[test]
     fn dlx_build_policy_only_allows_explicit_approvals() {
         let allow_build = vec!["esbuild".to_string()];
         let policy = dlx_build_policy(&allow_build);
