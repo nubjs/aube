@@ -789,10 +789,24 @@ impl PackageJson {
         let insert = |out: &mut BTreeMap<String, String>,
                       obj: &serde_json::Map<String, serde_json::Value>| {
             for (k, v) in obj {
-                if let Some(s) = v.as_str()
-                    && is_valid_selector_key(k)
-                {
-                    out.insert(k.clone(), s.to_string());
+                match v {
+                    // Short-hand form: `"selector": "spec"`. The key is a
+                    // raw pnpm/yarn selector that the resolver parses later.
+                    serde_json::Value::String(s) if is_valid_selector_key(k) => {
+                        out.insert(k.clone(), s.clone());
+                    }
+                    // npm's nested-object form: `"parent": { ".": "spec",
+                    // "child": "spec" | { ... } }`. The nesting encodes an
+                    // ancestor chain outermost-first, exactly mirroring
+                    // pnpm's `parent>child` selector ordering, so we flatten
+                    // it into selector keys rather than silently dropping the
+                    // pin. (pnpm itself rejects object values; this branch
+                    // only fires for npm-authored manifests.) See
+                    // `flatten_nested_overrides` for the `.`/nesting rules.
+                    serde_json::Value::Object(nested) => {
+                        flatten_nested_overrides(k, nested, out);
+                    }
+                    _ => {}
                 }
             }
         };
@@ -1047,6 +1061,61 @@ impl AllowBuildRaw {
 /// reaches the resolver unchanged.
 fn is_valid_selector_key(k: &str) -> bool {
     !k.is_empty()
+}
+
+/// Flatten one entry of npm's nested-object `overrides` form into pnpm
+/// `>`-joined selector keys, inserting each resolved rule into `out`.
+///
+/// npm lets an override value be an object instead of a string:
+///
+/// ```json
+/// "overrides": { "parent": { ".": "1.0.0", "child": "2.0.0" } }
+/// ```
+///
+/// The nesting is an ancestor chain written outermost-first — the same
+/// direction as pnpm's `parent>child` selector — so the translation is
+/// exact:
+///
+/// - a string child `"child": "spec"` becomes `<chain>>child = spec`;
+/// - the reserved key `"."` (npm's "this package itself") becomes a rule
+///   targeting the current chain's innermost segment, i.e. selector
+///   `<chain> = spec`;
+/// - a nested object recurses with the child appended to the chain.
+///
+/// Outer keys may carry a version req (`"parent@2.0.0": { ... }`); they
+/// pass through verbatim because aube's selector parser already accepts a
+/// `name@req` segment. pnpm's own `overrides` are string-only (pnpm errors
+/// on an object value), so this path is reached only for npm-authored
+/// manifests, where silently dropping the pin would yield a wrong graph.
+fn flatten_nested_overrides(
+    chain: &str,
+    nested: &serde_json::Map<String, serde_json::Value>,
+    out: &mut BTreeMap<String, String>,
+) {
+    if chain.is_empty() {
+        return;
+    }
+    for (key, val) in nested {
+        match (key.as_str(), val) {
+            (".", serde_json::Value::String(spec)) if is_valid_selector_key(chain) => {
+                // Override the chain's own innermost package.
+                out.insert(chain.to_string(), spec.clone());
+            }
+            (child, serde_json::Value::String(spec)) if child != "." => {
+                let selector = format!("{chain}>{child}");
+                if is_valid_selector_key(&selector) {
+                    out.insert(selector, spec.clone());
+                }
+            }
+            (child, serde_json::Value::Object(inner)) if child != "." => {
+                let selector = format!("{chain}>{child}");
+                flatten_nested_overrides(&selector, inner, out);
+            }
+            // `.` with a non-string value, or any other non-string leaf, is
+            // not a valid npm override target — skip it.
+            _ => {}
+        }
+    }
 }
 
 /// Append the string entries of `arr` to `dst`, skipping duplicates
@@ -1727,11 +1796,69 @@ mod tests {
     }
 
     #[test]
-    fn overrides_map_skips_object_values() {
-        // npm allows nested override objects; we don't support those yet,
-        // so they should be silently dropped rather than panicking.
+    fn overrides_map_flattens_nested_child() {
+        // npm's nested-object form: override `bar` only when it's a child
+        // of `foo`. Flattens to the pnpm parent-chain selector `foo>bar`
+        // instead of being silently dropped.
         let p = parse(r#"{"overrides": {"foo": {"bar": "1.0.0"}}}"#);
-        assert!(p.overrides_map().is_empty());
+        let m = p.overrides_map();
+        assert_eq!(m.get("foo>bar").map(String::as_str), Some("1.0.0"));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn overrides_map_flattens_nested_dot_self_and_child() {
+        // `.` overrides the parent itself; sibling keys override children
+        // scoped under the parent. `foo` itself → 1.0.0; `bar` under foo
+        // → 1.0.0.
+        let p = parse(r#"{"overrides": {"foo": {".": "1.0.0", "bar": "2.0.0"}}}"#);
+        let m = p.overrides_map();
+        assert_eq!(m.get("foo").map(String::as_str), Some("1.0.0"));
+        assert_eq!(m.get("foo>bar").map(String::as_str), Some("2.0.0"));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn overrides_map_flattens_deeply_nested_chain() {
+        // Arbitrary depth: override foo only when child of bar, only when
+        // bar is a child of baz → selector `baz>bar>foo`.
+        let p = parse(r#"{"overrides": {"baz": {"bar": {"foo": "1.0.0"}}}}"#);
+        let m = p.overrides_map();
+        assert_eq!(m.get("baz>bar>foo").map(String::as_str), Some("1.0.0"));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn overrides_map_flattens_nested_with_versioned_parent() {
+        // npm permits a version-pinned outer key: override foo only when
+        // it's a child of bar@2.0.0. The `name@req` segment passes through
+        // to the selector verbatim (the resolver parses it).
+        let p = parse(r#"{"overrides": {"bar@2.0.0": {"foo": "1.0.0"}}}"#);
+        let m = p.overrides_map();
+        assert_eq!(m.get("bar@2.0.0>foo").map(String::as_str), Some("1.0.0"));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn overrides_map_nested_does_not_drop_silently() {
+        // Regression guard for the original bug: a manifest whose only
+        // override is a nested object must NOT produce an empty map.
+        let p = parse(r#"{"overrides": {"foo": {"bar": "1.0.0"}}}"#);
+        assert!(
+            !p.overrides_map().is_empty(),
+            "nested-object overrides must not be silently dropped"
+        );
+    }
+
+    #[test]
+    fn overrides_map_nested_alias_value_round_trips() {
+        // The replacement spec inside a nested form may be any value npm
+        // accepts for a dependency, including an `npm:` alias.
+        let p = parse(r#"{"overrides": {"foo": {"bar": "npm:baz@^2"}}}"#);
+        assert_eq!(
+            p.overrides_map().get("foo>bar").map(String::as_str),
+            Some("npm:baz@^2")
+        );
     }
 
     #[test]
