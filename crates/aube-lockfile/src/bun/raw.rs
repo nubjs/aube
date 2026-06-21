@@ -80,6 +80,18 @@ pub(super) struct BunEntry {
     pub(super) ident: String,
     pub(super) meta: RawBunMeta,
     pub(super) integrity: Option<String>,
+    /// Registry tuple slot 1 — the resolved registry/tarball URL bun
+    /// writes for an npm package installed from a non-default registry
+    /// (`[ident, "<url>", {meta}, integrity]`). bun emits `""` for the
+    /// default registry, so an empty slot means "default" and is
+    /// dropped here. Only the registry shape carries a URL string
+    /// *before* the meta object; a git/github entry's third element is
+    /// the `owner-repo-sha` repo-tag, which sits *after* the meta object
+    /// and must not be mistaken for a registry URL. Re-emitting this on
+    /// round-trip is what keeps a scoped/private-registry bun.lock from
+    /// silently re-routing to the default npm registry on the next
+    /// resolve.
+    pub(super) registry_url: Option<String>,
 }
 
 impl BunEntry {
@@ -92,13 +104,25 @@ impl BunEntry {
 
         let mut meta = RawBunMeta::default();
         let mut integrity: Option<String> = None;
+        let mut registry_url: Option<String> = None;
+        let mut seen_meta = false;
         for el in arr.iter().skip(1) {
             match el {
                 serde_json::Value::Object(_) => {
                     meta = serde_json::from_value(el.clone()).unwrap_or_default();
+                    seen_meta = true;
                 }
                 serde_json::Value::String(s) if is_integrity_hash(s) => {
                     integrity = Some(s.clone());
+                }
+                // The registry URL is the lone non-integrity string that
+                // precedes the meta object (slot 1 of the npm tuple). A
+                // git/github repo-tag is also a non-integrity string but
+                // follows the meta object, so gate on `!seen_meta`. An
+                // empty slot is bun's "default registry" marker — leave
+                // it `None` so re-emit writes `""` exactly as bun does.
+                serde_json::Value::String(s) if !seen_meta && !s.is_empty() => {
+                    registry_url = Some(s.clone());
                 }
                 _ => {}
             }
@@ -108,6 +132,7 @@ impl BunEntry {
             ident,
             meta,
             integrity,
+            registry_url,
         })
     }
 }

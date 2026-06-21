@@ -286,12 +286,33 @@ pub fn write(
             let arr: Vec<Value> = sorted.into_iter().map(Value::String).collect();
             meta.insert("optionalPeers".to_string(), Value::Array(arr));
         }
+        // Preserve optional-platform packages' filter metadata so
+        // bun's platform-aware resolution still has what it needs
+        // on the next install. bun's meta field order is
+        // `os → cpu → libc → bin` (see `writePackageInfoObject` in
+        // bun's `bun.lock.zig`), so emit the platform filters before
+        // `bin` — otherwise a package carrying both round-trips to a
+        // different byte sequence than bun produces.
+        if !pkg.os.is_empty() {
+            let arr: Vec<Value> = pkg.os.iter().map(|s| Value::String(s.clone())).collect();
+            meta.insert("os".to_string(), Value::Array(arr));
+        }
+        if !pkg.cpu.is_empty() {
+            let arr: Vec<Value> = pkg.cpu.iter().map(|s| Value::String(s.clone())).collect();
+            meta.insert("cpu".to_string(), Value::Array(arr));
+        }
+        if !pkg.libc.is_empty() {
+            let arr: Vec<Value> = pkg.libc.iter().map(|s| Value::String(s.clone())).collect();
+            meta.insert("libc".to_string(), Value::Array(arr));
+        }
         // Preserve the full `bin:` map — bun's meta block records
         // executables by name so `bun install --frozen-lockfile` can
         // recreate the `.bin` shims without re-reading each tarball's
         // manifest. pnpm collapses this to `hasBin: true`; we keep
         // both representations on `LockedPackage.bin` so either
-        // writer can render byte-identical output.
+        // writer can render byte-identical output. bun emits `bin`
+        // LAST in the meta object (after os/cpu/libc), so it's
+        // inserted here, after the platform filters above.
         //
         // Prefer the original shape captured in `extra_meta["bin"]`
         // (string vs object) so a bun-authored lockfile that wrote
@@ -313,21 +334,6 @@ pub fn write(
             if !real_bins.is_empty() {
                 meta.insert("bin".to_string(), Value::Object(real_bins));
             }
-        }
-        // Preserve optional-platform packages' filter metadata so
-        // bun's platform-aware resolution still has what it needs
-        // on the next install.
-        if !pkg.os.is_empty() {
-            let arr: Vec<Value> = pkg.os.iter().map(|s| Value::String(s.clone())).collect();
-            meta.insert("os".to_string(), Value::Array(arr));
-        }
-        if !pkg.cpu.is_empty() {
-            let arr: Vec<Value> = pkg.cpu.iter().map(|s| Value::String(s.clone())).collect();
-            meta.insert("cpu".to_string(), Value::Array(arr));
-        }
-        if !pkg.libc.is_empty() {
-            let arr: Vec<Value> = pkg.libc.iter().map(|s| Value::String(s.clone())).collect();
-            meta.insert("libc".to_string(), Value::Array(arr));
         }
         // Extras: anything bun wrote on the meta block that we don't
         // model on `LockedPackage` (e.g. `deprecated`,
@@ -459,9 +465,16 @@ pub fn write(
         } else {
             let ident = format!("{}@{}", ident_name, pkg.version);
             let integrity = pkg.integrity.clone().unwrap_or_default();
+            // Slot 1 is bun's registry/tarball URL. A non-default
+            // registry preserves the full URL here; the default registry
+            // is the empty string (bun's "use default" marker). Re-emit
+            // whatever the parse carried on `tarball_url` so a
+            // scoped/private-registry bun.lock round-trips without
+            // re-routing to the default npm registry.
+            let registry = pkg.tarball_url.clone().unwrap_or_default();
             Value::Array(vec![
                 Value::String(ident),
-                Value::String(String::new()),
+                Value::String(registry),
                 Value::Object(meta),
                 Value::String(integrity),
             ])
@@ -574,13 +587,20 @@ pub fn write(
     // catalog / catalogs / patchedDependencies / trustedDependencies
     // are all round-tripped from the parsed graph; anything else the
     // lockfile carried drops through `graph.extra_fields`.
+    // bun's native top-level block order is
+    // `trustedDependencies → patchedDependencies → overrides →
+    // catalog → catalogs` (see `bun.lock.zig`'s writer, which emits
+    // them in that sequence between `workspaces` and `packages`).
+    // Push in the same order so a bun-authored lockfile round-trips
+    // byte-identically rather than reshuffling the metadata blocks.
     let mut top_level_extras: Vec<(String, Value)> = Vec::new();
-    if !graph.overrides.is_empty() {
-        let mut obj = serde_json::Map::new();
-        for (k, v) in &graph.overrides {
-            obj.insert(k.clone(), Value::String(v.clone()));
-        }
-        top_level_extras.push(("overrides".to_string(), Value::Object(obj)));
+    if !graph.trusted_dependencies.is_empty() {
+        let arr: Vec<Value> = graph
+            .trusted_dependencies
+            .iter()
+            .map(|s| Value::String(s.clone()))
+            .collect();
+        top_level_extras.push(("trustedDependencies".to_string(), Value::Array(arr)));
     }
     if !graph.patched_dependencies.is_empty() {
         let mut obj = serde_json::Map::new();
@@ -589,13 +609,12 @@ pub fn write(
         }
         top_level_extras.push(("patchedDependencies".to_string(), Value::Object(obj)));
     }
-    if !graph.trusted_dependencies.is_empty() {
-        let arr: Vec<Value> = graph
-            .trusted_dependencies
-            .iter()
-            .map(|s| Value::String(s.clone()))
-            .collect();
-        top_level_extras.push(("trustedDependencies".to_string(), Value::Array(arr)));
+    if !graph.overrides.is_empty() {
+        let mut obj = serde_json::Map::new();
+        for (k, v) in &graph.overrides {
+            obj.insert(k.clone(), Value::String(v.clone()));
+        }
+        top_level_extras.push(("overrides".to_string(), Value::Object(obj)));
     }
     if let Some(default_catalog) = graph.catalogs.get("default") {
         let mut obj = serde_json::Map::new();

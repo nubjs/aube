@@ -558,6 +558,218 @@ fn test_write_byte_identical_to_native_bun() {
     }
 }
 
+/// RT-1: the top-level metadata blocks must round-trip
+/// byte-identically in bun's native order — `trustedDependencies →
+/// patchedDependencies → overrides → catalog` (between `workspaces`
+/// and `packages`). The pre-existing byte-identity fixture carries no
+/// top-level metadata blocks, so a wrong block order slipped through.
+///
+/// Scope note: this asserts byte-identity for the four blocks bun and
+/// nub render identically. Named `catalogs` (object-of-objects) and an
+/// EMPTY `packages` block are deliberately excluded — nub currently
+/// renders a named catalog's inner object inline (bun renders it
+/// multi-line) and emits `"packages": {\n  }` for empty (bun emits
+/// `{}`). Those two rendering drifts are real but out of this lane's
+/// scope (B-7 is block *order*, not these renderings); they're tracked
+/// as follow-ups. `catalogs` ordering/preservation is still covered
+/// below by a parse round-trip.
+#[test]
+fn test_write_byte_identical_top_level_block_order() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let sri = fake_sri('a');
+    // Hand-authored in bun 1.3.x's exact JSONC style: 2-space indent,
+    // trailing commas on nested-object members, blocks in bun's order,
+    // a non-empty `packages` section.
+    let original = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {{
+    "": {{
+      "name": "root",
+      "dependencies": {{
+        "lodash": "^4.17.21",
+      }},
+    }},
+  }},
+  "trustedDependencies": ["esbuild", "sharp"],
+  "patchedDependencies": {{
+    "lodash@4.17.21": "patches/lodash@4.17.21.patch",
+  }},
+  "overrides": {{
+    "lodash": "^4.17.21",
+  }},
+  "catalog": {{
+    "react": "^18.2.0",
+  }},
+  "packages": {{
+    "lodash": ["lodash@4.17.21", "", {{}}, "{sri}"],
+  }}
+}}
+"#
+    );
+    std::fs::write(tmp.path(), &original).unwrap();
+    let graph = parse(tmp.path()).unwrap();
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        dependencies: [("lodash".to_string(), "^4.17.21".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    assert_eq!(
+        written, original,
+        "top-level block order/rendering drifted from bun's native output"
+    );
+
+    // Named `catalogs` still round-trips through parse (the byte-render
+    // of its inner object is a separate, tracked drift) — guard the
+    // data path here so the block isn't silently dropped.
+    let with_catalogs = r#"{
+  "lockfileVersion": 1,
+  "workspaces": { "": { "name": "root" } },
+  "catalogs": {
+    "evens": { "date-fns": "^2.30.0" }
+  },
+  "packages": {}
+}"#;
+    std::fs::write(tmp.path(), with_catalogs).unwrap();
+    let graph2 = parse(tmp.path()).unwrap();
+    assert_eq!(
+        graph2.catalogs["evens"]["date-fns"].specifier, "^2.30.0",
+        "named catalogs must survive parse"
+    );
+    let out2 = tempfile::NamedTempFile::new().unwrap();
+    write(out2.path(), &graph2, &manifest).unwrap();
+    let reparsed = parse(out2.path()).unwrap();
+    assert_eq!(
+        reparsed.catalogs["evens"]["date-fns"].specifier, "^2.30.0",
+        "named catalogs must survive a write→reparse round-trip"
+    );
+}
+
+/// RT-2: a non-default registry URL in npm tuple slot 1 must survive a
+/// round-trip. bun writes the full registry/tarball URL at slot 1 for
+/// a scoped/private-registry dep (`""` only for the default registry);
+/// dropping it re-routes the next resolve to the default npm registry
+/// (404 / name-squat risk). The pre-existing fixture only has
+/// default-registry (`""`) entries, so the data-loss slipped through.
+#[test]
+fn test_write_byte_identical_non_default_registry_url() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let sri = fake_sri('a');
+    // `@acme/widget` resolves from a private registry — its full
+    // tarball URL sits in slot 1. `picocolors` is a default-registry
+    // dep with the empty slot, so both branches are exercised.
+    let original = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {{
+    "": {{
+      "name": "root",
+      "dependencies": {{
+        "@acme/widget": "^1.0.0",
+        "picocolors": "^1.1.1",
+      }},
+    }},
+  }},
+  "packages": {{
+    "@acme/widget": ["@acme/widget@1.0.0", "https://npm.acme.internal/@acme/widget/-/widget-1.0.0.tgz", {{}}, "{sri}"],
+
+    "picocolors": ["picocolors@1.1.1", "", {{}}, "{sri}"],
+  }}
+}}
+"#
+    );
+    std::fs::write(tmp.path(), &original).unwrap();
+    let graph = parse(tmp.path()).unwrap();
+
+    // The private-registry URL must land on the model, not be dropped.
+    assert_eq!(
+        graph.packages["@acme/widget@1.0.0"].tarball_url.as_deref(),
+        Some("https://npm.acme.internal/@acme/widget/-/widget-1.0.0.tgz"),
+        "non-default registry URL dropped on parse"
+    );
+    // The default-registry dep keeps the empty slot (None on the model).
+    assert_eq!(
+        graph.packages["picocolors@1.1.1"].tarball_url, None,
+        "default-registry empty slot must parse to None, not a literal empty URL"
+    );
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        dependencies: [
+            ("@acme/widget".to_string(), "^1.0.0".to_string()),
+            ("picocolors".to_string(), "^1.1.1".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    assert_eq!(
+        written, original,
+        "non-default registry URL or default empty-slot drifted on re-emit"
+    );
+}
+
+/// RT-3: a package carrying both `bin` and `os`/`cpu` must emit them in
+/// bun's meta-object order — `os → cpu → libc → bin` (bin LAST). The
+/// pre-existing fixtures never had a single entry with both, so the
+/// wrong `bin`-before-platform-filters order slipped through.
+#[test]
+fn test_write_byte_identical_bin_after_platform_filters() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let sri = fake_sri('a');
+    // `esbuild` ships a `bin` AND platform filters — bun renders
+    // `os`, then `cpu`, then `bin` last on the meta object.
+    let original = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {{
+    "": {{
+      "name": "root",
+      "dependencies": {{
+        "esbuild": "^0.21.0",
+      }},
+    }},
+  }},
+  "packages": {{
+    "esbuild": ["esbuild@0.21.0", "", {{ "os": ["darwin", "linux"], "cpu": ["arm64", "x64"], "bin": {{ "esbuild": "bin/esbuild" }} }}, "{sri}"],
+  }}
+}}
+"#
+    );
+    std::fs::write(tmp.path(), &original).unwrap();
+    let graph = parse(tmp.path()).unwrap();
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        dependencies: [("esbuild".to_string(), "^0.21.0".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+
+    assert_eq!(
+        written, original,
+        "per-package meta field order (os/cpu/libc then bin) drifted from bun's output"
+    );
+}
+
 /// `configVersion` must echo back whatever was parsed, not a
 /// hardcoded `1`. Regression guard for a future bun release that
 /// bumps the field — without this, aube would silently downgrade

@@ -175,6 +175,11 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 os: entry.meta.os.iter().cloned().collect(),
                 cpu: entry.meta.cpu.iter().cloned().collect(),
                 libc: entry.meta.libc.iter().cloned().collect(),
+                // Carry bun's registry tuple slot 1 (a non-default
+                // registry/tarball URL) so re-emit doesn't drop it and
+                // re-route a scoped/private dep to the default npm
+                // registry on the next resolve. Empty/default → None.
+                tarball_url: entry.registry_url.clone(),
                 declared_dependencies: declared,
                 bin: bin_map,
                 extra_meta,
