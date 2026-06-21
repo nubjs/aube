@@ -270,12 +270,33 @@ impl RegistryClient {
             let req = self
                 .http_tarball_for_package(registry_url, &package_name)
                 .request(reqwest::Method::GET, url);
-            self.authed_for_package(req, registry_url, &package_name)
+            // Default path: resolve auth against the tarball's own URL. A
+            // tarball on the same origin as the configured registry picks
+            // up its credentials; a tarball on a *different* origin (a
+            // separate CDN) resolves to nothing and is sent
+            // unauthenticated — npm's default.
+            if self.has_resolved_auth_for_package(url, &package_name) {
+                return self.authed_for_package(req, url, &package_name);
+            }
+            // `always-auth` widening: the per-URL lookup found nothing, but
+            // the package's home registry has `always-auth` set, so attach
+            // that registry's credentials even though the tarball lives on
+            // a different origin. Keyed off the home registry URL so the
+            // existing prefix lookup resolves the configured token.
+            let home_registry = self.config.registry_for(&package_name);
+            if self.config.always_auth_for(home_registry) {
+                return self.authed_for_package(req, home_registry, &package_name);
+            }
+            self.authed_for_package(req, url, &package_name)
         } else {
             let req = self
                 .http_tarball_for(registry_url)
                 .request(reqwest::Method::GET, url);
-            self.authed(req, registry_url)
+            if self.has_resolved_auth_for(url) || !self.config.always_auth_for(registry_url) {
+                self.authed(req, url)
+            } else {
+                self.authed(req, registry_url)
+            }
         }
     }
 
@@ -707,6 +728,71 @@ mod tests {
             Some(&reqwest::header::HeaderValue::from_static(
                 "Bearer registry-token"
             )),
+        );
+    }
+
+    #[test]
+    fn cross_host_tarball_is_unauthenticated_by_default() {
+        // A tarball on a different origin than the configured registry is
+        // sent without credentials unless `always-auth` is set — npm's
+        // default, and the behavior `always-auth` exists to override.
+        let mut config = NpmConfig {
+            registry: "https://registry.example.com/".to_string(),
+            ..Default::default()
+        };
+        config.auth_by_uri.insert(
+            "//registry.example.com/".to_string(),
+            AuthConfig {
+                auth_token: Some("registry-token".to_string()),
+                ..Default::default()
+            },
+        );
+        let client = RegistryClient::from_config(config);
+
+        let req = client
+            .authed_tarball_get(
+                "https://cdn.example.net/lodash/-/lodash-1.0.0.tgz",
+                "https://cdn.example.net/lodash/-/lodash-1.0.0.tgz",
+            )
+            .build()
+            .unwrap();
+        assert!(
+            req.headers().get(reqwest::header::AUTHORIZATION).is_none(),
+            "cross-host tarball must not leak the registry token by default"
+        );
+    }
+
+    #[test]
+    fn always_auth_attaches_registry_token_to_cross_host_tarball() {
+        // With `always-auth` set for the home registry, its token is
+        // attached even to a tarball hosted on a different origin.
+        let mut config = NpmConfig {
+            registry: "https://registry.example.com/".to_string(),
+            ..Default::default()
+        };
+        config.auth_by_uri.insert(
+            "//registry.example.com/".to_string(),
+            AuthConfig {
+                auth_token: Some("registry-token".to_string()),
+                always_auth: true,
+                ..Default::default()
+            },
+        );
+        let client = RegistryClient::from_config(config);
+
+        let req = client
+            .authed_tarball_get(
+                "https://cdn.example.net/lodash/-/lodash-1.0.0.tgz",
+                "https://cdn.example.net/lodash/-/lodash-1.0.0.tgz",
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get(reqwest::header::AUTHORIZATION),
+            Some(&reqwest::header::HeaderValue::from_static(
+                "Bearer registry-token"
+            )),
+            "always-auth must attach the home registry's token cross-host"
         );
     }
 }

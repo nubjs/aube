@@ -468,6 +468,43 @@ pub(crate) fn effective_package_extensions(
     package_extensions
 }
 
+/// Effective `(os, cpu, libc)` platform-widening triple: the
+/// `package.json`/`pnpm-workspace.yaml` value from
+/// [`aube_manifest::effective_supported_architectures`] unioned with the
+/// config-sourced `supportedArchitectures` object setting. The latter is
+/// where a Yarn `.yarnrc.yml` `supportedArchitectures:` lands — yarnrc
+/// translation emits it as the JSON-object `supportedArchitectures` npmrc
+/// key, which flows through `merge_json_object_setting` exactly like
+/// `packageExtensions`. Unioning (rather than overriding) matches how the
+/// manifest and workspace-yaml sources already combine, and keeps the
+/// arch set additive across every config home.
+pub(crate) fn effective_supported_architectures(
+    manifest: &aube_manifest::PackageJson,
+    ws_config: &aube_manifest::workspace::WorkspaceConfig,
+    ctx: &aube_settings::ResolveCtx<'_>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (mut os, mut cpu, mut libc) =
+        aube_manifest::effective_supported_architectures(manifest, ws_config);
+    let mut obj: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    merge_json_object_setting(ctx, "supportedArchitectures", &mut obj);
+    let extend_field = |dst: &mut Vec<String>, key: &str| {
+        let Some(serde_json::Value::Array(arr)) = obj.get(key) else {
+            return;
+        };
+        for v in arr {
+            if let Some(s) = v.as_str()
+                && !dst.iter().any(|existing| existing == s)
+            {
+                dst.push(s.to_string());
+            }
+        }
+    };
+    extend_field(&mut os, "os");
+    extend_field(&mut cpu, "cpu");
+    extend_field(&mut libc, "libc");
+    (os, cpu, libc)
+}
+
 /// Stamp pnpm's `packageExtensionsChecksum` / `pnpmfileChecksum` onto
 /// `graph` so a written pnpm-lock.yaml matches what pnpm itself records,
 /// keeping config-drift detection in sync (a wrong/absent value makes
@@ -834,7 +871,7 @@ pub(crate) fn configure_resolver(
     let registry_supports_time_field = resolve_registry_supports_time_field(settings_ctx);
     let force_metadata_primer = resolve_force_metadata_primer(settings_ctx);
     let (sup_os, sup_cpu, sup_libc) =
-        aube_manifest::effective_supported_architectures(manifest, workspace_config);
+        effective_supported_architectures(manifest, workspace_config, settings_ctx);
     // pnpm-lock.yaml, aube-lock.yaml, bun.lock, and package-lock.json are
     // all committed, cross-platform artifacts that carry per-package os/cpu
     // metadata. When the user hasn't declared

@@ -121,6 +121,11 @@ pub struct NpmConfig {
     /// `httpProxy`). Resolved into the final `https_proxy` /
     /// `http_proxy` values during `apply_proxy_env`.
     pub npmrc_proxy: Option<String>,
+    /// Top-level (unscoped) `always-auth=true` default. npm v6 honored a
+    /// bare `always-auth`; it applies to the default registry. A
+    /// per-registry `//host/:always-auth` on [`AuthConfig::always_auth`]
+    /// takes precedence for that host. Defaults to `false`.
+    pub always_auth: bool,
 }
 
 /// Authentication for a specific registry.
@@ -134,6 +139,13 @@ pub struct AuthConfig {
     pub password: Option<String>,
     pub token_helper: Option<String>,
     pub tls: TlsConfig,
+    /// `always-auth` (`//host/:always-auth=true`, or npm's bare
+    /// `always-auth`, or Yarn's `npmAlwaysAuth`). When set, this
+    /// registry's credentials are attached to every request for it —
+    /// including tarball downloads hosted on a *different* origin than
+    /// the registry, which are otherwise sent unauthenticated. Defaults
+    /// to `false` (npm's default: auth is not sent cross-origin).
+    pub always_auth: bool,
 }
 
 impl AuthConfig {
@@ -175,6 +187,7 @@ impl Default for NpmConfig {
             cafile: None,
             ca: Vec::new(),
             npmrc_proxy: None,
+            always_auth: false,
         }
     }
 }

@@ -117,6 +117,19 @@ impl NpmConfig {
             .and_then(|auth| auth.token_helper.as_deref())
     }
 
+    /// Whether `always-auth` is in effect for `registry_url`: a
+    /// per-registry `//host/:always-auth` wins, otherwise the config-wide
+    /// top-level default applies. When true, this registry's credentials
+    /// should be attached even to off-origin requests (e.g. tarballs on a
+    /// separate CDN) that the per-URL lookup would otherwise leave
+    /// unauthenticated.
+    pub fn always_auth_for(&self, registry_url: &str) -> bool {
+        self.registry_config_for(registry_url)
+            .map(|auth| auth.always_auth)
+            .unwrap_or(false)
+            || self.always_auth
+    }
+
     /// Get the basic auth (_auth) for a given registry URL.
     pub fn basic_auth_for(&self, registry_url: &str) -> Option<String> {
         self.basic_auth_from_config(self.registry_config_for(registry_url)?)
@@ -287,6 +300,14 @@ impl NpmConfig {
                     )),
                     |auth| auth.password = Some(value),
                 );
+            } else if key == "always-auth" || key == "always_auth" {
+                // Bare `always-auth` is a valid npm v6 top-level key — it
+                // sets the config-wide default (applied to the default
+                // registry). A per-registry `//host/:always-auth` below
+                // takes precedence for that host. No rescope warning: the
+                // unscoped spelling is legitimate here, unlike unscoped
+                // credentials.
+                self.always_auth = parse_npmrc_bool(&value);
             } else if matches!(key.as_str(), "cert" | "key") {
                 let suffix = key.clone();
                 let registry = registries.slot(source);
@@ -561,6 +582,15 @@ impl NpmConfig {
                                 explicit_uri_fields.insert((uri_key, "key"));
                             }
                         }
+                        "always-auth" | "always_auth" => {
+                            let entry = auth_entry_for_uri(
+                                &mut self.auth_by_uri,
+                                &mut self.scoped_auth_by_uri,
+                                &uri_key,
+                                scope,
+                            );
+                            entry.always_auth = parse_npmrc_bool(&value);
+                        }
                         _ => {} // Ignore unknown suffixes for now
                     }
                 }
@@ -654,6 +684,18 @@ fn split_uri_scope_key(uri: &str) -> (&str, Option<&str>) {
         return (base, Some(scope));
     }
     (uri, None)
+}
+
+/// Parse an npmrc-style boolean. npm/pnpm treat `true`/`false` (and the
+/// bare presence of the key) as the canonical spellings; accept the
+/// common truthy synonyms case-insensitively so a Yarn `npmAlwaysAuth:
+/// true` (already emitted as the string `"true"`) and a hand-written
+/// `.npmrc` both resolve.
+fn parse_npmrc_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
 }
 
 fn canonical_rescoped_suffix(suffix: &str) -> Option<&'static str> {

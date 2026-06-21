@@ -526,7 +526,7 @@ pub(super) fn apply_lockfile_graph_platform_rules(
     // never runs on the lockfile-happy path, so this pass is
     // what makes cross-platform lockfile installs work.
     let (sup_os, sup_cpu, sup_libc) =
-        aube_manifest::effective_supported_architectures(manifest, ws_config);
+        super::settings::effective_supported_architectures(manifest, ws_config, settings_ctx);
     let supported_architectures = aube_resolver::SupportedArchitectures {
         os: sup_os,
         cpu: sup_cpu,

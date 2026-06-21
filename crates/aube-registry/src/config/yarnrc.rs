@@ -324,6 +324,13 @@ struct YarnRc {
     npm_registry_server: Option<String>,
     npm_auth_token: Option<String>,
     npm_auth_ident: Option<String>,
+    // `npmAlwaysAuth: true` tells Yarn to attach the registry's
+    // credentials to every request for that registry — including tarball
+    // downloads on a different host than the registry, which are otherwise
+    // sent unauthenticated. Translated to the npmrc-shaped `always-auth`
+    // key (top-level here, `//host/:always-auth` per-registry, or scoped
+    // via the owning scope's registry). See `into_entries`.
+    npm_always_auth: Option<bool>,
     node_linker: Option<String>,
     // Top-level network/TLS settings. Yarn Berry expresses the CA bundle
     // as a *file path* (`httpsCaFilePath`) and the proxies as plain URLs
@@ -331,6 +338,14 @@ struct YarnRc {
     // `cafile` / `http-proxy` / `https-proxy` settings the registry client
     // already consumes. `enableStrictSsl` maps onto `strict-ssl`.
     https_ca_file_path: Option<String>,
+    // mTLS client certificate / key. Yarn Berry expresses both as *file
+    // paths* (`httpsCertFilePath` / `httpsKeyFilePath`). The registry
+    // client's client-identity consumer takes inline PEM (`cert` / `key`),
+    // not a path, so the file contents are loaded from disk at translate
+    // time and emitted as the inline `cert` / `key` npmrc keys — see
+    // `into_entries`.
+    https_cert_file_path: Option<String>,
+    https_key_file_path: Option<String>,
     http_proxy: Option<String>,
     https_proxy: Option<String>,
     enable_strict_ssl: Option<bool>,
@@ -357,6 +372,16 @@ struct YarnRc {
     // nested entries round-trip untouched.
     #[serde(default)]
     package_extensions: BTreeMap<String, serde_json::Value>,
+    // Yarn Berry's `supportedArchitectures:` — `{ os, cpu, libc }` arrays,
+    // each entry a concrete value or the literal `"current"` (the host
+    // triple). The shape is identical to pnpm's
+    // `pnpm.supportedArchitectures`, so it is captured verbatim and
+    // re-emitted as a JSON object string under the `supportedArchitectures`
+    // settings key — the same object-setting channel pnpm's value flows
+    // through, where the install path unions it into the resolver's
+    // platform filter. Captured as a generic `serde_json::Value` so the
+    // arrays round-trip untouched.
+    supported_architectures: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -365,6 +390,7 @@ struct YarnScope {
     npm_registry_server: Option<String>,
     npm_auth_token: Option<String>,
     npm_auth_ident: Option<String>,
+    npm_always_auth: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -372,12 +398,18 @@ struct YarnScope {
 struct YarnRegistry {
     npm_auth_token: Option<String>,
     npm_auth_ident: Option<String>,
+    npm_always_auth: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct YarnNetworkSettings {
     https_ca_file_path: Option<String>,
+    // Per-host mTLS client cert/key paths. Translated to the per-registry
+    // inline `//host/:cert` / `//host/:key` keys (PEM loaded from disk),
+    // mirroring how the top-level pair maps onto `cert` / `key`.
+    https_cert_file_path: Option<String>,
+    https_key_file_path: Option<String>,
 }
 
 impl YarnRc {
@@ -403,6 +435,22 @@ impl YarnRc {
             self.npm_auth_token.as_deref(),
             self.npm_auth_ident.as_deref(),
         );
+        // Top-level `npmAlwaysAuth` applies to the default registry. With
+        // no default registry configured it scopes to the public registry
+        // (npmrc's bare `always-auth` does the same), so emit the unscoped
+        // key when there's no explicit default.
+        if self.npm_always_auth == Some(true) {
+            match &default_registry {
+                Some(registry) => {
+                    push(
+                        &mut out,
+                        format!("{}:always-auth", registry_uri_key(registry)),
+                        "true",
+                    );
+                }
+                None => push(&mut out, "always-auth", "true"),
+            }
+        }
 
         for (registry, config) in self.npm_registries {
             let registry = normalize_registry_url(&registry);
@@ -412,6 +460,13 @@ impl YarnRc {
                 config.npm_auth_token.as_deref(),
                 config.npm_auth_ident.as_deref(),
             );
+            if config.npm_always_auth == Some(true) {
+                push(
+                    &mut out,
+                    format!("{}:always-auth", registry_uri_key(&registry)),
+                    "true",
+                );
+            }
         }
 
         for (scope, config) in self.npm_scopes {
@@ -447,6 +502,15 @@ impl YarnRc {
                     config.npm_auth_token.as_deref(),
                     config.npm_auth_ident.as_deref(),
                 );
+                if config.npm_always_auth == Some(true)
+                    && let Some(registry) = &registry
+                {
+                    push(
+                        &mut out,
+                        format!("{}:always-auth", registry_uri_key(registry)),
+                        "true",
+                    );
+                }
             }
         }
 
@@ -468,6 +532,17 @@ impl YarnRc {
         // identical to how a project vs user `.npmrc` is treated.
         if let Some(cafile) = self.https_ca_file_path.as_deref() {
             push(&mut out, "cafile", cafile);
+        }
+        // mTLS client identity. The cert/key consumer takes inline PEM, so
+        // read the referenced files here and emit `cert` / `key`. Both must
+        // resolve for a usable identity; if either path is missing or
+        // unreadable, neither is emitted (a half-identity is never valid).
+        if let (Some(cert), Some(key)) = (
+            read_pem(self.https_cert_file_path.as_deref()),
+            read_pem(self.https_key_file_path.as_deref()),
+        ) {
+            push(&mut out, "cert", cert);
+            push(&mut out, "key", key);
         }
         if let Some(proxy) = self.http_proxy.as_deref() {
             push(&mut out, "http-proxy", proxy);
@@ -494,17 +569,23 @@ impl YarnRc {
         // target). The host key becomes the URI-scoped `//<host>/:cafile`
         // entry the `.npmrc` consumer already understands.
         for (host, settings) in &self.network_settings {
-            let Some(cafile) = settings.https_ca_file_path.as_deref() else {
-                continue;
-            };
             if host_is_glob(host) {
                 continue;
             }
-            push(
-                &mut out,
-                format!("//{}/:cafile", host.trim_matches('/')),
-                cafile,
-            );
+            let host_key = host.trim_matches('/');
+            if let Some(cafile) = settings.https_ca_file_path.as_deref() {
+                push(&mut out, format!("//{host_key}/:cafile"), cafile);
+            }
+            // Per-host mTLS identity → inline `//host/:cert` / `//host/:key`
+            // (PEM loaded from disk). Both must resolve, same as the
+            // top-level pair.
+            if let (Some(cert), Some(key)) = (
+                read_pem(settings.https_cert_file_path.as_deref()),
+                read_pem(settings.https_key_file_path.as_deref()),
+            ) {
+                push(&mut out, format!("//{host_key}/:cert"), cert);
+                push(&mut out, format!("//{host_key}/:key"), key);
+            }
         }
 
         if !self.package_extensions.is_empty()
@@ -513,7 +594,48 @@ impl YarnRc {
             push(&mut out, "packageExtensions", json);
         }
 
+        // `supportedArchitectures` → the JSON-object `supportedArchitectures`
+        // settings key, mirroring `packageExtensions`. The value must be a
+        // JSON object (`{os,cpu,libc}`); anything else (a stray scalar) is
+        // dropped rather than emitting a malformed entry the object-setting
+        // reader would ignore anyway.
+        if let Some(serde_json::Value::Object(obj)) = &self.supported_architectures
+            && !obj.is_empty()
+            && let Ok(json) = serde_json::to_string(&serde_json::Value::Object(obj.clone()))
+        {
+            push(&mut out, "supportedArchitectures", json);
+        }
+
         out
+    }
+}
+
+/// Read a PEM file referenced by a Yarn `httpsCertFilePath` /
+/// `httpsKeyFilePath` setting and return its contents as the inline
+/// `cert` / `key` value the registry client consumes. Returns `None`
+/// when the path is absent, empty, or unreadable (a missing client
+/// cert/key file is non-fatal — the install proceeds without an mTLS
+/// identity rather than aborting, matching how the registry client
+/// already tolerates an invalid cert/key pair). A warning is logged so
+/// a misconfigured path is diagnosable.
+fn read_pem(path: Option<&str>) -> Option<String> {
+    let path = path.map(str::trim).filter(|p| !p.is_empty())?;
+    match std::fs::read_to_string(path) {
+        Ok(content) if !content.trim().is_empty() => Some(content),
+        Ok(_) => {
+            tracing::warn!(
+                code = aube_codes::warnings::WARN_AUBE_INVALID_CLIENT_CERT,
+                "ignoring yarn mTLS cert/key path {path:?}: file is empty"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                code = aube_codes::warnings::WARN_AUBE_INVALID_CLIENT_CERT,
+                "ignoring yarn mTLS cert/key path {path:?}: {e}"
+            );
+            None
+        }
     }
 }
 

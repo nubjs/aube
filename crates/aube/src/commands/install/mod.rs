@@ -1052,7 +1052,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // set, so a deferred package that survives the trim is
             // exactly one the catch-up must fetch.
             let (fetch_sup_os, fetch_sup_cpu, fetch_sup_libc) =
-                aube_manifest::effective_supported_architectures(&manifest, &ws_config_shared);
+                settings::effective_supported_architectures(
+                    &manifest,
+                    &ws_config_shared,
+                    &settings_ctx,
+                );
             let fetch_supported_arch = aube_resolver::SupportedArchitectures {
                 os: fetch_sup_os,
                 cpu: fetch_sup_cpu,
@@ -1829,8 +1833,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // filter pass the lockfile-happy branch above runs against a
             // parsed lockfile. A no-op when the manifest didn't trigger
             // widening (graph was already host-only).
-            let (sup_os, sup_cpu, sup_libc) =
-                aube_manifest::effective_supported_architectures(&manifest, &ws_config_shared);
+            let (sup_os, sup_cpu, sup_libc) = settings::effective_supported_architectures(
+                &manifest,
+                &ws_config_shared,
+                &settings_ctx,
+            );
             let install_supported_architectures = aube_resolver::SupportedArchitectures {
                 os: sup_os,
                 cpu: sup_cpu,

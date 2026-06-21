@@ -258,6 +258,131 @@ networkSettings:
 }
 
 #[test]
+fn yarnrc_translates_top_level_mtls_cert_and_key_paths() {
+    // Yarn Berry expresses the client cert/key as file PATHS; the cert/key
+    // consumer takes inline PEM, so the reader loads both files and emits
+    // the inline `cert` / `key` npmrc keys.
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("client.crt");
+    let key_path = dir.path().join("client.key");
+    std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nCERTBODY\n").unwrap();
+    std::fs::write(&key_path, "-----BEGIN PRIVATE KEY-----\nKEYBODY\n").unwrap();
+    let entries = translate_yarnrc_content(&format!(
+        "httpsCertFilePath: {}\nhttpsKeyFilePath: {}\n",
+        cert_path.display(),
+        key_path.display()
+    ));
+    assert!(
+        entries
+            .iter()
+            .any(|(k, v)| k == "cert" && v.contains("CERTBODY"))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(k, v)| k == "key" && v.contains("KEYBODY"))
+    );
+}
+
+#[test]
+fn yarnrc_skips_mtls_when_cert_or_key_path_missing() {
+    // A half-identity (cert without key, or an unreadable path) is never a
+    // usable mTLS pair, so neither inline key is emitted.
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("client.crt");
+    std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nCERTBODY\n").unwrap();
+    let entries = translate_yarnrc_content(&format!(
+        "httpsCertFilePath: {}\nhttpsKeyFilePath: /nonexistent/client.key\n",
+        cert_path.display(),
+    ));
+    assert!(entries.iter().all(|(k, _)| k != "cert" && k != "key"));
+}
+
+#[test]
+fn yarnrc_translates_per_host_mtls_cert_and_key_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("host.crt");
+    let key_path = dir.path().join("host.key");
+    std::fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\nHOSTCERT\n").unwrap();
+    std::fs::write(&key_path, "-----BEGIN PRIVATE KEY-----\nHOSTKEY\n").unwrap();
+    let entries = translate_yarnrc_content(&format!(
+        r#"
+networkSettings:
+  "registry.example.com":
+    httpsCertFilePath: {}
+    httpsKeyFilePath: {}
+"#,
+        cert_path.display(),
+        key_path.display()
+    ));
+    assert!(
+        entries
+            .iter()
+            .any(|(k, v)| k == "//registry.example.com/:cert" && v.contains("HOSTCERT"))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(k, v)| k == "//registry.example.com/:key" && v.contains("HOSTKEY"))
+    );
+}
+
+#[test]
+fn yarnrc_translates_supported_architectures_to_object_setting() {
+    // Yarn `supportedArchitectures` mirrors pnpm's shape and rides the same
+    // object-setting channel as packageExtensions: a JSON object string
+    // under the `supportedArchitectures` key.
+    let entries = translate_yarnrc_content(
+        r#"
+supportedArchitectures:
+  os:
+    - current
+    - linux
+  cpu:
+    - arm64
+  libc:
+    - glibc
+"#,
+    );
+    let (_, json) = entries
+        .iter()
+        .find(|(k, _)| k == "supportedArchitectures")
+        .expect("supportedArchitectures entry must be emitted");
+    let value: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(value["os"], serde_json::json!(["current", "linux"]));
+    assert_eq!(value["cpu"], serde_json::json!(["arm64"]));
+    assert_eq!(value["libc"], serde_json::json!(["glibc"]));
+}
+
+#[test]
+fn yarnrc_translates_npm_always_auth_top_level_and_per_registry() {
+    // Top-level `npmAlwaysAuth` scopes to the default registry; a
+    // per-registry `npmRegistries.<url>.npmAlwaysAuth` scopes to that host.
+    let entries = translate_yarnrc_content(
+        r#"
+npmRegistryServer: "https://registry.example.com/"
+npmAlwaysAuth: true
+npmRegistries:
+  "//npm.other.com/":
+    npmAuthToken: secret-token
+    npmAlwaysAuth: true
+"#,
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(k, v)| k == "//registry.example.com/:always-auth" && v == "true"),
+        "default-registry always-auth: {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(k, v)| k == "//npm.other.com/:always-auth" && v == "true"),
+        "per-registry always-auth: {entries:?}"
+    );
+}
+
+#[test]
 fn yarn_env_translates_top_level_ca_proxy_and_strict_ssl() {
     let entries = yarn_env_entries_from(&[
         (
