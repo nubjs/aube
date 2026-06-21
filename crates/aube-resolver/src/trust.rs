@@ -255,6 +255,7 @@ pub const DEFAULT_TRUST_POLICY_EXCLUDES: &[&str] = &[
     "chokidar",
     "eslint-config-prettier",
     "eslint-import-resolver-typescript",
+    "nanoid",
     "react-redux",
     "reselect",
     "semver",
