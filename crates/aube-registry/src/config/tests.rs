@@ -3448,3 +3448,76 @@ fn scoped_auth_lookup_checks_shorter_prefixes_before_unscoped_fallback() {
         Some("org-a-token")
     );
 }
+
+#[test]
+fn home_npmrc_is_user_trusted_when_cwd_is_home_not_a_committed_project_source() {
+    // Regression: when the project dir IS the home dir, `~/.npmrc` was
+    // read TWICE — once as User (trusted) and once as Project (untrusted,
+    // via `project_dir.join(".npmrc")` resolving to the same file) — so
+    // its `https-proxy` / `strict-ssl=false` tripped the
+    // untrusted-committed-`.npmrc` gate. The user's own global config must
+    // stay user-trusted regardless of cwd.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".npmrc"),
+        "https-proxy=http://proxy.example:8080/\nstrict-ssl=false\n",
+    )
+    .unwrap();
+
+    // No Project-tagged entries should come out — the same-file read is
+    // deduped, not re-tagged as an untrusted committed source.
+    let tagged = load_npmrc_entries_tagged_with_home(Some(home.path()), None, home.path(), None);
+    assert!(
+        !tagged
+            .iter()
+            .any(|(src, _, _)| matches!(src, NpmrcSource::Project)),
+        "~/.npmrc read with cwd==home must not be tagged Project (untrusted): {tagged:?}",
+    );
+
+    // And the user-trusted proxy / strict-ssl settings actually apply.
+    let mut config = NpmConfig::default();
+    config.apply_tagged(tagged);
+    assert_eq!(
+        config.https_proxy.as_deref(),
+        Some("http://proxy.example:8080/"),
+        "user ~/.npmrc https-proxy must apply from $HOME (not refused as untrusted)",
+    );
+    assert!(
+        !config.strict_ssl,
+        "user ~/.npmrc strict-ssl=false must apply from $HOME (not refused as untrusted)",
+    );
+}
+
+#[test]
+fn genuine_committed_project_npmrc_in_nested_dir_stays_untrusted() {
+    // Counter-case proving the security gate is intact: a real committed
+    // `.npmrc` in a nested project dir (a different file from `~/.npmrc`)
+    // is still classified Project/untrusted, so its proxy / strict-ssl
+    // disable are refused.
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "https-proxy=http://evil.example:8080/\nstrict-ssl=false\n",
+    )
+    .unwrap();
+
+    let tagged = load_npmrc_entries_tagged_with_home(Some(home.path()), None, project.path(), None);
+    assert!(
+        tagged
+            .iter()
+            .any(|(src, _, _)| matches!(src, NpmrcSource::Project)),
+        "a genuine committed project .npmrc must be tagged Project (untrusted): {tagged:?}",
+    );
+
+    let mut config = NpmConfig::default();
+    config.apply_tagged(tagged);
+    assert_eq!(
+        config.https_proxy, None,
+        "committed project .npmrc must not set an https-proxy (untrusted)",
+    );
+    assert!(
+        config.strict_ssl,
+        "committed project .npmrc must not disable strict-ssl (untrusted)",
+    );
+}

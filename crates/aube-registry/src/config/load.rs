@@ -485,9 +485,9 @@ pub(super) fn load_npmrc_entries_tagged_with_globals(
     let user_rc = user_rc_override
         .map(PathBuf::from)
         .or_else(|| home.map(|h| h.join(".npmrc")));
-    if let Some(user_rc) = user_rc
+    if let Some(user_rc) = user_rc.as_deref()
         && user_rc.exists()
-        && let Ok(entries) = parse_npmrc(&user_rc)
+        && let Ok(entries) = parse_npmrc(user_rc)
     {
         out.extend(entries.into_iter().map(|(k, v)| (NpmrcSource::User, k, v)));
     }
@@ -518,6 +518,7 @@ pub(super) fn load_npmrc_entries_tagged_with_globals(
     }
     let project_rc = project_dir.join(".npmrc");
     if project_rc.exists()
+        && !is_same_npmrc_file(&project_rc, user_rc.as_deref())
         && let Ok(entries) = parse_npmrc_untrusted(&project_rc)
     {
         out.extend(
@@ -528,6 +529,7 @@ pub(super) fn load_npmrc_entries_tagged_with_globals(
     }
     if let Some((auth_path, auth_source)) = resolve_npmrc_auth_file_tagged(home, project_dir, &out)
         && auth_source.is_project_controlled()
+        && !is_same_npmrc_file(&auth_path, user_rc.as_deref())
         && auth_path.exists()
         && let Ok(entries) = parse_npmrc_untrusted(&auth_path)
     {
@@ -623,8 +625,10 @@ fn load_project_npmrc_entries_tagged(
             .cloned()
             .map(|(k, v)| (NpmrcSource::Project, k, v)),
     );
+    let user_rc = resolve_user_rc_path(home);
     let project_rc = project_dir.join(".npmrc");
     if project_rc.exists()
+        && !is_same_npmrc_file(&project_rc, user_rc.as_deref())
         && let Ok(entries) = parse_npmrc_untrusted(&project_rc)
     {
         out.extend(
@@ -635,6 +639,7 @@ fn load_project_npmrc_entries_tagged(
     }
     if let Some((auth_path, _auth_source)) = resolve_npmrc_auth_file_tagged(home, project_dir, &out)
         && auth_path.exists()
+        && !is_same_npmrc_file(&auth_path, user_rc.as_deref())
         && let Ok(entries) = parse_npmrc_untrusted(&auth_path)
     {
         out.extend(
@@ -762,6 +767,40 @@ pub(super) fn expand_userconfig_path(raw: &str, home: Option<&Path>) -> Option<P
         return home.map(PathBuf::from);
     }
     Some(PathBuf::from(trimmed))
+}
+
+/// Resolve the user-scope `.npmrc` path the same way the tagged loader
+/// does: the `*_CONFIG_USERCONFIG` env override (highest precedence,
+/// honoring the pnpm-incumbent gate) wins, else `$HOME/.npmrc`. Used to
+/// recognize when a project-scope read would re-open the *same physical
+/// file* as the user rc (e.g. `cwd == $HOME`).
+fn resolve_user_rc_path(home: Option<&Path>) -> Option<PathBuf> {
+    userconfig_env_value()
+        .and_then(|raw| expand_userconfig_path(&raw, home))
+        .or_else(|| home.map(|h| h.join(".npmrc")))
+}
+
+/// True when `candidate` is the SAME physical file as the user rc — so a
+/// project-scope (untrusted) read of it would merely duplicate the
+/// user-scope (trusted) read under a wrong trust tag. Compares canonical
+/// paths so a symlinked home, a `~/`-spelled override, and the absolute
+/// spelling all collapse to one identity; falls back to a lexical compare
+/// when either path can't be canonicalized (e.g. it doesn't exist).
+///
+/// This is purely a same-file dedup: a genuine committed repo `.npmrc`
+/// (a different inode from `~/.npmrc`) never matches, so the
+/// untrusted-committed-`.npmrc` trust gate is fully preserved. The only
+/// case it suppresses is `$HOME/.npmrc` being read twice when the project
+/// dir IS the home dir — `$HOME/.npmrc` is npm's canonical user-config
+/// path and is always user-trusted, never a project-committed source.
+fn is_same_npmrc_file(candidate: &Path, user_rc: Option<&Path>) -> bool {
+    let Some(user_rc) = user_rc else {
+        return false;
+    };
+    match (candidate.canonicalize(), user_rc.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => candidate == user_rc,
+    }
 }
 
 /// Spelling precedence for the `userconfig` relocation env var, highest
