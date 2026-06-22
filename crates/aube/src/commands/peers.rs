@@ -75,7 +75,7 @@ async fn check(args: PeersCheckArgs) -> miette::Result<Option<i32>> {
         ),
     )?;
 
-    let issues = collect_issues(&graph);
+    let issues = collect_issues(&graph, &cwd);
 
     if args.json {
         print_json(&issues);
@@ -113,7 +113,25 @@ enum IssueKind {
     Unparseable { found: String },
 }
 
-fn collect_issues(graph: &LockfileGraph) -> Vec<Issue> {
+/// Resolve a workspace `link:`/`portal:`/`file:` peer tail to the
+/// linked package's version. pnpm records a peer satisfied by a
+/// workspace member as `link:<path>` (e.g. `vue@link:packages/vue`) in
+/// the consumer's lockfile `dependencies`; that path tail is not a
+/// semver version, so it must be resolved to the linked member's
+/// `package.json` version before the satisfaction check. Returns None
+/// when the spec isn't a local link or the target version is
+/// unreadable (caller then falls back to the raw tail → Unparseable).
+fn link_target_version(tail: &str, project_root: &std::path::Path) -> Option<String> {
+    let rel = tail
+        .strip_prefix("link:")
+        .or_else(|| tail.strip_prefix("portal:"))
+        .or_else(|| tail.strip_prefix("file:"))?;
+    let manifest_path = project_root.join(rel).join("package.json");
+    let pj = super::load_manifest(&manifest_path).ok()?;
+    pj.version
+}
+
+fn collect_issues(graph: &LockfileGraph, project_root: &std::path::Path) -> Vec<Issue> {
     let mut out: Vec<Issue> = Vec::new();
     for pkg in graph.packages.values() {
         for (peer_name, peer_range) in &pkg.peer_dependencies {
@@ -130,7 +148,14 @@ fn collect_issues(graph: &LockfileGraph) -> Vec<Issue> {
             let resolved_tail = pkg.dependencies.get(peer_name);
             match resolved_tail {
                 Some(tail) => {
-                    let version_str = tail.split_once('(').map(|(v, _)| v).unwrap_or(tail);
+                    // A workspace `link:`/`portal:`/`file:` tail resolves to
+                    // the linked member's manifest version — a workspace
+                    // peer is satisfied by the local member, not flagged
+                    // unparseable.
+                    let resolved_version = link_target_version(tail, project_root);
+                    let version_str = resolved_version
+                        .as_deref()
+                        .unwrap_or_else(|| tail.split_once('(').map(|(v, _)| v).unwrap_or(tail));
                     match (
                         node_semver::Version::parse(version_str),
                         node_semver::Range::parse(peer_range),
@@ -312,6 +337,12 @@ mod tests {
         }
     }
 
+    // Project root is irrelevant for non-link resolved tails; use the
+    // current dir so the helper signature is satisfied.
+    fn no_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(".")
+    }
+
     #[test]
     fn satisfied_peer_produces_no_issue() {
         let g = graph_of(vec![pkg_with_peer(
@@ -321,7 +352,7 @@ mod tests {
             Some("18.2.0"),
             false,
         )]);
-        assert!(collect_issues(&g).is_empty());
+        assert!(collect_issues(&g, &no_root()).is_empty());
     }
 
     #[test]
@@ -333,7 +364,7 @@ mod tests {
             None,
             false,
         )]);
-        let issues = collect_issues(&g);
+        let issues = collect_issues(&g, &no_root());
         assert_eq!(issues.len(), 1);
         assert!(matches!(issues[0].kind, IssueKind::Missing));
     }
@@ -347,7 +378,7 @@ mod tests {
             None,
             true,
         )]);
-        assert!(collect_issues(&g).is_empty());
+        assert!(collect_issues(&g, &no_root()).is_empty());
     }
 
     #[test]
@@ -359,7 +390,7 @@ mod tests {
             Some("17.0.2"),
             false,
         )]);
-        let issues = collect_issues(&g);
+        let issues = collect_issues(&g, &no_root());
         assert_eq!(issues.len(), 1);
         match &issues[0].kind {
             IssueKind::Unmet { found } => assert_eq!(found, "17.0.2"),
@@ -376,7 +407,7 @@ mod tests {
             Some("not-a-semver-version"),
             false,
         )]);
-        let issues = collect_issues(&g);
+        let issues = collect_issues(&g, &no_root());
         assert_eq!(issues.len(), 1);
         assert!(matches!(issues[0].kind, IssueKind::Unparseable { .. }));
     }
@@ -390,6 +421,65 @@ mod tests {
             Some("18.2.0(prop-types@15.8.1)"),
             false,
         )]);
-        assert!(collect_issues(&g).is_empty());
+        assert!(collect_issues(&g, &no_root()).is_empty());
+    }
+
+    // Regression for the pnpm-11 monorepo case (vuejs/core): a registry
+    // package's peer satisfied by a WORKSPACE member is recorded as
+    // `link:<path>` in the consumer's lockfile deps (e.g. plugin-vue's
+    // `vue: link:packages/vue`). The check must resolve the link to the
+    // member's manifest version and verify satisfaction — not report it
+    // unparseable.
+    #[test]
+    fn workspace_link_peer_resolves_to_member_version() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let member_dir = tmp.path().join("packages/vue");
+        std::fs::create_dir_all(&member_dir).expect("mkdir member");
+        std::fs::write(
+            member_dir.join("package.json"),
+            r#"{"name":"vue","version":"3.5.38"}"#,
+        )
+        .expect("write member manifest");
+
+        let g = graph_of(vec![pkg_with_peer(
+            "@vitejs/plugin-vue",
+            "6.0.7",
+            ("vue", "^3.2.25"),
+            Some("link:packages/vue"),
+            false,
+        )]);
+
+        // 3.5.38 satisfies ^3.2.25 → no issue.
+        assert!(collect_issues(&g, tmp.path()).is_empty());
+    }
+
+    // A workspace-link peer whose member version does NOT satisfy the
+    // declared range is a genuine Unmet (resolved, but out of range) —
+    // not Unparseable.
+    #[test]
+    fn workspace_link_peer_out_of_range_is_unmet() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let member_dir = tmp.path().join("packages/vue");
+        std::fs::create_dir_all(&member_dir).expect("mkdir member");
+        std::fs::write(
+            member_dir.join("package.json"),
+            r#"{"name":"vue","version":"2.7.0"}"#,
+        )
+        .expect("write member manifest");
+
+        let g = graph_of(vec![pkg_with_peer(
+            "@vitejs/plugin-vue",
+            "6.0.7",
+            ("vue", "^3.2.25"),
+            Some("link:packages/vue"),
+            false,
+        )]);
+
+        let issues = collect_issues(&g, tmp.path());
+        assert_eq!(issues.len(), 1);
+        match &issues[0].kind {
+            IssueKind::Unmet { found } => assert_eq!(found, "2.7.0"),
+            other => panic!("expected Unmet, got {other:?}"),
+        }
     }
 }

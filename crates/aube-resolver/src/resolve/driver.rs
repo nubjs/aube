@@ -441,6 +441,25 @@ impl<'a> ResolveDriver<'a> {
             return Ok(());
         }
 
+        // A TRANSITIVE `link:`/`portal:` spec whose name is a workspace
+        // member is a workspace link (pnpm serializes a peer satisfied by
+        // a member this way, e.g. a registry parent recording
+        // `vue@link:packages/vue`). Bind it to the local member BEFORE the
+        // non-registry dispatch — otherwise it reaches
+        // `handle_local_source_task` and the default-on exotic-subdep
+        // guard wrongly refuses a first-party workspace package. Gated to
+        // NON-root tasks: a root-declared `link:` is the user's explicit
+        // local-path intent, so it keeps flowing through the local-source
+        // path even when the name happens to match a member. Links to a
+        // NON-member also fall through to the local-source path below.
+        if !task.is_root
+            && (task.range.starts_with("link:") || task.range.starts_with("portal:"))
+            && self.workspace_packages.contains_key(&task.name)
+            && self.try_workspace_link(&task)
+        {
+            return Ok(());
+        }
+
         if is_non_registry_specifier(&task.range) {
             return self.handle_local_source_task(task).await;
         }
@@ -1936,12 +1955,16 @@ impl<'a> ResolveDriver<'a> {
 
     /// Try to resolve `task` against the workspace.
     ///
-    /// Two cases link rather than going to the registry: an explicit
+    /// Three cases link rather than going to the registry: an explicit
     /// `workspace:` protocol (range accepted unconditionally for
-    /// `*`/`^`/`~`/`""`, range-checked otherwise) and a bare semver
-    /// range whose name matches a workspace package whose version
-    /// satisfies the range (yarn-v1 / npm / bun default). Returns
-    /// true when the task was wired to the local workspace copy.
+    /// `*`/`^`/`~`/`""`, range-checked otherwise); a `link:`/`portal:`
+    /// spec whose name is a workspace member (pnpm's serialization of a
+    /// workspace peer — e.g. `@vitejs/plugin-vue`'s `vue` peer recorded
+    /// as `vue@link:packages/vue` when the importer declares `vue` as a
+    /// workspace dep); and a bare semver range whose name matches a
+    /// workspace package whose version satisfies the range (yarn-v1 /
+    /// npm / bun default). Returns true when the task was wired to the
+    /// local workspace copy.
     fn try_workspace_link(&mut self, task: &ResolveTask) -> bool {
         let Some(ws_version) = self.workspace_packages.get(&task.name) else {
             return false;
@@ -1953,6 +1976,16 @@ impl<'a> ResolveDriver<'a> {
             Some("" | "*" | "^" | "~") => true,
             // workspace:<range> must still satisfy the local version.
             Some(rest) => version_satisfies(ws_version, rest),
+            // `link:`/`portal:` whose name is a workspace member is a
+            // workspace link, not an untrusted exotic dep. pnpm records
+            // a peer satisfied by a workspace member this way (e.g.
+            // `vue@link:packages/vue`); the workspace IS the trust
+            // boundary, so bind to the local member by name regardless
+            // of the path tail. The `is_member` guard above (name must
+            // be in `workspace_packages`) keeps a `link:` to a
+            // NON-member out of this branch — those still flow to
+            // `handle_local_source_task` and the exotic-subdep guard.
+            None if task.range.starts_with("link:") || task.range.starts_with("portal:") => true,
             // Bare semver paths. Special-case `*`/`""` so a workspace
             // with a placeholder version like `0.0.0-0` (common in
             // changesets-managed repos) still links instead of falling

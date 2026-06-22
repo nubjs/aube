@@ -3948,6 +3948,92 @@ async fn lockfile_reuse_handles_name_at_version_dep_form() {
     );
 }
 
+// Regression for the pnpm-11 monorepo install blocker (vuejs/core): a
+// registry package whose peer is satisfied by a WORKSPACE member is
+// recorded by pnpm as a `link:` transitive in the parent's lockfile
+// deps (e.g. `@vitejs/plugin-vue`'s `vue: link:packages/vue`). On
+// lockfile reuse that `link:` task reaches the resolver as a transitive
+// from a registry parent — the default-on `blockExoticSubdeps` guard
+// wrongly treated it as an untrusted exotic dep and HARD-FAILED the
+// whole install. A `link:`/`portal:` whose NAME is a workspace member
+// is a first-party workspace link (the workspace is the trust
+// boundary), so it must bind to the local member, not be blocked.
+#[tokio::test]
+async fn workspace_link_transitive_from_registry_parent_is_not_blocked_as_exotic() {
+    let plugin_vue = make_packument("@vitejs/plugin-vue", &["6.0.7"], "6.0.7");
+
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client);
+    // Default policy: block_exotic_subdeps = true (the trip wire).
+    assert!(resolver.dependency_policy.block_exotic_subdeps);
+    resolver
+        .cache
+        .insert("@vitejs/plugin-vue".to_string(), plugin_vue);
+
+    // Existing lockfile: the registry plugin-vue resolved its `vue` peer
+    // to the workspace member, serialized as `link:packages/vue`.
+    let mut existing_pkgs: BTreeMap<String, LockedPackage> = BTreeMap::new();
+    existing_pkgs.insert(
+        "@vitejs/plugin-vue@6.0.7".to_string(),
+        LockedPackage {
+            name: "@vitejs/plugin-vue".to_string(),
+            version: "6.0.7".to_string(),
+            dep_path: "@vitejs/plugin-vue@6.0.7".to_string(),
+            dependencies: [("vue".to_string(), "link:packages/vue".to_string())].into(),
+            ..Default::default()
+        },
+    );
+    let existing = LockfileGraph {
+        packages: existing_pkgs,
+        ..Default::default()
+    };
+
+    // Root imports plugin-vue; `vue` is a workspace member.
+    let root = PackageJson {
+        dependencies: [("@vitejs/plugin-vue".to_string(), "6.0.7".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let vue_member = PackageJson {
+        name: Some("vue".to_string()),
+        version: Some("3.5.38".to_string()),
+        ..Default::default()
+    };
+
+    let mut workspace_packages = std::collections::HashMap::new();
+    workspace_packages.insert("vue".to_string(), "3.5.38".to_string());
+
+    let graph = resolver
+        .resolve_workspace(
+            &[
+                (".".to_string(), root),
+                ("packages/vue".to_string(), vue_member),
+            ],
+            Some(&existing),
+            &workspace_packages,
+        )
+        .await
+        .expect("workspace link peer must not be blocked as an exotic subdep");
+
+    assert!(
+        graph_has_package(&graph, "@vitejs/plugin-vue", "6.0.7"),
+        "plugin-vue should resolve"
+    );
+    // The `vue` peer must bind to the workspace member version, not error.
+    let plugin = graph
+        .packages
+        .get("@vitejs/plugin-vue@6.0.7")
+        .expect("plugin-vue in graph");
+    assert_eq!(
+        plugin.dependencies.get("vue").map(String::as_str),
+        Some("3.5.38"),
+        "plugin-vue's vue peer must bind to the workspace member version"
+    );
+}
+
 // A fresh resolve must stash the packument's `deprecated` reason on the
 // LockedPackage (via `extra_meta`) so the pnpm/aube lockfile writer can
 // emit pnpm's `deprecated:` field. Without this the reason is dropped

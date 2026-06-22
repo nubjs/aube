@@ -650,7 +650,15 @@ impl LockfileGraph {
                 .or_insert(DepType::Optional);
         }
         if self.settings.auto_install_peers {
-            for (name, _) in manifest.non_optional_peer_dependencies() {
+            // Both required AND optional peers can be auto-installed by
+            // pnpm `auto-install-peers=true` and recorded under the
+            // importer's lockfile `dependencies`. An optional peer that
+            // resolves in scope (e.g. `typescript` declared
+            // `peerDependenciesMeta.optional` by `packages/vue`, present
+            // as a root devDep) lands there too — so classify both as
+            // Production for the dep-type drift check, or a valid pnpm 11
+            // lockfile reads stale on the optional-peer row.
+            for name in manifest.peer_dependencies.keys() {
                 if manifest.dependencies.contains_key(name)
                     || manifest.dev_dependencies.contains_key(name)
                     || manifest.optional_dependencies.contains_key(name)
@@ -711,15 +719,31 @@ impl LockfileGraph {
             .map(|s| s.as_str())
             .collect();
         if self.settings.auto_install_peers {
+            // Exempt the importer's OWN declared peers — required and
+            // optional alike — from the "manifest removed" check. Under
+            // `auto-install-peers=true` pnpm auto-installs an importer's
+            // optional peer that resolves in scope (e.g. `typescript`
+            // declared `peerDependenciesMeta.optional` by `packages/vue`)
+            // and records it in the importer's lockfile `dependencies`;
+            // it is derived state, not a removed manifest dep. This is a
+            // pure by-NAME exemption keyed on the importer's OWN manifest
+            // — it short-circuits before the (name, spec) auto-hoisted
+            // gate below, and is safe precisely because pnpm RE-installs
+            // an own optional peer that still resolves in scope on the
+            // next install, so the lockfile row stays valid. A dep shared
+            // with some OTHER package's peer declaration is unaffected
+            // (it isn't in THIS importer's peer set) and stays gated by
+            // the (name, spec) match below.
             manifest_names.extend(
                 manifest
-                    .non_optional_peer_dependencies()
-                    .filter(|(name, _)| {
+                    .peer_dependencies
+                    .keys()
+                    .filter(|name| {
                         !manifest.dependencies.contains_key(name.as_str())
                             && !manifest.dev_dependencies.contains_key(name.as_str())
                             && !manifest.optional_dependencies.contains_key(name.as_str())
                     })
-                    .map(|(name, _)| name.as_str()),
+                    .map(|name| name.as_str()),
             );
         }
         let auto_hoisted_peer_specs: std::collections::HashSet<(&str, &str)> = self
@@ -1152,8 +1176,15 @@ mod drift_tests {
         }
     }
 
+    // pnpm 11 with `auto-install-peers=true` auto-installs an OPTIONAL
+    // importer peer that resolves in scope and records it under the
+    // importer's lockfile `dependencies` (real-world: `typescript`,
+    // declared `peerDependenciesMeta.optional` by vuejs/core's
+    // `packages/vue`, present as a root devDep, lands in the importer
+    // deps with version 5.6.3). That is a VALID lockfile — the drift
+    // check must read it Fresh, not "manifest removed".
     #[test]
-    fn stale_when_optional_importer_peer_dependency_is_recorded_as_dependency() {
+    fn fresh_when_optional_importer_peer_dependency_is_recorded_as_dependency() {
         let mut manifest = make_manifest(&[]);
         manifest
             .peer_dependencies
@@ -1163,6 +1194,55 @@ mod drift_tests {
             serde_json::json!({"zod": {"optional": true}}),
         );
         let graph = make_graph(&[("zod", "^3.22.0", "zod@3.22.0")]);
+
+        assert_eq!(
+            graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()),
+            DriftStatus::Fresh
+        );
+    }
+
+    // The importer's OWN optional peer that resolves in scope is
+    // re-auto-installed by pnpm on every install, so a lockfile row for
+    // it is valid derived state even after the user removes any direct
+    // pin of the same name — drift must stay Fresh. (The shared-name
+    // protection that DOES fire is for a peer declared by some OTHER
+    // package, covered by `stale_when_user_removes_pinned_dep_that_shares_name_with_a_peer`.)
+    #[test]
+    fn fresh_when_user_removes_dep_sharing_name_with_own_optional_peer() {
+        // Manifest declares `zod` ONLY as an optional peer (the direct
+        // dependency the user once had is gone). Lockfile still records
+        // `zod` in the importer deps — pnpm re-auto-installs it.
+        let mut manifest = make_manifest(&[]);
+        manifest
+            .peer_dependencies
+            .insert("zod".into(), "^3.22.0".into());
+        manifest.extra.insert(
+            "peerDependenciesMeta".into(),
+            serde_json::json!({"zod": {"optional": true}}),
+        );
+        let graph = make_graph(&[("zod", "^3.22.0", "zod@3.22.0")]);
+
+        assert_eq!(
+            graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()),
+            DriftStatus::Fresh
+        );
+    }
+
+    // With `auto-install-peers=false` no peer (optional or required) is
+    // auto-installed, so an optional-peer row in the lockfile that the
+    // manifest doesn't otherwise declare is genuinely extraneous → stale.
+    #[test]
+    fn stale_when_optional_importer_peer_recorded_with_auto_install_peers_false() {
+        let mut manifest = make_manifest(&[]);
+        manifest
+            .peer_dependencies
+            .insert("zod".into(), "^3.22.0".into());
+        manifest.extra.insert(
+            "peerDependenciesMeta".into(),
+            serde_json::json!({"zod": {"optional": true}}),
+        );
+        let mut graph = make_graph(&[("zod", "^3.22.0", "zod@3.22.0")]);
+        graph.settings.auto_install_peers = false;
 
         match graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()) {
             DriftStatus::Stale { reason } => assert!(reason.contains("zod")),
@@ -1608,7 +1688,9 @@ mod drift_tests {
         let mut graph = make_graph(&[("zod", "^4.4.0", "zod@4.4.0")]);
         graph.overrides.insert("some-dep".into(), "^4.3.5".into());
         match graph.check_drift(&manifest, &BTreeMap::new(), &[], &BTreeMap::new()) {
-            DriftStatus::Stale { reason } => assert!(reason.contains("some-dep"), "reason: {reason}"),
+            DriftStatus::Stale { reason } => {
+                assert!(reason.contains("some-dep"), "reason: {reason}")
+            }
             other => panic!("expected stale, got {other:?}"),
         }
     }
