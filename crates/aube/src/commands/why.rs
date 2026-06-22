@@ -127,8 +127,9 @@ fn run_filtered(
 ) -> miette::Result<()> {
     let workspace_root = crate::dirs::find_workspace_root(cwd).ok_or_else(|| {
         miette!(
-            "{}: --filter requires a workspace root (aube-workspace.yaml, pnpm-workspace.yaml, or package.json with a `workspaces` field) at or above {}",
+            "{}: --filter requires a workspace root ({}, or package.json with a `workspaces` field) at or above {}",
             aube_util::cmd("why"),
+            aube_util::workspace_markers(),
             cwd.display()
         )
     })?;
@@ -153,8 +154,9 @@ fn run_filtered(
         .map_err(|e| miette!("failed to discover workspace packages: {e}"))?;
     if workspace_pkgs.is_empty() {
         return Err(miette!(
-            "{}: --filter requires a workspace root (aube-workspace.yaml, pnpm-workspace.yaml, or package.json with a `workspaces` field) at {}",
+            "{}: --filter requires a workspace root ({}, or package.json with a `workspaces` field) at {}",
             aube_util::cmd("why"),
+            aube_util::workspace_markers(),
             workspace_root.display()
         ));
     }

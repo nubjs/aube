@@ -201,8 +201,9 @@ pub async fn run(
             .map_err(|e| miette!("failed to discover workspace packages: {e}"))?;
         if workspace_pkgs.is_empty() {
             return Err(miette!(
-                "{}: --filter requires a workspace root (aube-workspace.yaml, pnpm-workspace.yaml, or package.json with a `workspaces` field) at or above {}",
+                "{}: --filter requires a workspace root ({}, or package.json with a `workspaces` field) at or above {}",
                 aube_util::cmd("list"),
+                aube_util::workspace_markers(),
                 cwd.display()
             ));
         }

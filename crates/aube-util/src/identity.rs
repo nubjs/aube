@@ -336,6 +336,41 @@ pub fn cmd(verb: &str) -> String {
     format!("{} {verb}", prog())
 }
 
+/// The active embedder's canonical lockfile basename — the file a FRESH
+/// install creates (`aube-lock.yaml` under the default profile, `lock.yaml`
+/// under nub). Use it wherever a user-facing message names the lockfile the
+/// engine writes, so the name follows the active brand instead of hardcoding
+/// `aube-lock.yaml`.
+///
+/// Default-preserving: `aube-lock.yaml` byte-for-byte under [`AUBE`].
+pub fn lockfile_basename() -> &'static str {
+    embedder().lockfile_basename
+}
+
+/// The user-facing list of workspace-root marker files the engine recognizes,
+/// composed for the active embedder — e.g. `` "`aube-workspace.yaml`,
+/// `pnpm-workspace.yaml`" `` under the default profile and just
+/// `` "`pnpm-workspace.yaml`" `` under a profile whose [`Embedder::workspace_yaml`]
+/// is `None` (nub). Use it in user-facing `--filter requires a workspace root
+/// (…)` / `no workspace root (…)` messages so the markers named follow the
+/// active brand instead of hardcoding `aube-workspace.yaml`.
+///
+/// The compatible pnpm workspace yaml (`pnpm-workspace.yaml`) is always
+/// included — the engine reads it under every profile. The embedder's own
+/// `workspace_yaml` (when set) precedes it.
+///
+/// Default-preserving: under the default [`AUBE`] profile this is exactly
+/// `` "`aube-workspace.yaml`, `pnpm-workspace.yaml`" `` byte-for-byte, so
+/// standalone aube's messages are unchanged.
+pub fn workspace_markers() -> String {
+    match embedder().workspace_yaml {
+        Some(own) if own != "pnpm-workspace.yaml" => {
+            format!("`{own}`, `pnpm-workspace.yaml`")
+        }
+        _ => "`pnpm-workspace.yaml`".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +427,22 @@ mod tests {
         assert_eq!(cmd("install"), "aube install");
         assert_eq!(cmd("patch-commit"), "aube patch-commit");
         assert_eq!(cmd("store prune"), "aube store prune");
+    }
+
+    /// Default-preserving for the marker/lockfile-name source-branding helpers:
+    /// under the default profile they reproduce aube's hardcoded user-facing
+    /// strings byte-for-byte, so converting a literal `aube-workspace.yaml,
+    /// pnpm-workspace.yaml` / `aube-lock.yaml` site to these helpers changes
+    /// nothing for standalone aube. (The nub-profile branch — markers collapsed
+    /// to just `pnpm-workspace.yaml`, lockfile `lock.yaml` — is covered by the
+    /// nub-side CLI tests, which register the NUB profile in their own process;
+    /// doing it here would flip the process-global fallback.)
+    #[test]
+    fn workspace_markers_and_lockfile_basename_under_default_profile() {
+        assert_eq!(
+            workspace_markers(),
+            "`aube-workspace.yaml`, `pnpm-workspace.yaml`"
+        );
+        assert_eq!(lockfile_basename(), "aube-lock.yaml");
     }
 }

@@ -135,8 +135,7 @@ pub(crate) fn write_and_log_lockfile(
     // resolution. A non-time-based rewrite therefore drops any `time:`
     // block (incl. a stray one carried in from the prior lockfile),
     // matching pnpm and the install write path.
-    let persist_times =
-        resolution_mode_for_cwd(cwd) == aube_resolver::ResolutionMode::TimeBased;
+    let persist_times = resolution_mode_for_cwd(cwd) == aube_resolver::ResolutionMode::TimeBased;
     let graph = &{
         let mut g = graph.clone();
         crate::patches::record_patches_on_graph(cwd, &mut g)?;
@@ -171,7 +170,8 @@ pub(crate) fn write_and_log_lockfile(
 pub(crate) fn find_workspace_root(start: &Path) -> miette::Result<PathBuf> {
     crate::dirs::find_workspace_root(start).ok_or_else(|| {
         miette!(
-            "no workspace root (aube-workspace.yaml, pnpm-workspace.yaml, or package.json with a `workspaces` field) found above {}",
+            "no workspace root ({}, or package.json with a `workspaces` field) found above {}",
+            aube_util::workspace_markers(),
             start.display()
         )
     })
@@ -192,7 +192,9 @@ pub(crate) fn select_workspace_packages(
         .map_err(|e| miette!("failed to discover workspace packages: {e}"))?;
     if workspace_pkgs.is_empty() {
         return Err(miette!(
-            "aube {command}: --filter requires a workspace root (aube-workspace.yaml, pnpm-workspace.yaml, or package.json with a `workspaces` field) at or above {}",
+            "{}: --filter requires a workspace root ({}, or package.json with a `workspaces` field) at or above {}",
+            aube_util::cmd(command),
+            aube_util::workspace_markers(),
             cwd.display()
         ));
     }
