@@ -556,7 +556,20 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
 
     let planned_gvs =
         gvs::planned_global_virtual_store(use_global_virtual_store_override, &opts.env_snapshot);
-    gvs::reset_on_mode_change(&cwd, &aube_dir, &modules_dir_name, planned_gvs)?;
+    // The mode-change check must compare the existing `.aube/` tree against
+    // what the linker will *actually* write, not the raw requested mode:
+    // the linker forces per-project materialization when the hidden hoist
+    // tree is on (`hoist=true`, the default) or the layout is `hoisted`.
+    // Predicting the raw `planned_gvs` instead made every non-fast-path
+    // install on a default project see a spurious `disabled → enabled`
+    // transition and wipe `node_modules` (issue #71). `resolve_node_linker`
+    // is the same resolver the link phase uses, so the two stay in lockstep.
+    let effective_gvs = gvs::effective_global_virtual_store(
+        planned_gvs,
+        aube_settings::resolved::hoist(&settings_ctx),
+        link::resolve_node_linker(&settings_ctx)?,
+    );
+    gvs::reset_on_mode_change(&cwd, &aube_dir, &modules_dir_name, effective_gvs)?;
 
     // 3. Parse or resolve lockfile, streaming tarball fetches during resolution
     let phase_start = std::time::Instant::now();

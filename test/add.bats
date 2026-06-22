@@ -265,6 +265,42 @@ EOF
 	assert_failure
 }
 
+@test "aube add in a workspace member does not flip the global-virtual-store mode (issue #71)" {
+	# Regression for the spurious WARN_AUBE_GVS_MODE_CHANGED reinstall loop:
+	# a root install materializes per-project (hoist=true default), but the
+	# mode-change check used to predict GVS-on, so `add` in any member saw a
+	# phantom disabled->enabled transition and wiped node_modules every time.
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+	EOF
+	cat >package.json <<-'EOF'
+		{"name": "root", "version": "0.0.0", "private": true}
+	EOF
+	mkdir -p packages/app packages/lib
+	cat >packages/app/package.json <<-'EOF'
+		{"name": "app", "version": "0.0.0", "dependencies": {"is-odd": "3.0.1"}}
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{"name": "lib", "version": "0.0.0", "dependencies": {"is-number": "7.0.0"}}
+	EOF
+
+	run aube install
+	assert_success
+
+	cd packages/lib
+	run aube add is-even
+	assert_success
+	refute_output --partial 'WARN_AUBE_GVS_MODE_CHANGED'
+	cd ../..
+
+	# A subsequent root install must stay warm — no phantom transition,
+	# no reinstall-from-scratch.
+	run aube install
+	assert_success
+	refute_output --partial 'WARN_AUBE_GVS_MODE_CHANGED'
+}
+
 @test "aube add -D: moves dep from dependencies to devDependencies" {
 	cat >package.json <<'EOF'
 {

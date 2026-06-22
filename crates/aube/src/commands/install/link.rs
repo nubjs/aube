@@ -7,6 +7,40 @@ use crate::state;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
 
+/// Resolve the layout mode. CLI override wins, then `.npmrc` /
+/// `pnpm-workspace.yaml`, then default (Isolated). `pnp` is a hard error
+/// regardless of source — we don't ship a PnP runtime, so accepting it
+/// would silently mislead. The CLI path hard-errors on an unknown value
+/// so typos surface immediately; settings-file values with an unknown
+/// spelling fall through to the generated default today, so a `.npmrc`
+/// typo degrades to `isolated` without a warning. Worth revisiting if
+/// that ever bites.
+///
+/// Shared by the link phase and the pre-link GVS-mode-change check so
+/// both predict the same layout (issue #71).
+pub(super) fn resolve_node_linker(
+    settings_ctx: &aube_settings::ResolveCtx<'_>,
+) -> miette::Result<aube_linker::NodeLinker> {
+    let reject_pnp =
+        miette!("node-linker=pnp is not supported by aube; use `isolated` (default) or `hoisted`");
+    let node_linker_cli = aube_settings::values::string_from_cli("nodeLinker", settings_ctx.cli);
+    if let Some(cli) = node_linker_cli.as_deref() {
+        let trimmed = cli.trim();
+        if trimmed.eq_ignore_ascii_case("pnp") {
+            return Err(reject_pnp);
+        }
+        trimmed.parse::<aube_linker::NodeLinker>().map_err(|_| {
+            miette!("unknown --node-linker value `{cli}`; expected `isolated` or `hoisted`")
+        })
+    } else {
+        match aube_settings::resolved::node_linker(settings_ctx) {
+            aube_settings::resolved::NodeLinker::Pnp => Err(reject_pnp),
+            aube_settings::resolved::NodeLinker::Hoisted => Ok(aube_linker::NodeLinker::Hoisted),
+            aube_settings::resolved::NodeLinker::Isolated => Ok(aube_linker::NodeLinker::Isolated),
+        }
+    }
+}
+
 pub(super) struct LinkPhaseInput<'a> {
     pub(super) cwd: &'a std::path::Path,
     pub(super) settings_ctx: &'a aube_settings::ResolveCtx<'a>,
@@ -101,32 +135,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     );
     let dedupe_direct_deps = aube_settings::resolved::dedupe_direct_deps(settings_ctx);
     let virtual_store_only = aube_settings::resolved::virtual_store_only(settings_ctx);
-    // Resolve the layout mode. CLI override wins, then `.npmrc` /
-    // `pnpm-workspace.yaml`, then default (Isolated). `pnp` is a
-    // hard error regardless of source — we don't ship a PnP runtime,
-    // so accepting it would silently mislead. The CLI path hard-errors
-    // on an unknown value so typos surface immediately; settings-file
-    // values with an unknown spelling fall through to the generated
-    // default today, so a `.npmrc` typo degrades to `isolated`
-    // without a warning. Worth revisiting if that ever bites.
-    let reject_pnp =
-        miette!("node-linker=pnp is not supported by aube; use `isolated` (default) or `hoisted`");
-    let node_linker_cli = aube_settings::values::string_from_cli("nodeLinker", settings_ctx.cli);
-    let node_linker = if let Some(cli) = node_linker_cli.as_deref() {
-        let trimmed = cli.trim();
-        if trimmed.eq_ignore_ascii_case("pnp") {
-            return Err(reject_pnp);
-        }
-        trimmed.parse::<aube_linker::NodeLinker>().map_err(|_| {
-            miette!("unknown --node-linker value `{cli}`; expected `isolated` or `hoisted`")
-        })?
-    } else {
-        match aube_settings::resolved::node_linker(settings_ctx) {
-            aube_settings::resolved::NodeLinker::Pnp => return Err(reject_pnp),
-            aube_settings::resolved::NodeLinker::Hoisted => aube_linker::NodeLinker::Hoisted,
-            aube_settings::resolved::NodeLinker::Isolated => aube_linker::NodeLinker::Isolated,
-        }
-    };
+    let node_linker = resolve_node_linker(settings_ctx)?;
     tracing::debug!("node-linker: {:?}", node_linker);
 
     let mut linker = aube_linker::Linker::new(store, strategy)

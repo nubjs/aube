@@ -46,6 +46,27 @@ pub(super) fn planned_global_virtual_store(
         .unwrap_or_else(|| !env_snapshot.iter().any(|(k, _)| k == "CI"))
 }
 
+/// The global virtual store mode the linker will *actually* materialize.
+///
+/// `planned_global_virtual_store` is the requested mode (override, else
+/// `!CI`), but the linker forces per-project materialization whenever the
+/// hidden hoist tree is enabled (`hoist=true`, the default) or the layout
+/// is `hoisted` — see `Linker::link_all`/`link_workspace`, both of which
+/// fall back to `without_global_virtual_store()` under those conditions.
+/// `reset_on_mode_change` compares this against the existing `.aube/` tree,
+/// so it MUST predict the same value the linker writes; using the raw
+/// `planned_gvs` instead made every non-fast-path install on a default
+/// (`hoist=true`) project see a spurious `disabled → enabled` transition
+/// and wipe `node_modules` (issue #71 — `aube add` in a workspace member,
+/// which always bypasses the fast path).
+pub(super) fn effective_global_virtual_store(
+    planned_gvs: bool,
+    hoist: bool,
+    node_linker: aube_linker::NodeLinker,
+) -> bool {
+    planned_gvs && !hoist && matches!(node_linker, aube_linker::NodeLinker::Isolated)
+}
+
 pub(super) fn reset_on_mode_change(
     cwd: &Path,
     aube_dir: &Path,
@@ -91,5 +112,44 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aube_linker::NodeLinker;
+
+    // Regression for issue #71: the mode-change check must predict the
+    // *effective* layout, which the linker forces to per-project whenever
+    // the hidden hoist tree is on (the default) or the layout is hoisted.
+    // Before the fix, `reset_on_mode_change` was fed the raw `planned_gvs`
+    // (`true` off-CI), so a default project — whose linker materializes
+    // per-project (`false`) — saw a spurious `disabled → enabled` flip on
+    // every non-fast-path install (e.g. `add` in a workspace member),
+    // wiping node_modules each time.
+
+    #[test]
+    fn default_project_predicts_per_project_so_no_spurious_reset() {
+        // hoist=true (default), isolated (default), GVS requested on (off-CI):
+        // the linker writes per-project, so the effective mode is `false`.
+        assert!(!effective_global_virtual_store(true, true, NodeLinker::Isolated));
+    }
+
+    #[test]
+    fn gvs_active_only_when_hoist_off_and_isolated() {
+        assert!(effective_global_virtual_store(true, false, NodeLinker::Isolated));
+    }
+
+    #[test]
+    fn hoisted_layout_never_uses_global_virtual_store() {
+        assert!(!effective_global_virtual_store(true, false, NodeLinker::Hoisted));
+        assert!(!effective_global_virtual_store(true, true, NodeLinker::Hoisted));
+    }
+
+    #[test]
+    fn requested_off_stays_off_regardless_of_hoist() {
+        assert!(!effective_global_virtual_store(false, false, NodeLinker::Isolated));
+        assert!(!effective_global_virtual_store(false, true, NodeLinker::Isolated));
     }
 }
